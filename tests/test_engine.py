@@ -597,6 +597,40 @@ def test_recovery_adopts_retire_window(env):
     assert store.get_job(job["id"])["state"] == "DONE"
 
 
+def test_recovery_of_gate_paused_encoding_does_not_count_restart(env):
+    """[SAF-6]/[SAF-12] Waiting at a start gate is not an interrupted encode."""
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(preset="test-preset", source_rel=entry.name,
+                           source_path=str(entry), original_path=str(entry),
+                           entry_kind="dir", state="ENCODING")
+    eng.recover()
+    job = store.get_job(job["id"])
+    assert job["state"] == "PLANNED"
+    assert job["restarts"] == 0
+    assert entry.exists()
+
+
+def test_recovery_counts_only_a_started_encode(env):
+    """[SAF-6]/[SAF-12] A real interrupted encode consumes one restart."""
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(preset="test-preset", source_rel=entry.name,
+                           source_path=str(entry), original_path=str(entry),
+                           entry_kind="dir", state="ENCODING")
+    store.set_setting(f"encode-started:{job['id']}", str(time.time()))
+    work = cfg.work / job["id"]
+    work.mkdir(parents=True)
+    partial = work / "out.mp4.partial"
+    partial.write_bytes(b"partial")
+    eng.recover()
+    job = store.get_job(job["id"])
+    assert job["state"] == "PROBED"
+    assert job["restarts"] == 1
+    assert not partial.exists()
+    assert entry.exists()
+
+
 def test_snapshot_does_not_override_db(env):
     """[SAF-6] DB wins when job.json disagrees; recovery rewrites the snapshot."""
     cfg, store, eng, _ = env

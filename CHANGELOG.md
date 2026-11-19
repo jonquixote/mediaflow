@@ -44,6 +44,8 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
   all audio as well as video.
 - Encoder failures that return non-zero now obey `max_restarts` instead of
   failing immediately.
+- A job waiting at a start gate is no longer mistaken for an interrupted
+  encode on daemon restart; only a real encoder start consumes a restart.
 - Maintenance deletions outside the media pipeline are contained and logged.
 
 ### Known limitations

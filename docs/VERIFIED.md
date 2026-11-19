@@ -25,7 +25,7 @@ cd /srv/agent-work/mediaflow
 scripts/check.sh
 ```
 
-Result: `696 passed in 20.83s`. `scripts/check.sh` first runs
+Result: `698 passed in 20.85s`. `scripts/check.sh` first runs
 `tools/gen_invariants.py --check` and the traceability meta-test, then the
 unit/integration suite and the full suite including slow and crash/chaos tests.
 The runner refuses a `MEDIAFLOW_ROOT` under `/srv/media`.
@@ -78,15 +78,20 @@ hardware 10-bit is separately reported and never inferred from software.
 
 ### Sandbox end-to-end checks
 
-These used tricked sample files under `/tmp/opencode/` and a sandbox media root:
+These used generated sample files under `/tmp/opencode/mf-final2` and a sandbox
+media root. The sandbox start gates were relaxed for temperature/space so the
+runs could proceed; verification was not relaxed.
 
-- H.264 MKV through `keep-remux-mp4`: stream copy, `hvc1` not applicable,
-  `+faststart`, atomic publish, manifest and marker present, original retired
-  to trash.
-- HEVC MKV through `1080p-balanced-mp4` with the software encoder: encode,
-  full decode verification, `hvc1`, publish and retire.
-- HEVC MPEG-TS through a remux-to-MP4 preset: valid `hvc1`/`hvcC`, full decode
-  verification, publish.
+- H.264 MKV through `keep-remux-mp4`: stream copy, `+faststart`, atomic
+  publish, manifest and marker present, original retired to trash, and the
+  published file passed the mandatory video-plus-audio full decode.
+- HEVC MKV through a software-enabled copy of `1080p-balanced-mp4`: encoded
+  MP4 with `hvc1`, mandatory full decode, publish and retire.
+- HEVC MPEG-TS through `keep-remux-mp4`: valid `hvc1`/`hvcC`, mandatory full
+  decode, publish and retire.
+- A job left in ENCODING by a start gate across process restarts returned to
+  PLANNED without consuming a restart; a genuinely interrupted encode still
+  consumes one. This is covered by `tests/test_engine.py`.
 
 Crash/chaos tests kill workers between state transitions and assert that the
 original is intact or in trash, the manifest is valid, and the library contains

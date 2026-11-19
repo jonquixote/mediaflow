@@ -326,8 +326,14 @@ class Engine:
                 if not self._step_plan(job):
                     return
             elif state == "ENCODING":
-                if not self._step_encode(job):
-                    return
+                try:
+                    if not self._step_encode(job):
+                        return
+                finally:
+                    # The flag exists only to tell crash recovery whether an
+                    # encoder was actually running.  Always clear it after a
+                    # controlled return; a SIGKILL leaves it behind.
+                    self.store.set_setting(f"encode-started:{job_id}", "")
             elif state == "ENCODED":
                 if not self._step_encoded(job):
                     return
@@ -506,6 +512,11 @@ class Engine:
             last.update(dict(info))
             self._write_progress(job["id"], "encoding", info)
 
+        # Persist that the encoder is about to run.  If the process dies during
+        # the encode, recovery sees this flag and counts a restart.  A job that
+        # is merely waiting for a start gate has no flag and must not be
+        # mistaken for an interrupted encode.
+        self.store.set_setting(f"encode-started:{job['id']}", str(self.clock()))
         try:
             result = self._run_encode_watched(job, plan, progress)
         except EncodeCancelled:
@@ -1397,10 +1408,21 @@ class Engine:
                         self.safety.remove(partial, "startup-cleanup", scratch=self.work / job["id"])
                     self._write_snapshot(job["id"])
                 elif state == "ENCODING":
+                    started_flag = self.store.get_setting(f"encode-started:{job['id']}", "")
+                    leftovers = [p for p in (self.work / job["id"]).glob("out.*") if p.is_file()]
+                    if not started_flag and not leftovers:
+                        # The job never left the start gate.  This is not an
+                        # interrupted encode and must not consume a restart.
+                        self.store.transition(job["id"], "PLANNED", expect_from="ENCODING",
+                                              message="encode had not started")
+                        self.store.event(job["id"], "recovery",
+                                         "encode had not started; resumed planning")
+                        self._write_snapshot(job["id"])
+                        continue
+                    self.store.set_setting(f"encode-started:{job['id']}", "")
                     restarts = int(job.get("restarts", 0)) + 1
-                    for p in (self.work / job["id"]).glob("out.*"):
-                        if p.is_file():
-                            self.safety.remove(p, "startup-interrupted-encode", scratch=self.work / job["id"])
+                    for p in leftovers:
+                        self.safety.remove(p, "startup-interrupted-encode", scratch=self.work / job["id"])
                     if restarts > int(_cfg(self.cfg, "max_restarts", 3)):
                         self._fail_job(job["id"], "restart-limit: startup-interrupted")
                     else:
