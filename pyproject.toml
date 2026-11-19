@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mediaflow"
+version = "1.0.0"
+description = "Media optimisation and organisation funnel"
+requires-python = ">=3.12"
+dependencies = ["guessit>=4.5,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6"]
+
+[project.scripts]
+mediaflow = "mediaflow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "integration: needs ffmpeg and synthetic media",
+  "crash: kill/recovery tests",
+  "slow: longer-running test",
+]
+filterwarnings = ["error::DeprecationWarning:mediaflow.*"]

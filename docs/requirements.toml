@@ -1,0 +1,278 @@
+# mediaflow requirement registry.
+# This file is the single source of truth for requirement IDs.
+# docs/INVARIANTS.md is generated from the safety=true entries; never edit it by hand.
+
+schema = 1
+spec = "mediaflow SPEC v1.0"
+
+[[requirements]]
+id = "SAF-1"
+title = "No deletion of originals"
+safety = true
+section = "7"
+text = "Originals are moved to trash, never deleted; trash shrinks only by retention expiry or an explicit trash purge. There is no automatic early purge."
+test = "tests/test_safety.py"
+
+[[requirements]]
+id = "SAF-2"
+title = "Verification before publish"
+safety = true
+section = "7"
+text = "Publish only after every check passes: output opens; duration is within max(1 s, 0.1%) and the last video packet matches; exactly one video stream and planned stream counts; resolution, HEVC tag, pixel format, SAR, colour metadata and frame rate match; total bitrate >= min_output_kbps; encode bits-per-pixel floor (REVIEW); full decode test. On failure the job is FAILED and the original untouched."
+test = "tests/test_verify.py"
+
+[[requirements]]
+id = "SAF-3"
+title = "Atomic publish and one filesystem"
+safety = true
+section = "7"
+text = "Publish is one rename() into movies/. inbox, convert, work, review, failed, trash and movies must share one st_dev or the daemon refuses to run. Every move is therefore a single rename."
+test = "tests/test_safety.py"
+
+[[requirements]]
+id = "SAF-4"
+title = "No overwrite, ever"
+safety = true
+section = "7"
+text = "An existing destination causes REVIEW duplicate. Only review accept --replace records an intent, moves the old library folder to trash with its own manifest, and then publishes. Nothing in movies/ is deleted or modified in place."
+test = "tests/test_engine.py"
+
+[[requirements]]
+id = "SAF-5"
+title = "Centralised deletion and moving"
+safety = true
+section = "7"
+text = "One deletion function only removes paths strictly under _pipeline/work, _pipeline/trash, or a job scratch directory; it refuses symlinks and paths with fewer than four components and logs every removal. One retire_move function moves into trash and never deletes. No shell=True or ad-hoc rm -rf."
+test = "tests/test_safety.py"
+
+[[requirements]]
+id = "SAF-6"
+title = "Crash safety and resumability"
+safety = true
+section = "7"
+text = "Every step is idempotent and resumable. Start-up recovery handles encoding or earlier, adopts a published destination only when its marker and output hash match, adopts a retire already in trash, and completes replace and restore intents. SIGKILL is tested in every window plus a chaos loop."
+test = "tests/test_crash.py"
+
+[[requirements]]
+id = "SAF-7"
+title = "Single instance and single writer"
+safety = true
+section = "7"
+text = "One daemon holds flock on /run/mediaflow/daemon.lock; one encode runs at a time. Mutating CLI commands are queued for the daemon or executed by the CLI while holding the same lock."
+test = "tests/test_engine.py"
+
+[[requirements]]
+id = "SAF-8"
+title = "Free-space guard"
+safety = true
+section = "7"
+text = "Free space must be at least max(1.2 * source_size, min_free_gb) before encode, before publish and during encode (watchdog uses min_free_gb / 2 and pauses). Root and DB filesystems need root_min_free_gb. Trash counts and pauses above max_trash_gb. Trash is never purged early."
+test = "tests/test_guards.py"
+
+[[requirements]]
+id = "SAF-9"
+title = "Machine protection"
+safety = true
+section = "7"
+text = "Layered protection: systemd limits, start gates (Jellyfin viewers, AC power, start temperature, schedule) and a coarse thermal SIGSTOP/SIGCONT stop last. The sensor is discovered by hwmon name; no sensor fails closed unless temp_sensor=none. Never touch fan or PROCHOT settings."
+test = "tests/test_guards.py"
+
+[[requirements]]
+id = "SAF-10"
+title = "Privilege and secrets"
+safety = true
+section = "7"
+text = "Run as mediaflow, never root, with no sudo. TMDb token is read from tmdb.env and sent only as an Authorization Bearer header, never in a URL. The notify URL is read only from notify.env. Both are redacted everywhere."
+test = "tests/test_secrets.py"
+
+[[requirements]]
+id = "SAF-11"
+title = "Dry-run first"
+safety = true
+section = "7"
+text = "Fresh installs start with dry_run = true. Turning it off is explicit and logged. In dry-run no file is moved, renamed, or published."
+test = "tests/test_engine.py"
+
+[[requirements]]
+id = "SAF-12"
+title = "Liveness"
+safety = true
+section = "7"
+text = "A job goes FAILED with its original preserved after max_restarts. A stall detector kills a live, unpaused encode with no progress for stall_minutes and counts a restart. An ffmpeg version change pauses the queue until capability tests pass."
+test = "tests/test_liveness.py"
+
+[[requirements]]
+id = "SAF-13"
+title = "Untrusted input"
+safety = true
+section = "7"
+text = "Every ffmpeg and ffprobe call includes -protocol_whitelist file,crypto,data. The probed container must be in the format allowlist. Only regular files are processed; symlinks inside preset folders are ignored and reported."
+test = "tests/test_probe.py"
+
+[[requirements]]
+id = "SCHED-1"
+title = "Schedule window is a start gate"
+safety = true
+section = "7"
+text = "A job starts only when its estimate fits before the window closes; once started it may overrun. A job that can never fit stays queued with paused reason estimate-exceeds-window, is reported once by status, and notifies after 30 minutes. run --force is the only override."
+test = "tests/test_sched.py"
+
+[[requirements]]
+id = "ENC-1"
+title = "Encoder interface reserved for phase 2"
+safety = false
+section = "7"
+text = "Encoding is invoked through encode(plan, resume_from=None), which returns the finished output. v1 always passes resume_from=None. No v1 code may assume an encode is a single indivisible ffmpeg run."
+test = "tests/test_encoder_interface.py"
+
+[[requirements]]
+id = "REV-1"
+title = "Review reasons resume at defined states"
+safety = true
+section = "4.1"
+text = "Every REVIEW reason records its origin state and resumes at the state in the review table. Clearing a review never skips planning, encoding, or verification."
+test = "tests/test_review.py"
+
+[[requirements]]
+id = "MP4-1"
+title = "HEVC MP4 video tag"
+safety = false
+section = "5.3"
+text = "Every HEVC video stream in an MP4 output (encode, remux, already-efficient and not-smaller fallbacks) gets -tag:v hvc1 and -movflags +faststart."
+test = "tests/test_ffmpeg.py"
+
+[[requirements]]
+id = "MP4-2"
+title = "Remux video compatibility"
+safety = false
+section = "5.3"
+text = "Video may be stream-copied into MP4 only when it is H.264 or HEVC. A remux to MP4 from another codec goes to REVIEW with reason remux-incompatible-video."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-3"
+title = "MP4 audio codec and channel rules"
+safety = false
+section = "5.3"
+text = "AAC, AC-3 and E-AC-3 are copied. DTS, DTS-HD, TrueHD, FLAC, PCM and Opus are transcoded by channel count: mono AAC 96k, stereo AAC 160k, 3-6 channels E-AC-3 448k preserving layout, 7-8 channels E-AC-3 640k, and more than 8 downmixed to 7.1. Remux-to-MP4 and SIZE-2 fallbacks follow this too."
+test = "tests/test_audio.py"
+
+[[requirements]]
+id = "MP4-4"
+title = "Audio selection order"
+safety = true
+section = "5.3"
+text = "Normalise language tags, drop commentary and audio-description tracks when exclude_commentary is true, prefer languages (original means default track language or first audio track), apply unknown_language, then fall back to the default or first audio track with a warning. Never produce zero audio if the source had audio. Default track first, then source order, up to max_tracks."
+test = "tests/test_audio.py"
+
+[[requirements]]
+id = "MP4-5"
+title = "MP4 text subtitles"
+safety = false
+section = "5.3"
+text = "Text subtitles (subrip, ass/ssa, webvtt, mov_text) are converted to mov_text for MP4; styling is lost."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-6"
+title = "MP4 bitmap subtitles"
+safety = true
+section = "5.3"
+text = "Bitmap subtitles (PGS, VobSub/dvd_subtitle, DVB) cannot go in MP4. With mkv_fallback, output the title as MKV with subtitles copied and record container mkv (bitmap subs). With drop, discard them and record it in the manifest."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-7"
+title = "Mixed containers"
+safety = false
+section = "5.3"
+text = "movies/ may contain MP4 and MKV. mkv_policy any_subs selects MKV whenever any subtitle is kept; never forbids MKV and drops bitmap subtitles. library report lists the container mix and the runbook explains it."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-8"
+title = "Sidecar subtitles"
+safety = false
+section = "5.3"
+text = "Sidecar *.srt, *.ass and *.vtt files next to the source are carried as Title (Year).<lang>.srt."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-9"
+title = "Chapters, attachments and data streams"
+safety = false
+section = "5.3"
+text = "MP4 keeps chapters (-map_chapters 0) and drops attachments, cover art and data streams. MKV presets keep attachments such as fonts."
+test = "tests/test_ffmpeg.py"
+
+[[requirements]]
+id = "MP4-10"
+title = "HDR and Dolby Vision"
+safety = true
+section = "5.3"
+text = "HDR10, HLG and Dolby Vision sources go to REVIEW with reason hdr unless the preset has hdr = keep. A keep remux copies the stream. A keep encode needs ten_bit_source = keep and working 10-bit encode. Never silently tone-map."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-11"
+title = "Interlaced sources"
+safety = false
+section = "5.3"
+text = "Interlaced sources go to REVIEW and are cleared by moving to a remux preset or rejecting."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "MP4-12"
+title = "Explicit stream mapping"
+safety = false
+section = "5.3"
+text = "Stream selection uses one explicit -map for each chosen stream and never -map 0."
+test = "tests/test_ffmpeg.py"
+
+[[requirements]]
+id = "MKV-1"
+title = "MKV presets are remux-only"
+safety = false
+section = "5.3"
+text = "An MKV preset is remux-only in v1, applies no codec restrictions, copies selected-language subtitles, keeps chapters and attachments, never needs hvc1, and still obeys selection, naming, verification and SAF rules."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "SIZE-1"
+title = "Already efficient"
+safety = false
+section = "5.3"
+text = "An HEVC source below the pixel-scaled bitrate threshold is remuxed. threshold_kbps = efficient_kbps_1080p * (pixels / 2073600) ** 0.75, giving about 2178 kbps at 720p and 11314 kbps at 2160p for the default 4000 kbps."
+test = "tests/test_size.py"
+
+[[requirements]]
+id = "SIZE-2"
+title = "Not smaller fallback"
+safety = false
+section = "5.3"
+text = "If encoded video stream bytes exceed in_video_bytes * (1 - min_savings_pct/100), discard the encode and re-plan as remux at plan_version + 1 with fallback_from = encode, reusing the audio and subtitle selection. If remux is incompatible the job goes to REVIEW. Recovery honours the recorded plan version."
+test = "tests/test_size.py"
+
+[[requirements]]
+id = "SIZE-3"
+title = "Never publish a larger encode"
+safety = true
+section = "5.3"
+text = "Never publish an encode whose video stream is larger than the source video; it follows the SIZE-2 fallback. Remux jobs are exempt from must-be-smaller."
+test = "tests/test_size.py"
+
+[[requirements]]
+id = "SIZE-4"
+title = "Frame rate and aspect"
+safety = true
+section = "5.3"
+text = "Never upscale. Keep the source frame rate (VFR stays VFR) and preserve display aspect ratio and SAR."
+test = "tests/test_plan.py"
+
+[[requirements]]
+id = "SIZE-5"
+title = "Explicit even dimensions"
+safety = false
+section = "5.3"
+text = "When a source exceeds the cap box, fit within max_width x max_height using SAR-derived display aspect, round width and height down to even numbers, and never exceed either cap. The plan records and ffmpeg receives explicit dimensions."
+test = "tests/test_dimensions.py"
