@@ -25,7 +25,7 @@ cd /srv/agent-work/mediaflow
 scripts/check.sh
 ```
 
-Result: `696 passed in 20.53s`. `scripts/check.sh` first runs
+Result: `696 passed in 20.83s`. `scripts/check.sh` first runs
 `tools/gen_invariants.py --check` and the traceability meta-test, then the
 unit/integration suite and the full suite including slow and crash/chaos tests.
 The runner refuses a `MEDIAFLOW_ROOT` under `/srv/media`.
