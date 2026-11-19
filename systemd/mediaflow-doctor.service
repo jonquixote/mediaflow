@@ -1,0 +1,17 @@
+[Unit]
+Description=Weekly mediaflow doctor report
+Documentation=file:///usr/share/doc/mediaflow/RUNBOOK.md
+
+[Service]
+Type=oneshot
+User=mediaflow
+Group=media
+Environment=MEDIAFLOW_CONFIG=/etc/mediaflow/config.toml
+ExecStart=/opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor
+Nice=19
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+ReadWritePaths=/srv/media /var/lib/mediaflow /run/mediaflow

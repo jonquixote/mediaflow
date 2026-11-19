@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily mediaflow retention, backup and failed-item sweep
+
+[Timer]
+OnCalendar=*-*-* 04:45:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

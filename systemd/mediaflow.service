@@ -1,0 +1,56 @@
+[Unit]
+Description=mediaflow media optimisation funnel
+Documentation=file:///usr/share/doc/mediaflow/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/mediaflow/config.toml
+
+[Service]
+Type=simple
+User=mediaflow
+Group=media
+SupplementaryGroups=render video
+Environment=MEDIAFLOW_CONFIG=/etc/mediaflow/config.toml
+ExecStart=/opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml run
+Restart=on-failure
+RestartSec=15
+KillMode=mixed
+TimeoutStopSec=120
+
+# RuntimeDirectory= creates /run/mediaflow with the setgid group mode.
+RuntimeDirectory=mediaflow
+RuntimeDirectoryMode=2775
+UMask=0002
+
+# Machine protection, layer 1 (SAF-9). Verify these on the real box before
+# setting dry_run=false; see docs/QUESTIONS.md.
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=300%
+MemoryHigh=2G
+MemoryMax=3G
+
+# Filesystem and privilege hardening.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/srv/media /var/lib/mediaflow /run/mediaflow
+DevicePolicy=closed
+DeviceAllow=/dev/null rw
+DeviceAllow=/dev/urandom rw
+DeviceAllow=/dev/random rw
+DeviceAllow=/dev/dri/renderD128 rw
+
+[Install]
+WantedBy=multi-user.target

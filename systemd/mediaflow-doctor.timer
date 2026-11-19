@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly mediaflow doctor
+
+[Timer]
+OnCalendar=Mon *-*-* 05:15:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

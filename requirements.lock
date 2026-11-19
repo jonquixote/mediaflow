@@ -1,0 +1,7 @@
+# Runtime dependencies, pinned with transitive hashes.
+# Installed by install.sh with: pip install --require-hashes --only-binary=:all: -r requirements.lock
+babelfish==0.6.1 --hash=sha256:512f1501d4c8f7d38f0921f48660be7542de1a7b24abb6a6a65324a670150293
+guessit==4.5.3 --hash=sha256:85d3a43f23dfa3949e314728ff394bfa3c3079c74afb417f8ee544423e57893c
+python-dateutil==4.0.0 --hash=sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c
+rebulk==6.0.2 --hash=sha256:3d9b1968f66adb93241d4379e0bc648e3eb965761502938cb44c247aeb358802
+tzdata==2026.6 --hash=sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec

@@ -1,0 +1,19 @@
+[Unit]
+Description=mediaflow daily DB backup, trash retention and failed-item sweep
+Documentation=file:///usr/share/doc/mediaflow/RUNBOOK.md
+
+[Service]
+Type=oneshot
+User=mediaflow
+Group=media
+# /run/mediaflow belongs to the main service; do not own or remove it here.
+Environment=MEDIAFLOW_CONFIG=/etc/mediaflow/config.toml
+ExecStart=/opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml maintenance
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+ReadWritePaths=/srv/media /var/lib/mediaflow /run/mediaflow
