@@ -33,11 +33,13 @@ def render(registry: dict) -> str:
 
 
 def main(argv: list[str]) -> int:
-    root = Path(argv[1]).resolve() if len(argv) > 1 else Path(__file__).resolve().parents[1]
+    check = "--check" in argv
+    positional = [arg for arg in argv[1:] if not arg.startswith("-")]
+    root = Path(positional[0]).resolve() if positional else Path(__file__).resolve().parents[1]
     source = root / "docs" / "requirements.toml"
     target = root / "docs" / "INVARIANTS.md"
     rendered = render(load(source))
-    if "--check" in argv:
+    if check:
         actual = target.read_text(encoding="utf-8") if target.exists() else ""
         if actual != rendered:
             print("docs/INVARIANTS.md is stale; run tools/gen_invariants.py", file=sys.stderr)
