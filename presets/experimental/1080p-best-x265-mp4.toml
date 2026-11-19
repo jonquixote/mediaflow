@@ -1,0 +1,48 @@
+# EXPERIMENTAL, disabled by default. install.sh never copies this into
+# presets.d and never creates its convert folder. To enable it: copy the file
+# into presets.d, set enabled = true, create the preset folder, run
+# `mediaflow calibrate` and record a speed-table entry. doctor warns while it
+# is enabled.
+id = "1080p-best-x265-mp4"
+description = "libx265 CRF 20, slow, max 1080p, MP4 (experimental, disabled)"
+container = "mp4"
+
+[meta]
+experimental = true
+enabled = false
+
+[video]
+action = "encode"
+codec = "hevc"                    # software backend selects libx265
+backend_order = ["software"]
+allow_software = true             # allowed only because the schedule window is set
+quality = 20                      # libx265 CRF
+look_ahead = false                # QSV-only option; not used by libx265
+max_width = 1920
+max_height = 1080
+ten_bit_source = "keep"
+tag = "hvc1"
+hdr = "review"
+interlaced = "review"
+
+[audio]
+languages = ["original", "eng"]
+max_tracks = 3
+copy_codecs = ["aac", "ac3", "eac3"]
+exclude_commentary = true
+unknown_language = "keep_first"
+
+[subtitles]
+languages = ["eng"]
+include_forced = true
+text = "mov_text"
+bitmap = "mkv_fallback"
+mkv_policy = "bitmap_only"
+
+[skip]
+already_efficient = true
+efficient_kbps_1080p = 4000
+min_savings_pct = 15
+
+[schedule]
+window = "01:00-07:00"            # SCHED-1: software encoding runs overnight only

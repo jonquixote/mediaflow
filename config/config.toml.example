@@ -1,0 +1,34 @@
+# mediaflow production configuration.
+# Secrets are NEVER stored here. Put them in /etc/mediaflow/tmdb.env and
+# /etc/mediaflow/notify.env (root:mediaflow, 0640).
+
+root = "/srv/media"
+ffmpeg = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+ffprobe = "/usr/lib/jellyfin-ffmpeg/ffprobe"
+dry_run = true
+poll_seconds = 30
+stable_seconds = 120
+trash_retention_days = 14
+failed_retention_days = 30
+min_free_gb = 40
+root_min_free_gb = 2
+max_trash_gb = 120
+space_watchdog_seconds = 60
+append_tmdbid = false
+pause_when_jellyfin_transcoding = true
+pause_on_battery = true
+pause_method = "sigstop"
+temp_sensor = "auto"
+start_if_temp_below_c = 65
+thermal_pause_c = 85
+thermal_resume_c = 75
+progress_seconds = 30
+stall_minutes = 10
+max_restarts = 3
+min_output_kbps = 300
+min_bpp = 0.01
+review_reminder_days = 3
+notify_cooldown_hours = 6
+jellyfin_user = "jellyfin"
+state_dir = "/var/lib/mediaflow"
+runtime_dir = "/run/mediaflow"

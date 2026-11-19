@@ -1,0 +1,47 @@
+# Deliberate home for HDR/Dolby Vision, 10-bit and exotic video codecs.
+# MKV presets are remux-only in v1 and never need an hvc1 tag.
+id = "keep-remux-mkv"
+description = "Remux any video codec into MKV; keep HDR, 10-bit and attachments"
+container = "mkv"
+
+[meta]
+experimental = false
+enabled = true
+
+[video]
+action = "remux"
+codec = "any"                     # MKV-1: no codec restrictions
+backend_order = []                # no encoder is used
+allow_software = false
+quality = 24                      # ignored for remux; kept for schema consistency
+look_ahead = false
+max_width = 3840                  # caps are ignored for remux
+max_height = 2160
+# tag intentionally absent: MKV does not use hvc1.
+hdr = "keep"
+interlaced = "review"
+# ten_bit_source is intentionally absent: it is an encode-only setting.
+
+[audio]
+languages = ["original", "eng"]
+max_tracks = 3
+copy_codecs = ["*"]               # MKV copies every audio codec
+exclude_commentary = true
+unknown_language = "keep_first"
+
+[subtitles]
+languages = ["eng"]
+include_forced = true
+text = "copy"                     # MKV-1 copies subtitles as-is
+# The output is already MKV, so bitmap/mkv_policy are not consulted. They are
+# set to a valid combination that still documents the intent.
+bitmap = "drop"
+mkv_policy = "bitmap_only"
+
+[skip]
+already_efficient = true
+efficient_kbps_1080p = 4000
+min_savings_pct = 15
+
+[schedule]
+window = ""

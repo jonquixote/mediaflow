@@ -1,0 +1,44 @@
+# Long TV-style content and low-value titles: HEVC hardware encode, max 720p.
+id = "720p-small-mp4"
+description = "HEVC hardware encode, higher quantiser, max 720p, MP4"
+container = "mp4"
+
+[meta]
+experimental = false
+enabled = true
+
+[video]
+action = "encode"
+codec = "hevc"
+backend_order = ["qsv", "vaapi"]
+allow_software = false
+quality = 28
+look_ahead = true
+max_width = 1280
+max_height = 720
+ten_bit_source = "keep"
+tag = "hvc1"
+hdr = "review"
+interlaced = "review"
+
+[audio]
+languages = ["original", "eng"]
+max_tracks = 3
+copy_codecs = ["aac", "ac3", "eac3"]
+exclude_commentary = true
+unknown_language = "keep_first"
+
+[subtitles]
+languages = ["eng"]
+include_forced = true
+text = "mov_text"
+bitmap = "mkv_fallback"
+mkv_policy = "bitmap_only"
+
+[skip]
+already_efficient = true
+efficient_kbps_1080p = 4000
+min_savings_pct = 15
+
+[schedule]
+window = ""

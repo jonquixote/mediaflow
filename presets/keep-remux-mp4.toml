@@ -1,0 +1,44 @@
+# Remux an H.264/HEVC source into MP4. No video re-encode.
+id = "keep-remux-mp4"
+description = "Remux H.264/HEVC video into MP4; change container and name only"
+container = "mp4"
+
+[meta]
+experimental = false
+enabled = true
+
+[video]
+action = "remux"
+codec = "copy"                    # MP4 remux compatibility is enforced by the planner (H.264/HEVC)
+backend_order = []                # no encoder is used
+allow_software = false
+quality = 24                      # ignored for remux; kept so every preset has the same schema
+look_ahead = false
+max_width = 3840                  # caps are ignored for remux
+max_height = 2160
+tag = "hvc1"                      # MP4-1: every HEVC MP4 output is tagged hvc1
+hdr = "review"                    # HDR/Dolby Vision needs keep-remux-mkv or explicit review
+interlaced = "review"
+# ten_bit_source is intentionally absent: it is an encode-only setting.
+
+[audio]
+languages = ["original", "eng"]
+max_tracks = 3
+copy_codecs = ["aac", "ac3", "eac3"]
+exclude_commentary = true
+unknown_language = "keep_first"
+
+[subtitles]
+languages = ["eng"]
+include_forced = true
+text = "mov_text"
+bitmap = "mkv_fallback"           # MP4-6: PGS/VobSub/DVB force an MKV output for this title
+mkv_policy = "bitmap_only"
+
+[skip]
+already_efficient = true
+efficient_kbps_1080p = 4000
+min_savings_pct = 15
+
+[schedule]
+window = ""
