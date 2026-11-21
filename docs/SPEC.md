@@ -120,6 +120,16 @@ is reported with it, and a metric that cannot be evaluated is reported as
 unavailable rather than silently skipped. A breach of the floor is a REVIEW,
 not a failure.
 
+Calibration measures that same operation. It builds the production plan,
+encodes an explicitly requested source interval with the production command
+builder and encoder, and compares the trial with the same interval of the
+source scaled to the planned geometry, so both sides cover the same frames.
+It refuses - with a reason - when no eligible backend exists and never
+substitutes one silently; a failed comparison or a frame-count mismatch is
+`n/a`, never a number. Only a valid trial seeds the speed table, and the
+seed is keyed by the backend that actually ran. Trial artifacts live in the
+configured work area and are removed through the approved cleanup path.
+
 MP4 rules: MP4-1, MP4-2, MP4-3, MP4-4, MP4-5, MP4-6, MP4-7, MP4-8, MP4-9,
 MP4-10, MP4-11, MP4-12. MKV-1. Size rules: SIZE-1, SIZE-2, SIZE-3, SIZE-4,
 SIZE-5. Backend tests run 8-bit and 10-bit HEVC with the exact preset options
@@ -148,6 +158,7 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-11** fresh install dry-run; explicit logged disable; nothing moves in dry-run.
 - **SAF-12** liveness: restart limit, stall detector, ffmpeg-version change pauses until capability tests pass.
 - **SAF-13** untrusted input: protocol whitelist, format allowlist, regular files only.
+- **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
 - **SCHED-1** schedule window is a start gate only; estimates must fit; force is the only override.
 - **REV-1** each REVIEW reason has a fixed resume state.
 - **ENC-1** encode interface accepts `resume_from`, reserved for phase 2.

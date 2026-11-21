@@ -110,6 +110,14 @@ text = "Every ffmpeg and ffprobe call includes -protocol_whitelist file,crypto,d
 test = "tests/test_probe.py"
 
 [[requirements]]
+id = "SAF-14"
+title = "Calibration measures the production operation"
+safety = true
+section = "5.4"
+text = "Calibration measures the production operation: the same planner, command builder, encoder, backend and target geometry as an encode, over an explicitly requested source interval. It never substitutes a backend silently; without an eligible backend it refuses and names the reason. The quality reference is the same source interval, decoded and scaled to the planned geometry, so both sides cover the same frames; a failed comparison or a frame-count mismatch is reported as not available with a reason, never as a number. A trial is seeded into the speed table only when it is valid, and the seed is keyed by the backend that actually ran."
+test = "tests/test_calibrate.py"
+
+[[requirements]]
 id = "SCHED-1"
 title = "Schedule window is a start gate"
 safety = true

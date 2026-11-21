@@ -417,10 +417,17 @@ def cmd_calibrate(args) -> int:
         except Exception as exc:
             print(f"calibration failed: {exc}", file=sys.stderr)
             return 2
+        status = result.get("status", "ok")
         if args.json:
             print(_json(result))
         else:
             print(format_calibration(result, short=args.short))
+        if status != "ok":
+            print(
+                f"calibration {status}: {result.get('reason') or 'no reason given'}",
+                file=sys.stderr,
+            )
+            return 2
         return 0
     finally:
         store.close()
