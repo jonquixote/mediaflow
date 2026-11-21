@@ -5,6 +5,71 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Sandbox verification - 2026-11-21 (Pass A: execution semantics)
+
+Environment: the same sandbox as the 2026-11-18 run below - Linux x86_64,
+Python 3.14.4, pytest 9.2.0, `/usr/lib/jellyfin-ffmpeg/ffmpeg` 8.1.3-Jellyfin.
+`/dev/dri/renderD128` is still not readable by the build user, so no hardware
+encode ran. Production `/srv/media` and the system configuration were not
+touched; every run used a sandbox root under `/tmp`.
+
+### Test suite
+
+Command:
+
+```sh
+cd /srv/agent-work/mediaflow
+scripts/check.sh
+```
+
+Result: `6 passed in 0.20s` for the traceability and generated-invariants
+step, `731 passed in 31.13s` for the unit/integration suite and
+`731 passed in 31.26s` for the full suite (including slow, crash and chaos
+tests). The baseline before this pass was 698 passed; the pass adds 33
+regression tests (14 calibration, 12 verifier, 2 planner, 1 encoder, plus
+the extended colour and stream-contract cases).
+
+### What the new checks were exercised against
+
+All of these ran on real, tiny files produced with the sandbox ffmpeg:
+
+- Video codec contract: a planned HEVC encode rejects an H.264 output, a
+  planned remux accepts the copied H.264 codec, and an MP4 HEVC output
+  without the `hvc1` sample entry is rejected while one with it passes.
+- Audio contract: codec, channel count, speaker layout, language and the
+  default disposition are each checked; a wrong value fails and a downmix is
+  judged by its channel count only.
+- Subtitle contract: a `mov_text` output passes, a copied text subtitle fails.
+- Colour contract: a stated colour property that disappears from the output
+  fails, a conflicting value fails, an unstated property creates no
+  requirement, and the documented `limited`/`tv` alias compares equal.  The
+  planner no longer turns ffprobe's inferred `color_range=tv` into a
+  requirement, which is what a plain MKV-to-MP4 remux of an untagged source
+  needs.
+- Quality metric: the value is bits per pixel per frame (a factor of 25 away
+  from the old per-second formula on a 25 fps clip), the frame-count basis is
+  reported (`container`, `decoded` or a labelled `estimated` value), a breach
+  of the floor is a REVIEW and not a failure, and an unknown frame count is
+  reported instead of being skipped.
+- Calibration: the trial command is the production command (the planner's
+  encoder, quality handling, target scaling, sample window and video-only
+  mapping), a 4K source is measured at the planned 1080p geometry, a preset
+  without an eligible backend is refused with a reason, a remux preset is
+  reported as not applicable, a failed scoring run is `n/a` with a reason, a
+  failed trial never seeds the speed table, and a valid trial seeds it under
+  the backend that actually ran.  Trial artifacts stayed inside the
+  configured work area and were removed afterwards.
+
+### Not verified here
+
+- Every QSV and VAAPI claim (backend selection, look-ahead, 10-bit, colour
+  round-trip, rate control) is still hardware-only and is listed in
+  `docs/QUESTIONS.md`.
+- The sandbox ffmpeg build has no `libvmaf` filter, so only the SSIM path of
+  the calibration score was exercised; the VMAF path is unverified.
+- The bits-per-pixel floor default (0.01 bits per pixel per frame) is a
+  placeholder and was not calibrated against real content.
+
 ## Sandbox verification - 2026-11-18
 
 Environment:

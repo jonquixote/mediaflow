@@ -54,6 +54,7 @@ stream indexes as reported by ffprobe. Paths in the plan are absolute.
       "source_codec": "dts",
       "language": "eng",
       "channels": 6,
+      "channel_layout": "5.1",
       "action": "transcode",
       "codec": "eac3",
       "bitrate": 448,
@@ -94,6 +95,16 @@ Rules:
   selected but copied.
 - For MP4 HEVC, `video.tag` is `hvc1`.
 - `video.target_width/height` are always explicit even numbers.
+- `video.color` carries only the colour properties the source **states**.
+  A property the source does not state is `null`; mediaflow never invents a
+  colour tag. ffprobe infers `color_range=tv` from an ordinary 8-bit 4:2:0
+  pixel format, so an inferred range is not a stated range and stays
+  `null` unless the source states full range (`pc`) or states a colour
+  matrix alongside it.
+- `audio[].channel_layout` is the source layout when ffprobe reports a
+  usable one (`5.1`, `stereo`, ...); it is absent when the layout is
+  unknown. `audio[].target_channels` is present when the output channel
+  count differs from the source (a downmix to 8 channels).
 - Review decisions are represented by a `ReviewRequired` exception while
   planning, not by a published plan. A persisted plan always has `review:
   null`; the engine records the review reason and origin state.

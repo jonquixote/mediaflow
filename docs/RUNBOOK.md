@@ -106,6 +106,26 @@ The table always has quality, size, time and a score (VMAF or SSIM, otherwise
 `n/a`). Choose values and edit the preset files. Real encodes also refine the
 speed table.
 
+`calibrate` measures the *production* operation: it builds the same plan an
+encode would use and runs the same command builder and encoder over the
+requested sample interval, so the number describes the real job. Read the
+report before trusting it:
+
+- The header names the preset, the encoder, the target geometry and the
+  scope. The scope is `video-encode-only`: audio and subtitle handling are
+  not part of the measurement.
+- `status: refused` means nothing was measured - usually no hardware encoder
+  is available for that preset. The reason line says which. Nothing is
+  seeded into the speed table in that case.
+- `status: not-applicable` means the preset does not measure anything (a
+  remux preset).
+- A row with `n/a` in the score column still has a valid size and time. The
+  reason (`scoring failed`, `frame count mismatch`, ...) is printed under the
+  row. A missing score never blocks the size/time measurement.
+- Only a valid trial seeds the speed table, under the backend that actually
+  ran. Trial files are written under the configured work area
+  (`_pipeline/work/calibration/`) and removed when the run ends.
+
 ## 6. MP4 and MKV in the same library
 
 `movies/` can contain both containers; Jellyfin handles this. An MP4 cannot

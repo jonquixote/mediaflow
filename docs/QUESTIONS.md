@@ -36,8 +36,20 @@ Format: `- [ ] section, what, how john can test`.
 ## Calibration, memory and scheduling
 
 - [ ] Section 5.4, `calibrate` on one animation, one dark live-action and one high-grain film, section 5.4. Run with 90 seconds, record size/time/VMAF or SSIM, and write the chosen quality values into the preset files.
+- [ ] Section 5.4/SAF-14, `calibrate` on the real machine reports the same backend the plan would select (`doctor` backend, not a silent software fallback), section 5.4. Run `mediaflow calibrate <clip> --preset 1080p-balanced-mp4 --json` and check that `backend`/`encoder` match the hardware the planner picks.
+- [ ] Section 5.4/SAF-14, the calibration quality score is meaningful on the real machine: the sandbox ffmpeg build has no `libvmaf`, so only SSIM was exercised, section 5.4. Run the same clip with an ffmpeg build that has `libvmaf` and record both numbers next to the chosen quality.
+- [ ] Section 5.4/SAF-14, the speed-table seed is found again by `estimate` after a calibration, section 12. Calibrate, then run `mediaflow estimate <path> --preset <id>` and confirm the factor matches the seeded one.
 - [ ] Section 5.4, speed-table estimates within 30% of real encode time on the sample clips, section 12. Compare `estimate` before and real encode wall time after; record both.
 - [ ] Section 5.4, the experimental x265 preset estimate versus the overnight window, section 5.1. Leave it disabled; if testing, calibrate first, copy the preset into `presets.d`, set `enabled=true`, create its convert folder, and confirm the schedule gate refuses jobs longer than the window.
+
+## Colour metadata, codecs and the quality metric
+
+- [ ] Section 7/SAF-2, the QSV and VAAPI encode paths carry the source's stated colour description (primaries, transfer, matrix, range) into the output; the sandbox could only verify the software path, section 7. Encode one tagged bt709 and one tagged bt2020/smpte2084 clip with `1080p-balanced-mp4` and check `ffprobe -show_streams` for `color_primaries`, `color_transfer`, `color_space` and `color_range`.
+- [ ] Section 7/SAF-2, an MP4 output written by the hardware encoders contains a complete `colr` box: the MP4 `nclx` entry needs primaries, transfer and matrix, and a range-only description cannot be carried, section 7. Inspect the box of a hardware-encoded MP4 (`ffprobe -show_streams` plus a hex look for `colr`) and record which fields survive.
+- [ ] Section 5.5/SAF-2, the planner's backend choice and the engine's speed-table backend key can disagree (`Engine._choose_backend` picks from the capability file, the planner also weighs the codec, the bit depth and the schedule window), section 5.5. On the real machine, compare the backend in `mediaflow plan --json` with the backend in `mediaflow estimate --json` for the same source and record whether they differ.
+- [ ] Section 7/SAF-2, the bits-per-pixel floor default (`min_bpp = 0.01` bits per pixel per frame, about 498 kbps at 1080p24) is a placeholder and is not empirically calibrated; the metric changed units in this pass, section 7. Run the calibration on the three sample clips, record the measured bits per pixel per frame, and set the default from that evidence.
+- [ ] Section 7/SAF-2, the presented-frame-count basis for variable-frame-rate sources (container count, then decoded count, then a labelled estimate), section 7. Take a VFR sample, compare `ffprobe -count_frames` with the container count, and record which basis the verifier used.
+- [ ] Section 7/SAF-2, the MP4 muxer marks the first track of a type as default even when the plan says otherwise, while MKV keeps the disposition exactly; the plan always marks the first selected audio track as default, section 7. Confirm on the real machine that a multi-track source keeps its intended default track after an MP4 encode.
 
 ## Environment-specific checks
 
