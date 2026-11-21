@@ -296,6 +296,87 @@ def test_plan_matches_plan_schema(tmp_path):
     json.dumps(plan)  # must be stored in jobs.plan_json
 
 
+def test_plan_colour_records_only_values_the_source_states(tmp_path):
+    """SAF-2: the colour contract never carries an inferred value.
+
+    ffprobe reports ``color_range=tv`` for ordinary 8-bit 4:2:0 even when
+    the file states no range at all.  Such a value is inferred from the
+    pixel format and must not become part of the output contract.
+    """
+    inferred = make_probe(
+        tmp_path,
+        video={
+            "color_primaries": None,
+            "color_transfer": None,
+            "color_space": None,
+            "color_range": "tv",
+        },
+    )
+    plan = build(inferred)
+    assert plan["video"]["color"] == {
+        "primaries": None,
+        "transfer": None,
+        "space": None,
+        "range": None,
+    }
+
+    stated = make_probe(
+        tmp_path,
+        video={
+            "color_primaries": "bt709",
+            "color_transfer": "bt709",
+            "color_space": "bt709",
+            "color_range": "tv",
+        },
+    )
+    plan = build(stated)
+    assert plan["video"]["color"] == {
+        "primaries": "bt709",
+        "transfer": "bt709",
+        "space": "bt709",
+        "range": "tv",
+    }
+
+    full_range = make_probe(
+        tmp_path,
+        video={
+            "color_primaries": None,
+            "color_transfer": None,
+            "color_space": None,
+            "color_range": "pc",
+        },
+    )
+    plan = build(full_range)
+    assert plan["video"]["color"]["range"] == "pc"
+
+
+def test_audio_contract_records_the_layout_and_the_downmix_target(tmp_path):
+    """SAF-2: the audio contract states what the output must look like.
+
+    A copy or a same-count transcode keeps the source speaker layout, so
+    it is part of the contract.  A downmix changes the channel count and
+    the encoder chooses the resulting layout, so only the count is
+    contractual there.
+    """
+    probe = make_probe(
+        tmp_path,
+        audio=[
+            audio_stream(1, "dts", "eng", 6),
+            audio_stream(2, "truehd", "eng", 12),
+        ],
+    )
+    probe.raw["streams"][1]["channel_layout"] = "5.1"
+    probe.raw["streams"][2]["channel_layout"] = "7.1.4"
+    plan = build(probe)
+
+    by_index = {entry["index"]: entry for entry in plan["audio"]}
+    assert by_index[1]["channel_layout"] == "5.1"
+    assert "target_channels" not in by_index[1]
+    assert by_index[2]["target_channels"] == 8
+    assert by_index[2]["downmix"] is True
+    assert "channel_layout" not in by_index[2]
+
+
 def test_planner_records_explicit_stream_indexes_and_never_map_zero(tmp_path):
     """MP4-12: the plan carries absolute indexes; -map 0 belongs to the encoder."""
     probe = make_probe(

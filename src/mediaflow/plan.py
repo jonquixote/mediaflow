@@ -618,6 +618,24 @@ def _stream_channels(stream: Mapping[str, Any]) -> int:
     return _int(stream.get("channels"), 0)
 
 
+def _channel_layout(stream: Mapping[str, Any]) -> str | None:
+    """The source channel layout, when ffprobe reports a usable one.
+
+    ffprobe reports ``channel_layout`` as a string ("5.1"); newer builds may
+    expose the structured ``ch_layout`` object instead.  Unknown layouts
+    return ``None`` so the verifier never invents a layout requirement.
+    """
+    value: Any = stream.get("channel_layout")
+    if value is None:
+        value = stream.get("ch_layout")
+    if isinstance(value, Mapping):
+        value = value.get("description") or value.get("name")
+    text = str(value or "").strip()
+    if not text or text.lower() in {"unknown", "unspecified", "none", "n/a", ""}:
+        return None
+    return text
+
+
 def _disposition(stream: Mapping[str, Any]) -> Mapping[str, Any]:
     return _mapping(stream.get("disposition"))
 
@@ -807,12 +825,60 @@ def _frame_rate(stream: Mapping[str, Any]) -> str:
     return "0/0"
 
 
+#: Values that mean "this property is not stated by the file".
+UNKNOWN_COLOUR_VALUES = frozenset(
+    {"", "unknown", "unspecified", "und", "n/a", "none", "reserved"}
+)
+
+
+def _known_colour_value(value: Any) -> Any:
+    """Return *value* when the file states it, otherwise ``None``.
+
+    ffprobe reports placeholder strings for properties the container does
+    not carry.  Those are not part of the output contract: mediaflow never
+    invents a colour tag.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in UNKNOWN_COLOUR_VALUES:
+        return None
+    return text
+
+
 def _colour(stream: Mapping[str, Any]) -> dict[str, Any]:
+    """The colour properties the source *states*.
+
+    ffprobe infers ``color_range=tv`` for ordinary 8-bit 4:2:0 pixel
+    formats even when the stream carries no range tag at all.  Such an
+    inferred value is not a statement by the file, so it is not put into
+    the plan: the plan is the output contract and it may only carry
+    colour metadata the source actually declares.
+
+    A range is therefore kept when
+
+    * it is ``pc`` (full range) - ffprobe never infers that for the
+      standard pixel formats, so it is stated by the source; or
+    * the source also states a colour matrix, in which case the range
+      belongs to a complete colour description (an MP4 ``nclx`` box
+      always carries the full-range flag next to the matrix).
+    """
+    primaries = _known_colour_value(stream.get("color_primaries"))
+    transfer = _known_colour_value(stream.get("color_transfer"))
+    space = _known_colour_value(stream.get("color_space"))
+    raw_range = _known_colour_value(stream.get("color_range"))
+    if raw_range is None:
+        colour_range: Any = None
+    elif raw_range.lower() == "pc" or space is not None:
+        colour_range = raw_range
+    else:
+        # ffprobe inferred the limited range from the pixel format.
+        colour_range = None
     return {
-        "primaries": stream.get("color_primaries"),
-        "transfer": stream.get("color_transfer"),
-        "space": stream.get("color_space"),
-        "range": stream.get("color_range"),
+        "primaries": primaries,
+        "transfer": transfer,
+        "space": space,
+        "range": colour_range,
     }
 
 
@@ -972,11 +1038,21 @@ def audio_choice(
         "bitrate": None if can_copy else _audio_codec_for_transcode(channels)[1],
         "default": bool(default),
     }
+    layout = _channel_layout(stream)
     title = _track_title(stream)
     if title:
         entry["title"] = title
     if not can_copy and channels > 8:
         entry["downmix"] = True
+        # The output channel count differs from the source here; the plan
+        # states it explicitly so the verifier never has to guess.  The
+        # speaker layout after a downmix is chosen by the encoder, so the
+        # source layout is not part of the output contract in this case.
+        entry["target_channels"] = 8
+    elif layout:
+        # Copy and same-count transcode keep the source layout, so it is
+        # part of the output contract and the verifier checks it.
+        entry["channel_layout"] = layout
     return entry
 
 
