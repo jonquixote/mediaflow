@@ -105,6 +105,21 @@ SIZE-5 computes explicit even target dimensions. Quality values are
 placeholders calibrated by john; speed estimates are keyed by preset, backend
 and resolution bucket and updated by real encodes.
 
+Verification compares the output with the plan. The video codec must match
+(the encoder family for an encode, the copied source codec for a remux) and
+every HEVC stream in an MP4 output must carry `hvc1`. Resolution, pixel
+format, SAR and frame rate must match. Every colour property the source
+*states* must be present and equal in the output; a property the source does
+not state is never invented and creates no requirement. Every planned audio
+track must match codec, channel count, channel layout, language and default
+disposition, and every planned subtitle track must match codec, language,
+forced and default disposition. The advisory quality metric is **bits per
+pixel per frame** (video payload bits / (presented frames x width x height));
+its frame-count basis (container count, decoded count or a labelled estimate)
+is reported with it, and a metric that cannot be evaluated is reported as
+unavailable rather than silently skipped. A breach of the floor is a REVIEW,
+not a failure.
+
 MP4 rules: MP4-1, MP4-2, MP4-3, MP4-4, MP4-5, MP4-6, MP4-7, MP4-8, MP4-9,
 MP4-10, MP4-11, MP4-12. MKV-1. Size rules: SIZE-1, SIZE-2, SIZE-3, SIZE-4,
 SIZE-5. Backend tests run 8-bit and 10-bit HEVC with the exact preset options

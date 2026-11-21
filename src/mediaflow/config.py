@@ -606,7 +606,9 @@ def _validate_config(config: Config) -> list[str]:
     non_negative("review_reminder_days", config.review_reminder_days)
     non_negative("notify_cooldown_hours", config.notify_cooldown_hours)
     if config.min_bpp > 10.0:
-        errors.append("min_bpp is implausibly large (expected bits per pixel, <= 10)")
+        errors.append(
+            "min_bpp is implausibly large (expected bits per pixel per frame, <= 10)"
+        )
     if config.start_if_temp_below_c > 120.0:
         errors.append("start_if_temp_below_c must be <= 120")
     if config.thermal_pause_c > 120.0:

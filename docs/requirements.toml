@@ -18,7 +18,7 @@ id = "SAF-2"
 title = "Verification before publish"
 safety = true
 section = "7"
-text = "Publish only after every check passes: output opens; duration is within max(1 s, 0.1%) and the last video packet matches; exactly one video stream and planned stream counts; resolution, HEVC tag, pixel format, SAR, colour metadata and frame rate match; total bitrate >= min_output_kbps; encode bits-per-pixel floor (REVIEW); full decode test. On failure the job is FAILED and the original untouched."
+text = "Publish only after every check passes: output opens; duration is within max(1 s, 0.1%) and the last video packet matches; exactly one video stream and the planned stream counts; the planned video codec matches (the encoder family for an encode, the copied source codec for a remux) and every HEVC stream in an MP4 output carries the hvc1 tag; resolution, pixel format, SAR and frame rate match; every colour property the source states is present and equal in the output, while an unstated property creates no requirement; every planned audio track matches codec, channel count, channel layout, language and default disposition; every planned subtitle track matches codec, language, forced and default disposition; total bitrate >= min_output_kbps; the bits-per-pixel-per-frame floor (REVIEW) with its frame-count basis reported; full decode test. On failure the job is FAILED and the original untouched."
 test = "tests/test_verify.py"
 
 [[requirements]]

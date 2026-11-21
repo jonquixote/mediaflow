@@ -69,6 +69,12 @@ def media(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "aac",
         "-b:a",
         "96k",
+        "-ac",
+        "2",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-disposition:a:0",
+        "default",
         "-shortest",
         str(source),
     )
@@ -156,14 +162,9 @@ def media(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "51",
         "-pix_fmt",
         "yuv420p",
-        "-color_primaries",
-        "bt709",
-        "-color_trc",
-        "bt709",
-        "-colorspace",
-        "bt709",
-        "-color_range",
-        "tv",
+        # A complete, production-shaped colour description.
+        "-vf",
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv",
         str(low),
     )
 
@@ -193,6 +194,8 @@ def media(tmp_path_factory: pytest.TempPathFactory) -> dict:
         "yuv420p",
         "-c:s",
         "mov_text",
+        "-metadata:s:s:0",
+        "language=eng",
         "-t",
         "1",
         str(subtitled),
@@ -232,27 +235,36 @@ def _plan(
     subtitles: int = 0,
     source_video_bytes: int = 10**9,
     color: dict | None = None,
+    audio_codec: str = "aac",
+    audio_channels: int = 2,
+    audio_layout: str | None = None,
+    audio_language: str = "eng",
+    subtitle_codec: str = "subrip",
+    subtitle_action: str = "mov_text",
+    subtitle_language: str = "eng",
+    subtitle_forced: bool = False,
 ) -> dict:
     audio = [
         {
             "index": 1 + index,
             "source_codec": "aac",
-            "language": "eng",
-            "channels": 2,
+            "language": audio_language,
+            "channels": audio_channels,
             "action": "copy",
-            "codec": "aac",
+            "codec": audio_codec,
             "bitrate": 96,
             "default": index == 0,
+            **({"channel_layout": audio_layout} if audio_layout else {}),
         }
         for index in range(audio_count)
     ]
     subtitle_entries = [
         {
             "index": 1 + audio_count + index,
-            "source_codec": "subrip",
-            "language": "eng",
-            "forced": False,
-            "action": "mov_text",
+            "source_codec": subtitle_codec,
+            "language": subtitle_language,
+            "forced": subtitle_forced,
+            "action": subtitle_action,
             "sidecar": None,
         }
         for index in range(subtitles)
@@ -282,7 +294,7 @@ def _plan(
             "frame_rate": frame_rate,
             "color": color or {},
             "backend": "software",
-            "encoder": "libx265",
+            "encoder": "libx264" if video_codec == "h264" else "libx265",
             "quality": 24,
         },
         "audio": audio,
@@ -483,10 +495,8 @@ def test_resolution_pix_fmt_and_sar_mismatches_fail(media: dict) -> None:
 
 
 @pytest.mark.integration
-def test_frame_rate_and_colour_mismatches_fail_and_unknown_is_allowed(
-    media: dict,
-) -> None:
-    """SAF-2: fps within 0.001; unknown colour metadata is acceptable."""
+def test_frame_rate_mismatch_fails(media: dict) -> None:
+    """SAF-2: the output frame rate must match the planned one."""
     wrong_rate = _plan(
         media["source"],
         action="remux",
@@ -499,7 +509,11 @@ def test_frame_rate_and_colour_mismatches_fail_and_unknown_is_allowed(
     assert not result.ok
     assert any("frame rate" in failure for failure in result.failures)
 
-    wrong_colour = _plan(
+
+@pytest.mark.integration
+def test_known_colour_metadata_must_survive(media: dict) -> None:
+    """SAF-2: a known colour property may not disappear from the output."""
+    conflicting = _plan(
         media["source"],
         action="remux",
         duration=0.5,
@@ -508,17 +522,59 @@ def test_frame_rate_and_colour_mismatches_fail_and_unknown_is_allowed(
         source_video_bytes=10**9,
         color={"space": "bt2020nc", "primaries": "bt2020"},
     )
-    result = verify_output(wrong_colour, media["low"], min_output_kbps=1, min_bpp=0)
+    result = verify_output(conflicting, media["low"], min_output_kbps=1, min_bpp=0)
     assert not result.ok
     assert any("colour space" in failure for failure in result.failures)
 
-    unknown_source = _plan(
+    missing = _plan(
         media["source"],
         action="remux",
         source_video_bytes=media["remux_video_bytes"],
-        color={"primaries": "bt2020", "transfer": "smpte2084"},
+        color={"primaries": "bt709", "transfer": "bt709"},
     )
-    result = verify_output(unknown_source, media["remux"])
+    result = verify_output(missing, media["remux"])
+    assert not result.ok
+    assert any("colour primaries is missing" in failure for failure in result.failures)
+    assert any("colour transfer is missing" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_unspecified_colour_metadata_creates_no_requirement(media: dict) -> None:
+    """SAF-2: unknown/unset plan colour never invents an output requirement."""
+    unspecified = _plan(
+        media["source"],
+        action="remux",
+        source_video_bytes=media["remux_video_bytes"],
+        color={"primaries": None, "transfer": "unknown", "space": "", "range": None},
+    )
+    result = verify_output(unspecified, media["remux"])
+    assert result.ok, result.failures
+
+    absent = _plan(
+        media["source"],
+        action="remux",
+        source_video_bytes=media["remux_video_bytes"],
+        color={},
+    )
+    result = verify_output(absent, media["remux"])
+    assert result.ok, result.failures
+
+
+@pytest.mark.integration
+def test_documented_colour_aliases_compare_equal(media: dict) -> None:
+    """SAF-2: "limited" is the documented alias of the "tv" range."""
+    alias = _plan(
+        media["source"],
+        action="remux",
+        duration=0.5,
+        target=(160, 120),
+        frame_rate="10/1",
+        audio_count=0,
+        source_video_bytes=10**9,
+        color={"primaries": "bt709", "transfer": "bt709", "space": "bt709",
+               "range": "limited"},
+    )
+    result = verify_output(alias, media["low"], min_output_kbps=1, min_bpp=0)
     assert result.ok, result.failures
 
 
@@ -731,3 +787,379 @@ def test_plan_errors_are_valueerror(media: dict) -> None:
     del missing_audio["audio"]
     with pytest.raises(ValueError, match="audio"):
         verify_output(missing_audio, media["remux"])
+
+
+# ---------------------------------------------------------------------------
+# planned stream contract (A4)
+# ---------------------------------------------------------------------------
+
+
+def _make_output(
+    path: Path,
+    *,
+    video_codec: str = "libx264",
+    audio_codec: str | None = "aac",
+    channels: int = 2,
+    language: str = "eng",
+    default: bool = True,
+    size: str = "320x240",
+    rate: int = 25,
+    duration: float = 1.0,
+) -> Path:
+    """Build a tiny real output file with the requested track shape."""
+    args = [
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={size}:rate={rate}:duration={duration}",
+    ]
+    if audio_codec:
+        args += [
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:sample_rate=48000:duration={duration}",
+        ]
+    args += ["-map", "0:v:0"]
+    if audio_codec:
+        args += ["-map", "1:a:0"]
+    args += [
+        "-c:v",
+        video_codec,
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if video_codec == "libx265":
+        args += ["-x265-params", "log-level=error"]
+    if audio_codec:
+        args += [
+            "-c:a",
+            audio_codec,
+            "-ac",
+            str(channels),
+            "-b:a",
+            "96k",
+            "-metadata:s:a:0",
+            f"language={language}",
+            "-disposition:a:0",
+            "default" if default else "0",
+        ]
+    args += ["-shortest"]
+    _run_ffmpeg(*args, str(path))
+    return path
+
+
+@pytest.mark.integration
+def test_planned_hevc_rejects_an_h264_output(media: dict) -> None:
+    """SAF-2: the planned video codec is part of the output contract."""
+    plan = _plan(media["source"], action="encode", video_codec="hevc")
+    result = verify_output(plan, media["remux"])
+    assert not result.ok
+    assert any("video codec" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_remux_plan_is_checked_against_the_source_codec(media: dict) -> None:
+    """SAF-2: a remux keeps the source codec and is verified against it."""
+    plan = _plan(
+        media["source"],
+        action="remux",
+        video_codec="h264",
+        source_video_bytes=media["remux_video_bytes"],
+    )
+    result = verify_output(plan, media["remux"])
+    assert result.ok, result.failures
+
+
+@pytest.mark.integration
+def test_mp4_hevc_requires_the_hvc1_sample_entry(media: dict) -> None:
+    """MP4-1: every HEVC stream in an MP4 output carries the hvc1 tag."""
+    plan = _plan(
+        media["source"],
+        action="encode",
+        video_codec="hevc",
+        target=(32, 32),
+        frame_rate="10/1",
+        duration=0.2,
+        audio_count=0,
+    )
+    good = verify_output(plan, media["hevc_hvc1"], min_output_kbps=1)
+    assert good.ok, good.failures
+
+    bad = verify_output(plan, media["hevc_hev1"], min_output_kbps=1)
+    assert not bad.ok
+    assert any("hvc1" in failure for failure in bad.failures)
+
+
+@pytest.mark.integration
+def test_audio_codec_mismatch_fails(media: dict, tmp_path: Path) -> None:
+    """SAF-2: every planned audio track is checked codec by codec."""
+    output = _make_output(tmp_path / "ac3.mp4", audio_codec="ac3")
+    plan = _plan(media["source"], action="encode", audio_codec="aac")
+    result = verify_output(plan, output)
+    assert not result.ok
+    assert any("audio track 0: codec" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_audio_channel_count_mismatch_fails(media: dict, tmp_path: Path) -> None:
+    """SAF-2: the planned audio channel count is enforced."""
+    output = _make_output(tmp_path / "mono.mp4", channels=1)
+    plan = _plan(media["source"], action="encode", audio_channels=2)
+    result = verify_output(plan, output)
+    assert not result.ok
+    assert any("channel count" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_audio_channel_layout_mismatch_fails(media: dict, tmp_path: Path) -> None:
+    """SAF-2: the planned audio channel layout is enforced."""
+    output = _make_output(tmp_path / "surround.mp4", channels=6)
+    plan = _plan(
+        media["source"],
+        action="encode",
+        audio_channels=6,
+        audio_layout="stereo",
+    )
+    result = verify_output(plan, output)
+    assert not result.ok
+    assert any("channel layout" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_audio_language_mismatch_fails(media: dict, tmp_path: Path) -> None:
+    """SAF-2: the planned audio language is enforced."""
+    output = _make_output(tmp_path / "german.mp4", language="deu")
+    plan = _plan(media["source"], action="encode", audio_language="eng")
+    result = verify_output(plan, output)
+    assert not result.ok
+    assert any("audio track 0: language" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_audio_default_disposition_mismatch_fails(
+    media: dict, tmp_path: Path
+) -> None:
+    """SAF-2: the planned default disposition is enforced.
+
+    The MP4 muxer always marks the first track of a type as default, so
+    the mismatch is produced in a container that keeps the disposition
+    exactly as written (MKV).
+    """
+    output = tmp_path / "nodefault.mkv"
+    _run_ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=25:duration=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=1",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-ac",
+        "2",
+        "-b:a",
+        "96k",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-disposition:a:0",
+        "0",
+        "-shortest",
+        str(output),
+    )
+    plan = _plan(media["source"], action="encode")
+    result = verify_output(plan, output)
+    assert not result.ok
+    assert any("default disposition" in failure for failure in result.failures)
+
+
+@pytest.mark.integration
+def test_a_downmix_is_checked_by_channel_count_only(
+    media: dict, tmp_path: Path
+) -> None:
+    """SAF-2: a downmix states the channel count, not a speaker layout."""
+    output = _make_output(tmp_path / "surround.mp4", channels=6)
+    plan = _plan(media["source"], action="encode", audio_channels=6)
+    plan["audio"][0]["channels"] = 12
+    plan["audio"][0]["target_channels"] = 6
+    plan["audio"][0]["downmix"] = True
+    plan["audio"][0].pop("channel_layout", None)
+
+    result = verify_output(plan, output)
+    assert result.ok, result.failures
+
+
+@pytest.mark.integration
+def test_mov_text_subtitle_passes_and_a_copied_text_subtitle_fails(
+    media: dict, tmp_path: Path
+) -> None:
+    """SAF-2/MP4-5: the planned subtitle codec is enforced."""
+    plan = _plan(
+        media["source"],
+        action="encode",
+        audio_count=0,
+        subtitles=1,
+        subtitle_action="mov_text",
+        subtitle_codec="subrip",
+    )
+    good = verify_output(plan, media["subtitled"])
+    assert good.ok, good.failures
+
+    copied = tmp_path / "copied.mkv"
+    _run_ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=25:duration=1",
+        "-i",
+        str(media["dir"] / "subs.srt"),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:s:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:s",
+        "srt",
+        "-metadata:s:s:0",
+        "language=eng",
+        "-t",
+        "1",
+        str(copied),
+    )
+    bad = verify_output(plan, copied)
+    assert not bad.ok
+    assert any("subtitle track 0: codec" in failure for failure in bad.failures)
+
+
+# ---------------------------------------------------------------------------
+# bits per pixel per frame (A3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_bpp_is_bits_per_pixel_per_frame(media: dict) -> None:
+    """SAF-2: the quality metric is bits per pixel per frame, not per second."""
+    plan = _plan(media["source"], action="encode", source_video_bytes=10**9)
+    result = verify_output(plan, media["remux"], min_bpp=0.0)
+    assert result.ok, result.failures
+    assert result.bpp is not None
+    assert result.bpp_frame_count == 25
+    assert result.bpp_frame_basis == "container"
+    expected = result.output_video_bytes * 8.0 / (25 * 320 * 240)
+    assert result.bpp == pytest.approx(expected)
+    # The old (wrong) formula divided by the duration instead of the frame
+    # count; for this 25 fps clip that is a factor of 25.
+    assert result.bpp != pytest.approx(
+        result.output_video_bytes * 8.0 / (1.0 * 320 * 240)
+    )
+
+
+@pytest.mark.integration
+def test_bpp_floor_breach_is_review_not_failure(media: dict) -> None:
+    """SAF-2: a quality-floor breach routes to REVIEW, it does not fail."""
+    plan = _plan(media["source"], action="encode", source_video_bytes=10**9)
+    result = verify_output(plan, media["remux"], min_bpp=10.0)
+    assert result.ok, result.failures
+    assert result.quality_floor_breach is True
+    assert result.bpp is not None
+
+
+@pytest.mark.integration
+def test_bpp_is_not_evaluated_when_the_frame_count_is_unknown(
+    media: dict, monkeypatch
+) -> None:
+    """SAF-2: an unavailable frame count is surfaced, never silently skipped."""
+    original = verify_mod._probe_json
+
+    def without_frame_count(path, ffprobe, timeout):
+        data = original(path, ffprobe, timeout)
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                stream.pop("nb_frames", None)
+                stream["avg_frame_rate"] = "0/0"
+                stream["r_frame_rate"] = "0/0"
+        return data
+
+    monkeypatch.setattr(verify_mod, "_probe_json", without_frame_count)
+    monkeypatch.setattr(verify_mod, "_count_decoded_frames", lambda *a, **k: None)
+
+    plan = _plan(media["source"], action="encode", source_video_bytes=10**9)
+    result = verify_output(plan, media["remux"], min_bpp=0.01)
+    assert result.bpp is None
+    assert result.bpp_note and "frame count" in result.bpp_note
+    assert any("frame count" in warning for warning in result.warnings)
+
+
+def test_presented_frame_count_policy(media: dict, monkeypatch) -> None:
+    """SAF-2: the frame-count basis is container, decoded or estimated."""
+    path = media["remux"]
+    frames, basis, note = verify_mod._presented_frame_count(
+        path,
+        FFPROBE,
+        60,
+        {"nb_frames": "25"},
+        1.0,
+    )
+    assert (frames, basis, note) == (25, "container", None)
+
+    frames, basis, note = verify_mod._presented_frame_count(
+        path,
+        FFPROBE,
+        60,
+        {"nb_frames": "0", "avg_frame_rate": "25/1"},
+        2.0,
+    )
+    assert frames == 25
+    assert basis == "decoded"
+    assert note is None
+
+    # Without a container count and without a decodable frame count the
+    # metric falls back to duration x frame rate and says so.
+    monkeypatch.setattr(verify_mod, "_count_decoded_frames", lambda *a, **k: None)
+    frames, basis, note = verify_mod._presented_frame_count(
+        path,
+        FFPROBE,
+        60,
+        {"nb_frames": None, "avg_frame_rate": "24000/1001", "r_frame_rate": "25/1"},
+        1.0,
+    )
+    assert frames == 24
+    assert basis == "estimated"
+    assert note and "variable-frame-rate" in note
+
+    frames, basis, note = verify_mod._presented_frame_count(
+        path,
+        FFPROBE,
+        60,
+        {"nb_frames": None, "avg_frame_rate": "0/0", "r_frame_rate": "0/0"},
+        0.0,
+    )
+    assert frames is None
+    assert basis is None
+    assert note and "unknown" in note
+

@@ -26,6 +26,9 @@ progress_seconds = 30
 stall_minutes = 10
 max_restarts = 3
 min_output_kbps = 300
+# Quality floor in bits per pixel per frame (video payload bits divided by
+# presented frames x width x height).  0.01 is about 498 kbps at 1080p24 and
+# is a placeholder: calibrate it on real content before trusting it.
 min_bpp = 0.01
 review_reminder_days = 3
 notify_cooldown_hours = 6
