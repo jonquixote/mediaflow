@@ -343,7 +343,10 @@ def test_software_fallback_overrides_qsv_and_sets_pix_fmt(tmp_path: Path) -> Non
     assert _value_after(command, "-crf") == "24"
     assert _value_after(command, "-preset") == "slow"
     assert _value_after(command, "-pix_fmt") == "yuv420p"
-    assert _value_after(command, "-vf") == "scale=1280:720:flags=lanczos"
+    vf = _value_after(command, "-vf")
+    assert "scale=1280:720:flags=lanczos" in vf
+    # The planned colour is stamped on the frames so the encoder keeps it.
+    assert vf.startswith("setparams=color_primaries=bt709")
     assert all("qsv" not in arg and "vaapi" not in arg for arg in command)
     assert _value_after(command, "-tag:v") == "hvc1"
 

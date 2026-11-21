@@ -11,6 +11,7 @@ Requirement coverage in this module: [MP4-1], [MP4-9], [MP4-12], [SAF-13],
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import re
@@ -120,6 +121,35 @@ def _codec_family(name: str) -> str:
     return lowered
 
 
+def codec_family(name: str) -> str:
+    """Public codec-family helper shared by the planner and the verifier.
+
+    ``hevc_qsv``/``hevc_vaapi``/``libx265``/``hevc`` all map to ``hevc``;
+    ``h264``/``libx264`` map to ``h264``.  Anything else is returned in
+    lower case so unknown codecs stay comparable.
+    """
+    return _codec_family(str(name or ""))
+
+
+def expected_output_codec(plan: Mapping) -> str:
+    """The codec family the plan says the output video stream must carry.
+
+    For an encode the planned encoder decides (``hevc_qsv`` -> ``hevc``).
+    For a remux the copied source codec decides, which is what the planner
+    records in ``video.codec``; the generic preset label is never used.
+    """
+    if not isinstance(plan, Mapping):
+        raise PlanError(f"plan must be a mapping, got {type(plan).__name__}")
+    video = plan.get("video")
+    video = video if isinstance(video, Mapping) else {}
+    action = str(plan.get("action") or "").strip().lower()
+    if action == "encode":
+        encoder = str(video.get("encoder") or "").strip()
+        if encoder:
+            return _codec_family(encoder)
+    return _codec_family(str(video.get("codec") or "").strip())
+
+
 def _container(plan: Mapping) -> str:
     raw = plan.get("container")
     if raw is None:
@@ -147,12 +177,54 @@ def output_partial_path(output: Path | str) -> Path:
     return Path(f"{Path(output)}.partial")
 
 
+@dataclass(frozen=True)
+class SampleSpec:
+    """An explicit input sampling window.
+
+    ``start`` is the offset in seconds from the beginning of the input and
+    ``duration`` is the length of the sampled interval.  Both must be finite
+    numbers, ``start`` must not be negative and ``duration`` must be
+    positive; invalid values raise :class:`PlanError` instead of producing a
+    broken ffmpeg command.
+
+    The same spec is used for the candidate trial and for the reference
+    comparison, so both cover the *same intended frame interval*.  Ordinary
+    production jobs never pass a sample and are unaffected.
+    """
+
+    start: float
+    duration: float
+
+    def __post_init__(self) -> None:
+        try:
+            start = float(self.start)
+            duration = float(self.duration)
+        except (TypeError, ValueError) as exc:
+            raise PlanError("sample start and duration must be numbers") from exc
+        if not math.isfinite(start) or start < 0:
+            raise PlanError(
+                f"sample start must be a finite number >= 0: {self.start!r}"
+            )
+        if not math.isfinite(duration) or duration <= 0:
+            raise PlanError(
+                f"sample duration must be a finite number > 0: {self.duration!r}"
+            )
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "duration", duration)
+
+    def as_args(self) -> list[str]:
+        """The ffmpeg input options for this window."""
+        return ["-ss", f"{self.start:.3f}", "-t", f"{self.duration:.3f}"]
+
+
 def build_command(
     plan: Mapping,
     output: Path | str,
     *,
     ffmpeg: str = FFMPEG,
     software: bool = False,
+    sample: SampleSpec | None = None,
+    video_only: bool = False,
 ) -> list[str]:
     """Build one explicit ffmpeg argv for a plan.
 
@@ -162,6 +234,14 @@ def build_command(
     ``software=True`` is the explicit phase-1 fallback: it overrides the
     plan's hardware backend and uses libx265 with software scaling.
 
+    ``sample`` restricts the run to one explicit input interval
+    (``-ss``/``-t`` before ``-i``).  It exists for calibration trials; a
+    production job never passes it and its command is unchanged.
+
+    ``video_only`` maps the video stream alone and disables audio, subtitle
+    and data output.  It is used for the encode-only calibration trial and
+    never changes an ordinary production command.
+
     Raises :class:`ValueError` (``PlanError``) for missing or unknown plan
     fields rather than leaking ``KeyError``.
     """
@@ -169,6 +249,8 @@ def build_command(
         raise PlanError(f"plan must be a mapping, got {type(plan).__name__}")
     if plan.get("schema") not in (None, 1, "1"):
         raise PlanError(f"unsupported plan schema: {plan.get('schema')!r}")
+    if sample is not None and not isinstance(sample, SampleSpec):
+        raise PlanError("sample must be a SampleSpec")
 
     container = _container(plan)
     action = _str(_require(plan, "action", "plan"), "action").strip().lower()
@@ -197,6 +279,11 @@ def build_command(
 
     audio = _plan_streams(plan, "audio")
     subtitles = _plan_streams(plan, "subtitles")
+    if video_only:
+        # An encode-only trial: the plan's audio/subtitle contract is not
+        # exercised at all, so it is not mapped and not configured.
+        audio = []
+        subtitles = []
 
     # -- backend / output video codec -----------------------------------
     backend = str(video.get("backend") or "").strip().lower()
@@ -237,7 +324,12 @@ def build_command(
     elif action == "encode" and backend == "vaapi":
         command += ["-vaapi_device", VAAPI_DEVICE]
 
-    command += ["-protocol_whitelist", PROTOCOL_WHITELIST, "-i", str(source_path)]
+    command += ["-protocol_whitelist", PROTOCOL_WHITELIST]
+    if sample is not None:
+        # Input-side seek and duration: the trial covers exactly the
+        # requested interval, decoded (not keyframe-copied).
+        command += sample.as_args()
+    command += ["-i", str(source_path)]
 
     # -- explicit stream mapping ----------------------------------------
     command += ["-map", f"0:{video_index}"]
@@ -255,11 +347,23 @@ def build_command(
     if keep_attachments:
         command += ["-map", "0:t?", "-c:t", "copy"]
 
+    if video_only:
+        # Explicitly disable every non-video output stream.
+        command += ["-an", "-sn", "-dn"]
+
     command += ["-map_metadata", "0"]
     chapters = _bool(plan.get("chapters", container == "mkv"))
     command += ["-map_chapters", "0" if chapters else "-1"]
 
     # -- video -----------------------------------------------------------
+    # The colour properties the plan knows are carried into the encode.
+    # `setparams` sets them on the frames (that is what the encoder writes
+    # into the VUI and the container); the output options repeat them for
+    # the encoders that read them from the context.  A QSV decode already
+    # produced hardware frames, so no software filter is inserted there -
+    # the hardware path carries the values through the encoder context and
+    # is verified on the box (docs/QUESTIONS.md).
+    colour_filter = _colour_filter(video.get("color")) if action == "encode" else ""
     if action == "remux":
         command += ["-c:v", "copy"]
     elif backend == "qsv":
@@ -289,13 +393,11 @@ def build_command(
         if bit_depth >= 10:
             command += ["-profile:v", "main10"]
         upload_format = "p010le" if bit_depth >= 10 else "nv12"
+        chain = [part for part in (colour_filter,) if part]
         if scaled:
-            command += [
-                "-vf",
-                f"scale={target_width}:{target_height}:flags=lanczos,format={upload_format},hwupload",
-            ]
-        else:
-            command += ["-vf", f"format={upload_format},hwupload"]
+            chain.append(f"scale={target_width}:{target_height}:flags=lanczos")
+        chain += [f"format={upload_format}", "hwupload"]
+        command += ["-vf", ",".join(chain)]
     else:  # software
         command += [
             "-c:v",
@@ -307,12 +409,22 @@ def build_command(
             "-pix_fmt",
             "p010le" if bit_depth >= 10 else "yuv420p",
         ]
+        chain = [part for part in (colour_filter,) if part]
         if scaled:
-            command += ["-vf", f"scale={target_width}:{target_height}:flags=lanczos"]
+            chain.append(f"scale={target_width}:{target_height}:flags=lanczos")
+        if chain:
+            command += ["-vf", ",".join(chain)]
 
     is_mp4_hevc = container == "mp4" and output_codec == "hevc"
     if is_mp4_hevc:
         command += ["-tag:v", "hvc1", "-movflags", "+faststart"]
+
+    if action == "encode":
+        # Colour metadata is part of the output contract: when the plan
+        # knows a value the encoder is told to carry it, so a known tag
+        # cannot silently disappear.  Unknown/unset values are not
+        # invented and are never passed on.
+        command += _colour_options(video.get("color"))
 
     # -- audio -----------------------------------------------------------
     for ordinal, entry in enumerate(audio):
@@ -354,6 +466,70 @@ def _plan_streams(plan: Mapping, key: str) -> list[Mapping]:
     for index, entry in enumerate(raw):
         result.append(_mapping(entry, f"plan.{key}[{index}]"))
     return result
+
+
+#: Plan colour key -> ffmpeg output option.  Only these four properties are
+#: part of the v1 colour contract.
+COLOUR_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("primaries", "-color_primaries"),
+    ("transfer", "-color_trc"),
+    ("space", "-colorspace"),
+    ("range", "-color_range"),
+)
+
+#: Values that mean "not known" and must never be written to the output.
+UNKNOWN_COLOUR_VALUES = frozenset(
+    {"", "unknown", "n/a", "none", "reserved", "unspecified", "und"}
+)
+
+
+def _colour_options(colour: Any) -> list[str]:
+    """ffmpeg output options for the known colour properties in *colour*.
+
+    Unknown, unset or placeholder values are skipped: mediaflow never
+    invents a colour tag.  A remux keeps the source metadata through the
+    stream copy and is not touched here.
+    """
+    if not isinstance(colour, Mapping):
+        return []
+    options: list[str] = []
+    for key, option in COLOUR_OPTIONS:
+        value = colour.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        text = str(value).strip()
+        if not text or text.lower() in UNKNOWN_COLOUR_VALUES:
+            continue
+        options += [option, text]
+    return options
+
+
+def _colour_filter(colour: Any) -> str:
+    """A ``setparams`` filter that stamps the known colour on the frames.
+
+    The encoders write the VUI from the frame properties, so this is what
+    keeps a known colour tag from disappearing during an encode.  Unknown
+    values are skipped and never invented.
+    """
+    if not isinstance(colour, Mapping):
+        return ""
+    parts: list[str] = []
+    for key, option in (
+        ("primaries", "color_primaries"),
+        ("transfer", "color_trc"),
+        ("space", "colorspace"),
+        ("range", "range"),
+    ):
+        value = colour.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        text = str(value).strip()
+        if not text or text.lower() in UNKNOWN_COLOUR_VALUES:
+            continue
+        parts.append(f"{option}={text}")
+    if not parts:
+        return ""
+    return "setparams=" + ":".join(parts)
 
 
 def _audio_codec(entry: Mapping, container: str, ordinal: int) -> str:
@@ -673,8 +849,16 @@ class FfmpegEncoder:
         output: Path | str | None = None,
         timeout: float | None = None,
         software: bool | None = None,
+        sample: SampleSpec | None = None,
+        video_only: bool = False,
     ) -> EncodeResult:
-        """Run ffmpeg for ``plan`` and return an :class:`EncodeResult`."""
+        """Run ffmpeg for ``plan`` and return an :class:`EncodeResult`.
+
+        ``sample`` and ``video_only`` are the explicit calibration knobs:
+        they restrict one run to an input interval and to the video stream
+        alone.  Production calls never pass them, so their command is the
+        ordinary production command.
+        """
         if resume_from is not None:
             raise NotImplementedError(
                 "mediaflow v1 does not resume encodes; pass resume_from=None"
@@ -699,7 +883,14 @@ class FfmpegEncoder:
         use_software = self.software if software is None else software
         effective_timeout = self.timeout if timeout is None else timeout
         command = _insert_progress_flags(
-            build_command(plan, partial, ffmpeg=self.ffmpeg, software=use_software)
+            build_command(
+                plan,
+                partial,
+                ffmpeg=self.ffmpeg,
+                software=use_software,
+                sample=sample,
+                video_only=video_only,
+            )
         )
         final.parent.mkdir(parents=True, exist_ok=True)
         try:
