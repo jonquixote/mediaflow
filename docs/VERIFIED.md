@@ -24,10 +24,11 @@ scripts/check.sh
 Exact results:
 
 - traceability and generated invariants: `6 passed in 0.22s`
-- unit and integration: `818 passed in 42.52s`
-- full suite including slow/crash/chaos: `818 passed in 42.46s`
+- unit and integration: `818 passed in 42.85s`
+- full suite including slow/crash/chaos: `818 passed in 41.96s`
 
-The delta from the verified 782-test baseline is 36 regression tests.
+A pre-merge run produced the same counts. The delta from the verified
+782-test baseline is 36 regression tests.
 
 Cases exercised:
 
