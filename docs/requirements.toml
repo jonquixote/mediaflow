@@ -18,7 +18,7 @@ id = "SAF-2"
 title = "Verification before publish"
 safety = true
 section = "7"
-text = "Publish only after every check passes: output opens; duration is within max(1 s, 0.1%) and the last video packet matches; exactly one video stream and the planned stream counts; the planned video codec matches (the encoder family for an encode, the copied source codec for a remux) and every HEVC stream in an MP4 output carries the hvc1 tag; resolution, pixel format, SAR and frame rate match; every colour property the source states is present and equal in the output, while an unstated property creates no requirement; every planned audio track matches codec, channel count, channel layout, language and default disposition; every planned subtitle track matches codec, language, forced and default disposition; total bitrate >= min_output_kbps; the bits-per-pixel-per-frame floor (REVIEW) with its frame-count basis reported; full decode test. On failure the job is FAILED and the original untouched."
+text = "Publish only after every check passes: output opens; output duration is within max(1 s, 0.1%) of source duration and the video presentation tail (the maximum packet pts + duration) matches output container duration within the same tolerance; exactly one video stream and the planned stream counts; the planned video codec matches (the encoder family for an encode, the copied source codec for a remux) and every HEVC stream in an MP4 output carries the hvc1 tag; resolution, pixel format, SAR and frame rate match; every colour property the source states is present and equal in the output, while an unstated property creates no requirement; every planned audio track matches codec, channel count, channel layout, language and default disposition; every planned subtitle track matches codec, language, forced and default disposition; total bitrate >= min_output_kbps; the bits-per-pixel-per-frame floor (REVIEW) with its frame-count basis reported; full decode test. On failure the job is FAILED and the original untouched."
 test = "tests/test_verify.py"
 
 [[requirements]]
@@ -66,7 +66,7 @@ id = "SAF-8"
 title = "Free-space guard"
 safety = true
 section = "7"
-text = "Free space must be at least max(1.2 * source_size, min_free_gb) before encode, before publish and during encode (watchdog uses min_free_gb / 2 and pauses). Root and DB filesystems need root_min_free_gb. Trash counts and pauses above max_trash_gb. Trash is never purged early."
+text = "Free space must be at least max(1.2 * source_size, min_free_gb) before encode and before publish. During encode, the watchdog pauses unless free space covers net remaining work plus an additive min_free_gb / 2 emergency reserve; bytes already written are not subtracted twice. Root and DB filesystems need root_min_free_gb. Trash counts and pauses above max_trash_gb. Trash is never purged early."
 test = "tests/test_guards.py"
 
 [[requirements]]
@@ -116,6 +116,30 @@ safety = true
 section = "5.4"
 text = "Calibration measures the production operation: the same planner, command builder, encoder, backend and target geometry as an encode, over an explicitly requested source interval. It never substitutes a backend silently; without an eligible backend it refuses and names the reason. The quality reference is the same source interval, decoded and scaled to the planned geometry, so both sides cover the same frames; a failed comparison or a frame-count mismatch is reported as not available with a reason, never as a number. A trial is seeded into the speed table only when it is valid, and the seed is keyed by the backend that actually ran."
 test = "tests/test_calibrate.py"
+
+[[requirements]]
+id = "SUP-1"
+title = "Bounded verification aggregates"
+safety = true
+section = "5.5"
+text = "Production verification streams video-packet and decoded-frame scans with memory bounded independently of the number of records. It sums video packet bytes, keeps packet count distinct from decoded-frame count, and derives the presentation end from the maximum packet pts + duration rather than the last packet in file order. A cancelled or interrupted scan returns no partial result."
+test = "tests/test_verify.py"
+
+[[requirements]]
+id = "SUP-2"
+title = "Cancellation and exclusive ownership"
+safety = true
+section = "5.5"
+text = "Cancellation or a protection termination wins over a late worker result; partial hashes and scans are discarded. Every owned child process is terminated and reaped, and the exclusive expensive-operation slot and job scratch remain owned until a non-cooperative worker has actually exited."
+test = "tests/test_verify.py"
+
+[[requirements]]
+id = "SUP-3"
+title = "Typed outcomes and controlled recovery"
+safety = true
+section = "5.5"
+text = "Success, failure, cancellation, stall, overall timeout, protection interruption and deferral are distinct outcomes. Only uninterrupted success may publish output or seed a speed-table value. A controlled encode interruption caused by protection or daemon shutdown preserves the original, discards the partial output and is recovered at PLANNED without consuming a restart; an encode stall, encode timeout or genuinely interrupted encode consumes one. A verification interruption never advances the job to VERIFIED."
+test = "tests/test_verify.py"
 
 [[requirements]]
 id = "SCHED-1"

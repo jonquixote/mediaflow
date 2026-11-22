@@ -105,9 +105,12 @@ SIZE-5 computes explicit even target dimensions. Quality values are
 placeholders calibrated by john; speed estimates are keyed by preset, backend
 and resolution bucket and updated by real encodes.
 
-Verification compares the output with the plan. The video codec must match
-(the encoder family for an encode, the copied source codec for a remux) and
-every HEVC stream in an MP4 output must carry `hvc1`. Resolution, pixel
+Verification compares the output with the plan. Output duration must match
+source duration within `max(1 s, 0.1%)`, and the video presentation tail (the
+maximum packet `pts + duration`) must match output container duration within
+that tolerance; packet order is not presentation order. The video codec must
+match (the encoder family for an encode, the copied source codec for a remux)
+and every HEVC stream in an MP4 output must carry `hvc1`. Resolution, pixel
 format, SAR and frame rate must match. Every colour property the source
 *states* must be present and equal in the output; a property the source does
 not state is never invented and creates no requirement. Every planned audio
@@ -129,6 +132,28 @@ substitutes one silently; a failed comparison or a frame-count mismatch is
 `n/a`, never a number. Only a valid trial seeds the speed table, and the
 seed is keyed by the backend that actually ran. Trial artifacts live in the
 configured work area and are removed through the approved cleanup path.
+
+### 5.5 Shared execution and liveness
+
+The encoder, verifier, calibration trials and capability probes use one
+supervision boundary and one exclusive operation slot. A progress callback is
+visibility, not proof of work: liveness advances only for a finite, monotonic
+frame count, media timestamp or byte count. Intentional pause time does not
+count toward a stall or overall-timeout limit.
+
+- **SUP-1** Production verification uses bounded packet and frame aggregates,
+  sums video packet bytes, keeps packet count distinct from decoded-frame
+  count, and uses the maximum packet `pts + duration` as the presentation end.
+- **SUP-2** Cancellation or protection termination suppresses a late success;
+  partial results are discarded, owned children are reaped, and the exclusive
+  slot and scratch remain held until a non-cooperative worker exits.
+- **SUP-3** Success, failure, cancellation, stall, timeout, interruption and
+  deferral are distinct. Only uninterrupted success may publish or seed.
+  Controlled encode interruptions recover without consuming a restart; encode
+  stalls, encode timeouts and genuine interruptions consume one.
+
+Existing encoder and verifier call shapes remain supported; the engine passes
+new supervision controls only when the callable accepts them.
 
 MP4 rules: MP4-1, MP4-2, MP4-3, MP4-4, MP4-5, MP4-6, MP4-7, MP4-8, MP4-9,
 MP4-10, MP4-11, MP4-12. MKV-1. Size rules: SIZE-1, SIZE-2, SIZE-3, SIZE-4,
@@ -159,6 +184,9 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-12** liveness: restart limit, stall detector, ffmpeg-version change pauses until capability tests pass.
 - **SAF-13** untrusted input: protocol whitelist, format allowlist, regular files only.
 - **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
+- **SUP-1** bounded verification scans; packet bytes and counts are aggregated without retaining packet records; presentation end is the maximum packet pts + duration.
+- **SUP-2** cancellation/protection wins over late success; partial results are discarded; children and exclusive resources remain owned until the worker exits.
+- **SUP-3** typed terminal outcomes; only uninterrupted success may publish or seed; controlled encode recovery does not consume a restart.
 - **SCHED-1** schedule window is a start gate only; estimates must fit; force is the only override.
 - **REV-1** each REVIEW reason has a fixed resume state.
 - **ENC-1** encode interface accepts `resume_from`, reserved for phase 2.
@@ -191,6 +219,18 @@ sent for failures, lingering reviews, paused queues and purge summaries.
 Secrets live only in `tmdb.env` and `notify.env`, mode 0640 root:mediaflow.
 Invalid reloads keep the previous good config. A dry-run flip is logged and
 re-plans PLANNED jobs once.
+
+No new configuration key is required for shared supervision: the existing
+`stall_minutes`, `space_watchdog_seconds`, `min_free_gb`, `min_free_gb / 2`
+emergency reserve, `pause_on_battery`, `pause_method`, `temp_sensor` and
+`max_restarts` settings retain their meanings. Existing plans remain valid;
+`plan_version`, `fallback_from` and `working_output` keep their contract, and
+remux plans carry an explicit `copy-estimate` instead of borrowing an encode
+backend row. New interruption markers are additive settings: a job with no
+marker follows the historical crash-recovery path, while a controlled encode
+or verification marker takes precedence and is recoverable. Older encoder,
+verifier, probe and guard call shapes continue to work; new supervision
+controls are supplied only when the callable accepts them.
 
 ## 11-12. Deployment and tests
 

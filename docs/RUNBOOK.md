@@ -168,13 +168,51 @@ Options:
 Never move files from `movies/` by hand while the daemon is running. Use
 `restore` or a REVIEW command so the database and marker stay consistent.
 
+### Operation outcomes and recovery
+
+| Outcome | Operator meaning |
+|---|---|
+| `succeeded` | The uninterrupted operation completed; publication or seeding may continue. |
+| `failed` | Process or content failure; nothing is published and the original remains preserved. |
+| `cancelled` | User cancellation; partial output is discarded and the job becomes cancelled/FAILED. |
+| `stalled` | No real work progress; an encode consumes one restart. |
+| `timed-out` | Overall deadline reached; this is distinct from a content failure. |
+| `interrupted` | Controlled protection or daemon shutdown; not an unexplained encoder crash. |
+| `deferred` | The exclusive slot was busy or a bounded probe was protection-deferred; retry later. |
+| `paused` | Nonterminal intentional pause; the stall clock is suspended. |
+
+Recovery follows the outcome, not just the state:
+
+- **Daemon shutdown during encoding:** the owned child is stopped and reaped,
+  the partial is removed, and the job is recoverable at `PLANNED` without
+  increasing `restarts`.
+- **Protection interruption during encoding:** same controlled recovery as
+  daemon shutdown, with the reason recorded in the job events.
+- **Encode stall, encode timeout, encoder failure, or genuine interruption:**
+  one restart is consumed and the job returns to `PROBED`.
+- **Controlled interruption during verification:** the job remains `ENCODED`,
+  receives no output hash, and cannot advance to `VERIFIED`; verification is
+  retried.
+- **Verification stall or timeout:** the job fails and the original is preserved.
+- **Busy processing slot:** `processing-slot-busy` is a deferral, not evidence
+  that hardware is unsupported.
+- **Non-cooperative legacy worker:** the exclusive slot and job work directory
+  remain held until that worker exits. Do not manually remove its work while
+  it is alive.
+
 ## 8. Heat, power and schedules
 
 The service is AC-only by default. It will not start while Jellyfin is
 transcoding, on battery, or when the package is already hot. It pauses when AC
 drops, disk space gets low, or the package reaches the thermal threshold for
 60 seconds. It signals ffmpeg with SIGSTOP/SIGCONT (default) or, if configured,
-finishes the current job then idles (`pause_method = "idle_after_job"`).
+finishes the current user-paused job then idles
+(`pause_method = "idle_after_job"`). That setting defers only a deliberate
+user pause: AC loss, thermal conditions, low space, Jellyfin transcoding and
+an ffmpeg-change hold still interrupt the current expensive operation. The
+mid-encode space check reserves net remaining work plus an additive emergency
+reserve; it never subtracts already-written bytes from that net value a second
+time.
 
 The fan curve is controlled outside mediaflow. mediaflow never writes fan or
 PROCHOT settings. Record the active fan profile whenever you run the one-hour
@@ -210,6 +248,12 @@ the ffmpeg version changes, mediaflow pauses the queue, re-runs capability
 tests, and resumes only if 8-bit hardware encode still works. 10-bit results are
 recorded separately. If the queue stays paused with `ffmpeg-changed`, read the
 journal and run `doctor`; fix the capability problem or pin/downgrade ffmpeg.
+
+Capability probes are tri-state. A completed probe may establish yes or no. A
+timeout, deferral, cancellation, or failure to start the probe is unknown, not
+unsupported. An unknown or incomplete report does not overwrite the last valid
+`/var/lib/mediaflow/capabilities.json`. During an ffmpeg version change, the
+queue remains paused until a complete capability run succeeds.
 
 ## 11. On-hardware acceptance checklist
 

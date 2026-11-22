@@ -57,3 +57,10 @@ Format: `- [ ] section, what, how john can test`.
 - [ ] Section 7/SAF-9, Jellyfin-transcoding detection with the real `jellyfin` user and a real transcode, section 7. Start a transcode and confirm mediaflow refuses to start/queues a job.
 - [ ] Section 8, TMDb reachability and one real title lookup, section 8. Install a token, run one dry-run plan, confirm cached response reuse and that the token never appears in process output or logs.
 - [ ] Section 9.1/SAF-10, optional notification delivery and payload redaction with the real notify service, section 9.1. Trigger a REVIEW and confirm the payload contains only counts/job ids; verify cooldown.
+
+## Shared execution and controlled recovery
+
+- [ ] Section 5.5/SUP-3, controlled `SIGTERM` during a real encode and during verification, section 7. Run `sudo systemctl stop mediaflow.service` in each phase; confirm the ffmpeg child is gone, the original is intact, no partial file is published, the encode recovers at `PLANNED` without increasing `restarts`, and verification remains unverified until it completes.
+- [ ] Section 5.5/SUP-1, reordered and variable-frame-rate packet presentation on real media, section 5.5. Compare `ffprobe -show_packets` with the container duration; confirm mediaflow uses the maximum `pts + duration`, not the final packet in file order, and that packet count and decoded-frame count remain distinct.
+- [ ] Section 5.5/SUP-1, bounded verification memory on a large packet-dense file, section 5.5. Verify a large VFR file while sampling peak RSS; confirm retained verifier memory does not grow in proportion to packet count and stays within the systemd `MemoryMax` limit.
+- [ ] Section 5.5/SUP-3, an interrupted or deferred capability probe, section 10. Interrupt `doctor` during a backend probe, for example by removing AC while it is running; confirm the result is `unknown` or `deferred`, not `no`, and that the last valid `/var/lib/mediaflow/capabilities.json` is unchanged.

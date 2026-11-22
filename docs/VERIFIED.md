@@ -5,6 +5,70 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Sandbox verification - 2026-11-21 (Pass B: shared supervision and bounded verification)
+
+Environment: Linux x86_64, Python 3.14.4, pytest 9.2.0 and
+`/usr/lib/jellyfin-ffmpeg/ffmpeg` 8.1.3-Jellyfin in the same sandbox.
+`/dev/dri/renderD128` is not readable/writable by the build user, so no
+hardware encode ran. Production `/srv/media` and system configuration were not
+touched; every run used a sandbox root under `/tmp`.
+
+### Test suite
+
+Command:
+
+```sh
+cd /srv/agent-work/mediaflow
+scripts/check.sh
+```
+
+Exact results:
+
+- traceability and generated invariants: `6 passed in 0.21s`
+- unit and integration: `782 passed in 42.04s`
+- full suite including slow, crash and chaos tests: `782 passed in 41.50s`
+
+The previous Pass A baseline was 731 tests; this pass adds 51 regression tests.
+
+### Cases exercised
+
+- Real-progress liveness: repeated callbacks, malformed/regressing values,
+  independent frame/time/byte dimensions, bounded startup and finalization
+  allowances, and suspension during pause.
+- Process ownership: cancellation of a real sleeping subprocess, cancellation
+  of a stopped child, termination escalation, reaping, bounded output tails and
+  lossless progress-line reads.
+- Typed outcomes: cancellation, protection interruption, stall, timeout,
+  deferral and success remain distinct; internally detected stops do not set
+  the caller's cancellation event.
+- Verification: reordered packet aggregation, maximum `pts + duration` tail,
+  packet/frame distinction, cancellable hashing and scans, full video+audio
+  decode, decode timeout, protection interruption and shell-out argument
+  safety.
+- Engine shutdown and cancellation: daemon-shutdown recovery without consuming
+  a restart, a stale user cancellation yielding to shutdown at the next
+  operation boundary, late-success suppression, commit-time cancellation,
+  safe direct cancellation of an unrelated job, deferred slot/work cleanup
+  until a non-cooperative worker exits, and generation-protected cleanup after
+  retry.
+- Resource ownership: the single expensive-operation slot is held by
+  calibration and capability probes through every phase; a busy slot is a
+  typed deferral. Non-cooperative workers retain the slot and work until exit.
+- Capability honesty: tri-state facts, no second bit-depth probe after an
+  incomplete first probe, completed facts surviving later failures,
+  spawn-failure unknowns and incomplete reports not overwriting valid evidence.
+- Disk and speed-table chain: net remaining work, additive emergency reserve,
+  monotonic watchdog cadence, publish-copy reserve, planned backend and
+  canonical target-height lookup, remux copy estimate and post-encode update.
+
+### Not verified here
+
+- The four new `docs/QUESTIONS.md` items for Pass B.
+- Any QSV or VAAPI behavior, real `SIGTERM`/systemd recovery, large-file
+  verifier RSS, reordered/VFR presentation on real media, or interrupted
+  capability probing on the installed service.
+- The VMAF path remains unverified because this ffmpeg build has no `libvmaf`.
+
 ## Sandbox verification - 2026-11-21 (Pass A: execution semantics)
 
 Environment: the same sandbox as the 2026-11-18 run below - Linux x86_64,
