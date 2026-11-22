@@ -26,6 +26,8 @@ from datetime import date, datetime, time as clock_time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
+from .supervision import ProtectionAction, ProtectionDecision
+
 try:  # POSIX only; mediaflow itself only runs on Linux.
     import pwd
 except ImportError:  # pragma: no cover - keeps imports testable on non-POSIX
@@ -328,7 +330,13 @@ def _number(value: Any, default: float) -> float:
 
 @dataclass(frozen=True)
 class SpaceStatus:
-    """Observed space values plus the resulting decision."""
+    """Observed space values plus the resulting decision.
+
+    ``remaining_work_bytes`` and ``emergency_required_bytes`` make the
+    in-flight reserve explicit.  The latter is an additive low-water
+    reserve; it is not a replacement for the work estimate and trash is
+    never purged to satisfy it.
+    """
 
     free_bytes: int
     required_bytes: int
@@ -336,6 +344,9 @@ class SpaceStatus:
     root_free_bytes: int
     db_free_bytes: int
     decision: GuardDecision
+    remaining_work_bytes: int = 0
+    emergency_required_bytes: int = 0
+    output_consumed_bytes: int = 0
 
 
 def _free_bytes(disk_usage: Callable[[Any], Any], path: Path) -> int | None:
@@ -427,25 +438,56 @@ def check_space(
     cfg: GuardConfig,
     *,
     source_size: int = 0,
+    remaining_work: int | None = None,
+    output_consumed: int = 0,
+    emergency_low_water: int | None = None,
     mid_encode: bool = False,
     db_path: Path | None = None,
     disk_usage: Callable[[Any], Any] | None = None,
 ) -> tuple[SpaceStatus, GuardDecision]:
     """Check all free-space reserves.  Never purges trash.
 
-    Before an encode the pipeline filesystem needs ``max(1.2 * source_size,
-    min_free_gb)``.  A mid-encode check needs ``max(1.2 * source_size,
-    min_free_gb / 2)``.  The root and database filesystems each need
-    ``root_min_free_gb`` and trash must not exceed ``max_trash_gb``.
+    Admission reserves ``max(1.2 * source_size, min_free_gb)``.  During an
+    encode, callers provide ``remaining_work``: the conservative number of
+    output bytes still to be written.  ``output_consumed`` is reported for
+    observability but is not subtracted again, because ``remaining_work`` is
+    already a net remaining-work value.  The emergency low-water reserve is
+    additive to that value, so a nearly-complete encode does not accidentally
+    remove the safety margin.
+
+    The legacy call shape (no ``remaining_work``) retains the old
+    ``max(1.2 * source_size, min_free_gb / 2)`` mid-encode behaviour for
+    compatibility with callers outside the engine.  Root and database
+    filesystems each need ``root_min_free_gb`` independently and trash is a
+    policy cap, never a source of early-purged space.
     """
 
     builder = _DecisionBuilder()
     usage = disk_usage if disk_usage is not None else shutil.disk_usage
     min_free_gb = _number(_cfg_get(cfg, "min_free_gb", DEFAULT_MIN_FREE_GB), DEFAULT_MIN_FREE_GB)
-    if mid_encode:
-        min_free_gb /= 2.0
     source_bytes = max(0.0, _number(source_size, 0.0))
-    required = int(math.ceil(max(1.2 * source_bytes, min_free_gb * GIB)))
+    remaining_bytes: int | None = None
+    consumed_bytes = max(0, int(math.ceil(_number(output_consumed, 0.0))))
+    if remaining_work is not None:
+        # ``remaining_work`` is already net: callers have accounted for the
+        # bytes consumed by the current partial.  Do not subtract the same
+        # bytes a second time.
+        remaining_bytes = max(0, int(math.ceil(_number(remaining_work, 0.0))))
+    emergency_bytes = 0
+    if mid_encode:
+        if emergency_low_water is not None:
+            emergency_bytes = max(0, int(math.ceil(_number(emergency_low_water, 0.0))))
+        else:
+            emergency_bytes = int(math.ceil((min_free_gb / 2.0) * GIB))
+        if remaining_bytes is None:
+            # Compatibility path for legacy callers.  The engine always
+            # supplies remaining_work for an in-flight check.
+            required = int(math.ceil(max(1.2 * source_bytes, emergency_bytes)))
+        else:
+            # The emergency reserve is additional to the remaining work.
+            required = remaining_bytes + emergency_bytes
+    else:
+        required = int(math.ceil(max(1.2 * source_bytes, min_free_gb * GIB)))
 
     pipeline = _cfg_path(cfg, "pipeline", Path("/srv/media/_pipeline"))
     free = _free_bytes(usage, pipeline)
@@ -515,6 +557,9 @@ def check_space(
         root_free_bytes=root_free,
         db_free_bytes=db_free,
         decision=decision,
+        remaining_work_bytes=(remaining_bytes or 0),
+        emergency_required_bytes=emergency_bytes,
+        output_consumed_bytes=consumed_bytes,
     )
     return status, decision
 
@@ -743,7 +788,7 @@ def read_ac_state(cfg: GuardConfig) -> bool | None:
     except OSError:
         return None
 
-    readable = False
+    valid_offline = False
     uncertain = False
     for supply in entries:
         online = supply / "online"
@@ -758,12 +803,17 @@ def read_ac_state(cfg: GuardConfig) -> bool | None:
         except OSError:
             uncertain = True
             continue
-        readable = True
         if value == "1":
             return True
+        if value == "0":
+            valid_offline = True
+            continue
+        # A readable but malformed sysfs value is unknown, not proof that the
+        # machine is running on battery.
+        uncertain = True
     if uncertain:
         return None
-    return False if readable else None
+    return False if valid_offline else None
 
 
 def ac_should_pause(ac_online: bool | None, cfg: GuardConfig) -> bool:
@@ -946,9 +996,10 @@ def _elapsed_seconds(above_since: Any) -> float | None:
     """Interpret an ``above_since`` marker.
 
     Accepted forms are an elapsed-seconds number, a ``timedelta``, a wall-clock
-    datetime, an epoch timestamp, or a ``time.monotonic()`` timestamp.  Small
-    numbers (under 1000) are elapsed seconds; larger numbers are timestamps,
-    which keeps the helper usable both from tests and from the monitor.
+    datetime, an epoch timestamp, or a ``time.monotonic()`` timestamp.  Values
+    below one million are elapsed seconds for compatibility with the original
+    helper; larger values are timestamps, which keeps the helper usable both
+    from tests and from the monitor.
     """
 
     if above_since is None or isinstance(above_since, bool):
@@ -966,14 +1017,24 @@ def _elapsed_seconds(above_since: Any) -> float | None:
             return time.time() - value / 1000.0
         if value >= 1e9:
             return time.time() - value
-        if value >= 1000:
+        if value >= 1_000_000:
             return time.monotonic() - value
         return value
     return None
 
 
-def thermal_should_pause(current_c: float | None, cfg: GuardConfig, above_since: Any) -> bool:
-    """True only at/above ``thermal_pause_c`` for the sustain period."""
+def thermal_should_pause(
+    current_c: float | None,
+    cfg: GuardConfig,
+    above_since: Any,
+    *,
+    elapsed_seconds: float | None = None,
+) -> bool:
+    """True only at/above ``thermal_pause_c`` for the sustain period.
+
+    ``elapsed_seconds`` is the unambiguous value used by monotonic callers.
+    The legacy ``above_since`` forms remain accepted for compatibility.
+    """
 
     if current_c is None:
         return False
@@ -992,7 +1053,11 @@ def thermal_should_pause(current_c: float | None, cfg: GuardConfig, above_since:
         return False
     if sustain <= 0:
         return True
-    elapsed = _elapsed_seconds(above_since)
+    elapsed = (
+        max(0.0, float(elapsed_seconds))
+        if elapsed_seconds is not None
+        else _elapsed_seconds(above_since)
+    )
     return elapsed is not None and elapsed >= sustain
 
 
@@ -1009,6 +1074,113 @@ def thermal_should_resume(current_c: float | None, cfg: GuardConfig) -> bool:
         DEFAULT_THERMAL_RESUME_C,
     )
     return current <= resume_c
+
+
+class MachineProtectionMonitor:
+    """Compose AC and thermal conditions into one typed monitor.
+
+    AC and thermal policy remain separate: ``on-battery``/``no-ac-source``
+    never masquerade as a thermal condition and vice versa.  Unknown AC state
+    fails closed when ``pause_on_battery`` is enabled.
+
+    The monitor never clears a caller-owned pause event.  An external user
+    pause and a machine pause therefore compose without either owner being
+    able to erase the other.  Set ``defer_on_protection`` for bounded probes
+    (calibration and capability tests): those operations cannot wait for an
+    unplugged charger indefinitely and must return a typed deferral instead.
+    """
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        cancel_event: Any = None,
+        pause_event: Any = None,
+        defer_on_protection: bool = False,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.cfg = GuardConfig.from_config(config)
+        self.cancel_event = cancel_event
+        # Retained for API compatibility.  The monitor deliberately does not
+        # mutate it because it may contain an unrelated user-pause request.
+        self.pause_event = pause_event
+        self.defer_on_protection = bool(defer_on_protection)
+        self.clock = clock
+        self.above_since: float | None = None
+        self.thermal_active = False
+        self.sensor: Any = None
+        self.sensor_checked = False
+
+    def _event_set(self, event: Any) -> bool:
+        if event is None:
+            return False
+        try:
+            return bool(event.is_set())
+        except Exception:
+            return False
+
+    def _thermal_reason(self) -> str | None:
+        if str(_cfg_get(self.cfg, "temp_sensor", "auto")).strip().casefold() == "none":
+            return None
+        try:
+            if not self.sensor_checked:
+                self.sensor = discover_temp_sensor(self.cfg)
+                self.sensor_checked = True
+            current = read_package_temp(self.sensor) if self.sensor else None
+            if current is None:
+                return "thermal-sensor-missing"
+            if thermal_should_resume(current, self.cfg):
+                self.thermal_active = False
+                self.above_since = None
+                return None
+            if self.thermal_active:
+                return "thermal"
+            if current >= float(_cfg_get(self.cfg, "thermal_pause_c", DEFAULT_THERMAL_PAUSE_C)):
+                if self.above_since is None:
+                    self.above_since = float(self.clock())
+                elapsed = max(0.0, float(self.clock()) - self.above_since)
+                if thermal_should_pause(
+                    current, self.cfg, self.above_since, elapsed_seconds=elapsed
+                ):
+                    self.thermal_active = True
+                    return "thermal"
+            return None
+        except Exception:
+            return "thermal-sensor-error"
+
+    def __call__(self) -> ProtectionDecision:
+        if self._event_set(self.cancel_event):
+            return ProtectionDecision(
+                ProtectionAction.TERMINATE,
+                ("user-cancelled",),
+                detail="operation cancelled",
+                kind="cancelled",
+            )
+        reasons: list[str] = []
+        ac_reason = _ac_reason(read_ac_state(self.cfg), self.cfg)
+        if ac_reason is not None:
+            reasons.append(ac_reason)
+        thermal_reason = self._thermal_reason()
+        if thermal_reason is not None:
+            reasons.append(thermal_reason)
+        if reasons:
+            action = (
+                ProtectionAction.DEFER
+                if self.defer_on_protection
+                else ProtectionAction.PAUSE
+            )
+            detail = (
+                "machine protection deferred the operation"
+                if action is ProtectionAction.DEFER
+                else "machine protection requires a pause"
+            )
+            return ProtectionDecision(
+                action,
+                tuple(reasons),
+                detail=detail,
+                kind="protection",
+            )
+        return ProtectionDecision(ProtectionAction.CONTINUE)
 
 
 # ---------------------------------------------------------------------------
@@ -1247,18 +1419,30 @@ def mid_encode_gate(
     cfg: GuardConfig,
     *,
     source_size: int,
+    remaining_work: int | None = None,
+    output_consumed: int = 0,
+    emergency_low_water: int | None = None,
     disk_usage: Callable[[Any], Any] | None = None,
 ) -> GuardDecision:
-    """Mid-encode watchdog gate: space (half reserve) and AC only.
+    """Mid-encode watchdog gate: remaining work/space and AC only.
 
-    Thermal handling and SIGSTOP/SIGCONT belong to the coarse monitor, not
-    here.  Trash is still checked and is never purged.
+    ``remaining_work`` is the net number of bytes still to be written;
+    ``output_consumed`` is observational and is not subtracted again.  The
+    emergency low-water reserve is additive.  Thermal handling and
+    SIGSTOP/SIGCONT belong to the coarse monitor, not here.  Trash is still
+    checked and is never purged.
     """
 
     builder = _DecisionBuilder()
 
     _space_status, space_decision = check_space(
-        cfg, source_size=source_size, mid_encode=True, disk_usage=disk_usage
+        cfg,
+        source_size=source_size,
+        remaining_work=remaining_work,
+        output_consumed=output_consumed,
+        emergency_low_water=emergency_low_water,
+        mid_encode=True,
+        disk_usage=disk_usage,
     )
     builder.extend(space_decision)
 
