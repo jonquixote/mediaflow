@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +18,12 @@ import pytest
 from mediaflow.db import Store
 from mediaflow.engine import CommandError, Engine, RestorePurged, ReviewNeeded
 from mediaflow.safety import FileSafety
+from mediaflow.supervision import (
+    OperationState,
+    SlotBusy,
+    processing_slot,
+    slot_path,
+)
 
 
 class DummyConfig:
@@ -41,6 +49,8 @@ class DummyConfig:
         self.progress_seconds = 30
         self.min_output_kbps = 300
         self.min_bpp = 0.01
+        self.pause_on_battery = False
+        self.temp_sensor = "none"
         self.trash_retention_days = 14
         self.failed_retention_days = 30
         self.ffmpeg = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
@@ -773,3 +783,819 @@ def test_cancel_command_during_encode(env):
     assert job["state"] == "FAILED"
     assert "cancelled" in (job.get("error") or "")
     assert all(c["status"] != "pending" for c in store.pending_commands())
+
+
+# ---------------------------------------------------------------------------
+# shutdown, cancellation and resource ownership
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_shutdown_interrupts_encode_without_consuming_a_retry(env):
+    """SUP-3: a controlled daemon shutdown leaves a recoverable ENCODING job."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    started = threading.Event()
+
+    class Waiting:
+        def encode(self, plan, resume_from=None, progress_cb=None,
+                   cancel_event=None, pause_event=None):
+            started.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    return SimpleNamespace(ok=False, returncode=143)
+                time.sleep(0.01)
+            return SimpleNamespace(ok=False, returncode=143)
+
+    eng.encoder = Waiting()
+    thread = threading.Thread(target=eng.tick)
+    thread.start()
+    assert started.wait(3)
+    job_id = store.list_jobs()[0]["id"]
+
+    eng.request_shutdown()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    job = store.get_job(job_id)
+    assert job["state"] == "ENCODING"
+    assert job["restarts"] == 0
+    assert store.get_setting(f"encode-shutdown:{job_id}", "") == "daemon-shutdown"
+    assert store.get_setting(f"encode-protection-interrupted:{job_id}", "") == ""
+    assert Path(job["source_path"]).exists()
+    assert any(event["kind"] == "encode-shutdown" for event in store.events(job_id))
+
+    # Startup recovery adopts the controlled interruption at PLANNED without
+    # treating it as an encoder crash.
+    eng.recover()
+    recovered = store.get_job(job_id)
+    assert recovered["state"] == "PLANNED"
+    assert recovered["restarts"] == 0
+    assert Path(recovered["source_path"]).exists()
+
+
+def test_user_cancellation_suppresses_a_late_successful_worker(env):
+    """SUP-2: a late successful worker cannot advance a cancelled job."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    started = threading.Event()
+
+    class LateSuccess:
+        def encode(self, plan, resume_from=None, progress_cb=None,
+                   cancel_event=None, pause_event=None):
+            started.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    out = Path(plan["working_output"])
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(b"late output")
+                    return SimpleNamespace(ok=True, returncode=0)
+                time.sleep(0.01)
+            return SimpleNamespace(ok=False, returncode=1)
+
+    eng.encoder = LateSuccess()
+    thread = threading.Thread(target=eng.tick)
+    thread.start()
+    assert started.wait(3)
+    job_id = store.list_jobs()[0]["id"]
+    store.enqueue_command("cancel", {"job_id": job_id})
+    thread.join(5)
+
+    assert not thread.is_alive()
+    job = store.get_job(job_id)
+    assert job["state"] == "FAILED"
+    assert "cancelled" in (job.get("error") or "")
+    assert not Path((job.get("plan") or {}).get("working_output", "")).exists()
+    assert not cfg.movies.exists() or not any(cfg.movies.iterdir())
+    assert store.get_setting(f"encode-shutdown:{job_id}", "") == ""
+
+
+def test_noncooperative_worker_keeps_the_slot_and_work_until_exit(
+    env, monkeypatch
+):
+    """SUP-2: a late worker cannot overlap the next operation or lose its work."""
+
+    import mediaflow.engine as engine_module
+
+    original_supervisor = engine_module.supervise_callable
+
+    def short_supervisor(operation, **kwargs):
+        policy = kwargs.get("policy")
+        if policy is not None:
+            kwargs["policy"] = replace(policy, terminate_grace=0.05)
+        return original_supervisor(operation, **kwargs)
+
+    monkeypatch.setattr(engine_module, "supervise_callable", short_supervisor)
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    started = threading.Event()
+    release = threading.Event()
+
+    class NonCooperative:
+        def encode(self, plan, resume_from=None, progress_cb=None,
+                   cancel_event=None, pause_event=None):
+            started.set()
+            release.wait(10)
+            out = Path(plan["working_output"])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(b"late output")
+            return SimpleNamespace(ok=True, returncode=0)
+
+    eng.encoder = NonCooperative()
+    thread = threading.Thread(target=eng.tick)
+    thread.start()
+    assert started.wait(3)
+    job_id = store.list_jobs()[0]["id"]
+    store.enqueue_command("cancel", {"job_id": job_id})
+    thread.join(3)
+
+    assert not thread.is_alive()
+    job = store.get_job(job_id)
+    assert job["state"] == "FAILED"
+    work = cfg.work / job_id
+    assert work.exists(), "work was removed while the legacy worker was alive"
+    with pytest.raises(SlotBusy):
+        with processing_slot(slot_path(cfg), timeout=0):
+            pass
+
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not work.exists():
+            break
+        time.sleep(0.02)
+    assert not work.exists()
+    with processing_slot(slot_path(cfg), timeout=0):
+        pass
+
+
+def test_daemon_shutdown_marks_interrupted_verification_without_advancing(env, monkeypatch):
+    """SUP-3: verification shutdown is distinct and cannot advance to VERIFIED."""
+
+    import mediaflow.engine as engine_module
+
+    original_supervisor = engine_module.supervise_callable
+
+    def short_supervisor(operation, **kwargs):
+        policy = kwargs.get("policy")
+        if policy is not None:
+            kwargs["policy"] = replace(policy, terminate_grace=0.05)
+        return original_supervisor(operation, **kwargs)
+
+    monkeypatch.setattr(engine_module, "supervise_callable", short_supervisor)
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODED",
+        source_size=1000,
+        source_video_bytes=0,
+    )
+    out = cfg.work / job["id"] / "out.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"encoded output")
+    plan = {
+        "preset": "test-preset",
+        "action": "encode",
+        "ext": "mp4",
+        "working_output": str(out),
+        "estimated_seconds": 1.0,
+        "source": {
+            "path": str(entry),
+            "duration": 60.0,
+            "size_bytes": 1000,
+            "video_bytes": 0,
+        },
+        "video": {
+            "index": 0,
+            "backend": "qsv",
+            "target_height": 1080,
+        },
+    }
+    store.update_job(job["id"], plan_json=plan, plan_version=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def verifier(_plan, output, **_kwargs):
+        started.set()
+        release.wait(10)
+        from mediaflow.util import sha256_file
+        return SimpleNamespace(
+            ok=True,
+            failures=[],
+            quality_floor_breach=False,
+            sha256=sha256_file(output),
+            output_size=output.stat().st_size,
+            output_video_bytes=100,
+            output_duration=60.0,
+        )
+
+    eng.verifier = verifier
+    thread = threading.Thread(target=eng._step_encoded, args=(store.get_job(job["id"]),))
+    thread.start()
+    assert started.wait(3)
+
+    eng.request_shutdown()
+    thread.join(3)
+
+    assert not thread.is_alive()
+    current = store.get_job(job["id"])
+    assert current["state"] == "ENCODED"
+    assert current.get("output_sha256") is None
+    assert store.get_setting(f"verification-shutdown:{job['id']}", "") == "daemon-shutdown"
+    assert store.get_setting(
+        f"verification-protection-interrupted:{job['id']}", ""
+    ) == ""
+    assert any(
+        event["kind"] == "verification-shutdown"
+        for event in store.events(job["id"])
+    )
+
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            with processing_slot(slot_path(cfg), timeout=0):
+                break
+        except SlotBusy:
+            time.sleep(0.02)
+    else:
+        pytest.fail("verification slot was not released after the worker exited")
+
+
+def test_recovery_honours_a_shutdown_marker_without_partial_files(env):
+    """A controlled shutdown marker is authoritative even with no leftovers."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODING",
+    )
+    store.set_setting(f"encode-shutdown:{job['id']}", "daemon-shutdown")
+
+    eng.recover()
+
+    recovered = store.get_job(job["id"])
+    assert recovered["state"] == "PLANNED"
+    assert recovered["restarts"] == 0
+    messages = [event["message"] for event in store.events(job["id"])
+                if event["kind"] == "recovery"]
+    assert any("controlled encode interruption" in message for message in messages)
+    assert not any("had not started" in message for message in messages)
+    assert Path(recovered["source_path"]).exists()
+
+
+def test_legacy_success_racing_shutdown_stays_recoverable(env, monkeypatch):
+    """A shutdown suppresses even a legacy result without a typed state."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODING",
+        source_size=1000,
+        source_video_bytes=1000,
+    )
+    out = cfg.work / job["id"] / "out.mp4"
+    plan = {
+        "preset": "test-preset",
+        "action": "encode",
+        "ext": "mp4",
+        "working_output": str(out),
+        "estimated_seconds": 1.0,
+        "source": {
+            "path": str(entry),
+            "duration": 60.0,
+            "size_bytes": 1000,
+            "video_bytes": 1000,
+        },
+        "video": {
+            "index": 0,
+            "backend": "qsv",
+            "target_height": 1080,
+        },
+    }
+    store.update_job(job["id"], plan_json=plan, plan_version=1)
+
+    def raced_result(job_data, _plan, _progress):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"late output")
+        eng.request_shutdown()
+        return SimpleNamespace(ok=True, returncode=0)
+
+    monkeypatch.setattr(eng, "_run_encode_watched", raced_result)
+
+    assert eng._step_encode(store.get_job(job["id"])) is False
+
+    current = store.get_job(job["id"])
+    assert current["state"] == "ENCODING"
+    assert current["restarts"] == 0
+    assert store.get_setting(f"encode-shutdown:{job['id']}", "") == "daemon-shutdown"
+    assert store.get_setting(f"encode-protection-interrupted:{job['id']}", "") == ""
+    assert Path(current["source_path"]).exists()
+    assert not any(event["kind"] == "encode-failed" for event in store.events(job["id"]))
+
+
+def test_busy_processing_slot_defers_encode_without_a_protection_marker(env):
+    """A busy slot is a resumable deferral, not an interrupted encode."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODING",
+        source_size=1000,
+        source_video_bytes=1000,
+    )
+    out = cfg.work / job["id"] / "out.mp4"
+    plan = {
+        "preset": "test-preset",
+        "action": "encode",
+        "ext": "mp4",
+        "working_output": str(out),
+        "estimated_seconds": 1.0,
+        "source": {
+            "path": str(entry),
+            "duration": 60.0,
+            "size_bytes": 1000,
+            "video_bytes": 1000,
+        },
+        "video": {
+            "index": 0,
+            "backend": "qsv",
+            "target_height": 1080,
+        },
+    }
+    store.update_job(job["id"], plan_json=plan, plan_version=1)
+
+    with processing_slot(slot_path(cfg), timeout=0):
+        assert eng._step_encode(store.get_job(job["id"])) is False
+
+    current = store.get_job(job["id"])
+    assert current["state"] == "ENCODING"
+    assert current["restarts"] == 0
+    assert store.get_setting(f"encode-deferred:{job['id']}", "") == "processing-slot-busy"
+    assert store.get_setting(f"encode-protection-interrupted:{job['id']}", "") == ""
+    assert store.get_setting(f"encode-shutdown:{job['id']}", "") == ""
+
+
+def test_direct_cancel_signals_the_active_encoder(env):
+    """The public cancel path uses the typed user-cancellation intent."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    started = threading.Event()
+    observed = threading.Event()
+
+    class Waiting:
+        def encode(self, plan, resume_from=None, progress_cb=None,
+                   cancel_event=None, pause_event=None):
+            started.set()
+            if cancel_event is not None:
+                observed.set()
+                cancel_event.wait(5)
+            return SimpleNamespace(ok=False, returncode=143)
+
+    eng.encoder = Waiting()
+    thread = threading.Thread(target=eng.tick)
+    thread.start()
+    assert started.wait(3)
+    job_id = store.list_jobs()[0]["id"]
+
+    eng.cancel(job_id)
+    thread.join(5)
+
+    assert not thread.is_alive()
+    with eng._operation_state_lock:
+        assert eng._cancel_reason == "user-cancelled"
+    job = store.get_job(job_id)
+    assert job["state"] == "FAILED"
+    assert "cancelled" in (job.get("error") or "")
+    assert observed.is_set()
+
+
+def test_cancellation_before_the_encoded_commit_cannot_advance(env, monkeypatch):
+    """A cancel accepted after the worker returns but before commit wins."""
+
+    import mediaflow.engine as engine_module
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    original_fsync = engine_module.fsync_file
+
+    def cancel_before_commit(path):
+        original_fsync(path)
+        with eng._operation_state_lock:
+            eng._active_cancel = True
+            eng._cancel_reason = "user-cancelled"
+
+    monkeypatch.setattr(engine_module, "fsync_file", cancel_before_commit)
+
+    eng.tick()
+
+    job = store.list_jobs()[0]
+    assert job["state"] == "FAILED"
+    assert "cancelled" in (job.get("error") or "")
+    assert not Path((job.get("plan") or {}).get("working_output", "")).exists()
+    assert not cfg.movies.exists() or not any(cfg.movies.iterdir())
+
+
+def test_shutdown_before_an_operation_prevents_the_encoder_from_starting(env):
+    """A pre-existing daemon shutdown closes the operation boundary."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    called = threading.Event()
+
+    class MustNotRun:
+        def encode(self, *args, **kwargs):
+            called.set()
+            raise AssertionError("encoder started after shutdown")
+
+    eng.encoder = MustNotRun()
+    eng.request_shutdown()
+    plan = {"working_output": str(cfg.work / "job" / "out.mp4")}
+
+    from mediaflow.ffmpeg import EncodeResult
+    result = eng._run_encode_watched({"id": "job"}, plan, lambda _info: None)
+
+    assert isinstance(result, EncodeResult)
+    assert result.state is OperationState.INTERRUPTED
+    assert result.reasons == ("daemon-shutdown",)
+    assert not called.is_set()
+
+
+def test_noncooperative_verifier_defers_work_cleanup_until_worker_exit(
+    env, monkeypatch
+):
+    """SUP-2: verification cancellation cannot remove output under a live worker."""
+
+    import mediaflow.engine as engine_module
+
+    original_supervisor = engine_module.supervise_callable
+
+    def short_supervisor(operation, **kwargs):
+        policy = kwargs.get("policy")
+        if policy is not None:
+            kwargs["policy"] = replace(policy, terminate_grace=0.05)
+        return original_supervisor(operation, **kwargs)
+
+    monkeypatch.setattr(engine_module, "supervise_callable", short_supervisor)
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODED",
+        source_size=1000,
+        source_video_bytes=0,
+    )
+    out = cfg.work / job["id"] / "out.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"encoded output")
+    plan = {
+        "preset": "test-preset",
+        "action": "encode",
+        "ext": "mp4",
+        "working_output": str(out),
+        "estimated_seconds": 1.0,
+        "source": {
+            "path": str(entry),
+            "duration": 60.0,
+            "size_bytes": 1000,
+            "video_bytes": 0,
+        },
+        "video": {
+            "index": 0,
+            "backend": "qsv",
+            "target_height": 1080,
+        },
+    }
+    store.update_job(job["id"], plan_json=plan, plan_version=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def verifier(_plan, _output, **_kwargs):
+        started.set()
+        release.wait(10)
+        return SimpleNamespace(ok=False, failures=["late failure"])
+
+    eng.verifier = verifier
+    thread = threading.Thread(target=eng._step_encoded, args=(store.get_job(job["id"]),))
+    thread.start()
+    assert started.wait(3)
+    store.enqueue_command("cancel", {"job_id": job["id"]})
+    thread.join(3)
+
+    assert not thread.is_alive()
+    current = store.get_job(job["id"])
+    assert current["state"] == "FAILED"
+    assert "cancelled" in (current.get("error") or "")
+    work = cfg.work / job["id"]
+    assert work.exists(), "verification work was removed while the worker was alive"
+    assert out.exists()
+    with pytest.raises(SlotBusy):
+        with processing_slot(slot_path(cfg), timeout=0):
+            pass
+
+    release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not work.exists():
+            break
+        time.sleep(0.02)
+    assert not work.exists()
+    with processing_slot(slot_path(cfg), timeout=0):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# disk reserves and the canonical speed key
+# ---------------------------------------------------------------------------
+
+
+def test_remaining_encode_work_uses_media_progress_not_output_growth(env):
+    """Output growth alone never manufactures free space."""
+
+    cfg, store, eng, _ = env
+    job = {
+        "id": "job",
+        "source_size": 1000,
+        "source_video_bytes": 1000,
+        "plan": {
+            "source": {"size_bytes": 1000, "video_bytes": 1000},
+            "working_output": str(cfg.work / "job" / "out.mp4"),
+        },
+    }
+    partial = cfg.work / "job" / "out.mp4.partial"
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.write_bytes(b"x" * 400)
+
+    # No real media progress: retain the full conservative work budget.
+    eng._encode_progress_fraction = 0.0
+    assert eng._remaining_encode_work(job) == 1000
+    assert eng._encode_output_consumed(job) == 400
+
+    # At 75% media progress the source-based remaining budget is 250 bytes.
+    # The partial-size projection is smaller, so the conservative value wins.
+    eng._encode_progress_fraction = 0.75
+    assert eng._remaining_encode_work(job) == 250
+    assert eng._encode_output_consumed(job) == 400
+
+
+def test_mid_encode_gate_receives_net_work_and_uses_a_monotonic_cadence(env):
+    """The watchdog asks for remaining work and does not use wall-clock jumps."""
+
+    cfg, store, eng, _ = env
+    cfg.space_watchdog_seconds = 60
+    calls = []
+
+    class Recorder:
+        def mid_encode_gate(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(ok=True, reasons=(), messages=())
+
+    eng.guards = Recorder()
+    job = {
+        "id": "job",
+        "source_size": 10_000_000,
+        "source_video_bytes": 1000,
+        "plan": {
+            "source": {"size_bytes": 10_000_000, "video_bytes": 1000},
+            "working_output": str(cfg.work / "job" / "out.mp4"),
+        },
+    }
+    partial = cfg.work / "job" / "out.mp4.partial"
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.write_bytes(b"x" * 250)
+    eng._encode_progress_fraction = 0.75
+
+    reasons, should_pause = eng._encoding_pause_state(job)
+    assert not should_pause
+    assert reasons == []
+    assert len(calls) == 1
+    assert calls[0]["remaining_work"] == 250
+    assert calls[0]["output_consumed"] == 250
+    assert calls[0]["source_size"] == 10_000_000
+
+    # A second observation inside the monotonic interval does not run the
+    # disk guard again, regardless of wall-clock elapsed time.
+    eng._space_checked_monotonic = time.monotonic()
+    eng._encoding_pause_state(job)
+    assert len(calls) == 1
+
+
+def test_publish_space_reserve_uses_the_output_copy_not_the_source(env):
+    """Publishing reserves the bytes that may be copied into movies/."""
+
+    cfg, store, eng, _ = env
+    calls = []
+
+    class Recorder:
+        def check_space(self, **kwargs):
+            calls.append(kwargs)
+            return None, SimpleNamespace(ok=True, reasons=(), messages=())
+
+    eng.guards = Recorder()
+    job = {
+        "id": "job",
+        "source_size": 9_000_000,
+        "output_size": 1234,
+        "plan": {"working_output": str(cfg.work / "job" / "out.mp4")},
+    }
+
+    decision = eng._space_gate(job)
+
+    assert decision.ok is True
+    assert calls[0]["source_size"] == 1234
+
+
+def test_engine_uses_the_planned_backend_and_target_height_speed_key(env):
+    """Only the selected backend and canonical target-height row are used."""
+
+    cfg, store, eng, _ = env
+    store.speed_seed("test-preset", "qsv", 1080, 2.0)
+    store.speed_seed("test-preset", "vaapi", 1080, 7.0)
+    store.speed_seed("test-preset", "qsv", 2160, 9.0)
+
+    plan = {
+        "preset": "test-preset",
+        "action": "encode",
+        "source": {"duration": 100.0, "size_bytes": 1000, "video_bytes": 1000},
+        "video": {
+            "backend": "qsv",
+            "width": 3840,
+            "height": 2160,
+            "target_width": 1920,
+            "target_height": 1080,
+        },
+    }
+
+    eng._apply_plan_speed(plan)
+
+    assert plan["speed_source"] == "table"
+    assert plan["speed_factor"] == 2.0
+    assert plan["estimated_seconds"] == 50.0
+    assert eng._plan_speed_key(plan) == ("qsv", 1080)
+    assert eng._estimate({}, plan) == 50.0
+
+
+def test_remux_uses_an_explicit_copy_estimate_without_a_backend_row(env):
+    """A remux never borrows an encode backend's speed factor."""
+
+    cfg, store, eng, _ = env
+    store.speed_seed("test-preset", "qsv", 1080, 2.0)
+    plan = {
+        "preset": "test-preset",
+        "action": "remux",
+        "source": {"duration": 120.0, "size_bytes": 1000, "video_bytes": 1000},
+        "video": {
+            "backend": None,
+            "width": 1920,
+            "height": 1080,
+            "target_width": 1920,
+            "target_height": 1080,
+        },
+    }
+
+    eng._apply_plan_speed(plan)
+
+    assert plan["speed_source"] == "copy-estimate"
+    assert plan["estimated_seconds"] == 120.0
+    assert "speed_factor" not in plan
+    assert eng._plan_speed_key(plan) == (None, 0)
+    assert eng._estimate({}, plan) == 120.0
+
+
+def test_shutdown_at_a_new_operation_boundary_overrides_a_stale_cancel(env):
+    """SUP-3: daemon shutdown is process-wide, not a stale per-job reason."""
+
+    cfg, store, eng, _ = env
+    first = threading.Event()
+    eng._begin_operation(first, "first-job")
+    with eng._operation_state_lock:
+        eng._active_cancel = True
+        eng._cancel_reason = "user-cancelled"
+    eng.request_shutdown()
+
+    second = threading.Event()
+    assert eng._begin_operation(second, "second-job") is True
+    with eng._operation_state_lock:
+        assert eng._cancel_reason == "daemon-shutdown"
+        assert eng._active_cancel_job_id == "second-job"
+    eng._end_operation()
+
+
+def test_direct_cancel_of_another_job_does_not_signal_the_active_worker(env):
+    """SUP-2: cancelling an idle job cannot stop an unrelated operation."""
+
+    cfg, store, eng, _ = env
+    active_event = threading.Event()
+    with eng._operation_state_lock:
+        eng._active_cancel_event = active_event
+        eng._active_cancel_job_id = "active-job"
+        eng._active_cancel = True
+        eng._cancel_reason = "user-cancelled"
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="ENCODED",
+    )
+
+    eng.cancel(job["id"])
+
+    assert not active_event.is_set()
+    with eng._operation_state_lock:
+        assert eng._active_cancel_job_id == "active-job"
+    assert store.get_job(job["id"])["state"] == "FAILED"
+
+
+def test_deferred_cleanup_cannot_remove_a_retried_attempts_work(env):
+    """SUP-2: a late old worker cannot delete the new attempt's work."""
+
+    cfg, store, eng, _ = env
+    work = cfg.work / "job"
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "current.txt").write_bytes(b"new attempt")
+    worker_done = threading.Event()
+
+    eng._cleanup_after_worker("job", worker_done)
+    with eng._operation_state_lock:
+        eng._operation_generation += 1
+    worker_done.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with eng._deferred_cleanup_lock:
+            if ("job", 0) not in eng._deferred_cleanups:
+                break
+        time.sleep(0.01)
+
+    assert work.exists()
+    assert (work / "current.txt").read_bytes() == b"new attempt"
+
+
+def test_post_encode_speed_update_uses_the_planned_backend_and_target_height(env):
+    """The selected backend and canonical target-height bucket are updated."""
+
+    cfg, store, eng, _ = env
+    store.speed_seed("test-preset", "qsv", 1080, 1.0)
+    store.speed_seed("test-preset", "vaapi", 1080, 7.0)
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset",
+        source_rel="Film (2001)",
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="RETIRED",
+    )
+    plan = {
+        "action": "encode",
+        "source": {"duration": 100.0, "size_bytes": 1000, "video_bytes": 1000},
+        "video": {"backend": "qsv", "height": 2160, "target_height": 1080},
+    }
+    trash_dir = cfg.trash / time.strftime("%Y-%m-%d") / job["id"]
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    (trash_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    store.update_job(
+        job["id"], plan_json=plan, encode_seconds=50.0,
+        trash_path=str(trash_dir), manifest_path=str(trash_dir / "manifest.json"),
+    )
+
+    eng._step_retired(store.get_job(job["id"]))
+
+    assert store.speed_get("test-preset", "qsv", 1080) == pytest.approx(1.3)
+    assert store.speed_get("test-preset", "vaapi", 1080) == 7.0

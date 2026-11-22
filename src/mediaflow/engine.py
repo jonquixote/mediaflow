@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -22,6 +23,19 @@ from typing import Any, Callable, Mapping
 from .safety import (
     CrossDeviceError, FileSafety, PathDenied, SafetyError,
     atomic_write_json, check_one_filesystem, fsync_dir, fsync_file,
+)
+from .supervision import (
+    OperationCancelled,
+    OperationDeferred,
+    OperationInterrupted,
+    OperationState,
+    ProtectionAction,
+    ProtectionDecision,
+    SlotBusy,
+    SupervisionPolicy,
+    processing_slot,
+    slot_path,
+    supervise_callable,
 )
 from .util import gzip_text, has_temp_marker, human_bytes, is_real_dir, is_regular_file, sha256_file, tree_stats
 
@@ -80,6 +94,14 @@ class EncodeCancelled(EngineError):
     """A user cancelled the running encode."""
 
 
+class EncodeProtectionInterrupted(EngineError):
+    """A protection condition stopped an encode without a failure retry."""
+
+    def __init__(self, reasons: tuple[str, ...] = (), message: str | None = None):
+        super().__init__(message or "encode interrupted by protection")
+        self.reasons = tuple(reasons)
+
+
 @dataclass
 class SourceInspection:
     entry: Path
@@ -89,6 +111,66 @@ class SourceInspection:
     source_size: int
     video_candidates: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+
+class _CombinedEvent:
+    """A read-only event view over caller cancellation and worker stop.
+
+    The shared supervisor owns its private stop event.  Legacy injected
+    workers can only observe an event, so this view lets them react to an
+    internally detected stall, timeout or protection interruption without the
+    supervisor mutating the caller's cancellation event.
+    """
+
+    def __init__(self, *events: Any) -> None:
+        self._events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(
+            bool(event.is_set())
+            for event in self._events
+            if hasattr(event, "is_set")
+        )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self.is_set():
+            return True
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            for event in self._events:
+                waiter = getattr(event, "wait", None)
+                if callable(waiter):
+                    try:
+                        if waiter(remaining):
+                            return True
+                    except TypeError:
+                        if waiter():
+                            return True
+            if deadline is not None and time.monotonic() >= deadline:
+                return self.is_set()
+            time.sleep(0.01)
+
+
+@dataclass
+class _VerificationWatchResult:
+    """Typed result used when a legacy verifier is under outer supervision."""
+
+    state: OperationState
+    ok: bool = False
+    failures: list[str] = field(default_factory=list)
+    quality_floor_breach: bool = False
+    sha256: str = ""
+    output_size: int = 0
+    output_video_bytes: int = 0
+    output_duration: float = 0.0
+    reasons: tuple[str, ...] = ()
+    timeout_type: str | None = None
+    interrupted: bool = False
+    cancelled: bool = False
+    deferred: bool = False
+    stalled: bool = False
+    worker_done: threading.Event | None = None
 
 
 class Engine:
@@ -137,11 +219,29 @@ class Engine:
         self._started = False
         self._user_paused = store.get_setting("user_paused", "0") == "1"
         self._pause_reasons: list[str] = []
+        # Machine-wide holds (for example an ffmpeg-upgrade retest) are kept
+        # separately from a single job's transient gate reasons.  A review or
+        # an unrelated job must never erase a global safety hold.
+        self._global_pause_reasons: list[str] = []
         self._progress_last = 0.0
         self._active_cancel = False
+        self._cancel_reason: str | None = None
+        self._shutdown_requested = False
+        self._active_cancel_event: threading.Event | None = None
+        self._active_cancel_job_id: str | None = None
+        self._operation_state_lock = threading.RLock()
+        self._operation_generation = 0
+        self._deferred_cleanup_lock = threading.Lock()
+        self._deferred_cleanups: set[tuple[str, int]] = set()
         self._encode_paused = False
         self._encode_pause_reasons: list[str] = []
+        self._encode_progress: dict[str, Any] = {}
+        self._encode_progress_fraction = 0.0
+        self._encode_partial_bytes = 0
+        self._space_checked_at = 0.0
+        self._space_checked_monotonic = 0.0
         self._thermal_above_since: float | None = None
+        self._encode_thermal_active = False
         self._encode_temp_sensor: Any = None
         self._encode_sensor_checked = False
         self.force_job: str | None = None
@@ -193,6 +293,10 @@ class Engine:
                 log.exception("advance failed job=%s", job["id"])
                 self._fail_job(job["id"], "internal-error", detail=str(exc))
             processed += 1
+            if self._shutdown_requested:
+                # The active child has been terminated and reaped.  Do not
+                # start another job during the same daemon tick.
+                break
             after = self.store.get_job(job["id"])
             if after and (after["state"], after.get("updated_at")) == before:
                 # No progress; gates/pauses will be reflected in status.
@@ -204,9 +308,188 @@ class Engine:
                 break
         self._update_progress_counts()
         self.write_status()
-        self.process_commands()
+        if not self._shutdown_requested:
+            self.process_commands()
         self.housekeeping()
         return processed
+
+    @property
+    def pause_reasons(self) -> list[str]:
+        """Return every active pause reason, including machine-wide holds."""
+
+        return sorted(
+            set(self._pause_reasons)
+            | set(self._global_pause_reasons)
+            | set(self._encode_pause_reasons)
+            | ({"user-paused"} if self._user_paused else set())
+        )
+
+    def set_global_pause_reasons(self, reasons: list[str] | tuple[str, ...]) -> None:
+        """Set machine-wide holds without disturbing per-job pause reasons."""
+
+        self._global_pause_reasons = sorted({
+            str(reason) for reason in reasons if str(reason).strip()
+        })
+
+    def add_global_pause_reasons(self, reasons: list[str] | tuple[str, ...]) -> None:
+        """Add machine-wide holds while preserving unrelated holds."""
+
+        self.set_global_pause_reasons([
+            *self._global_pause_reasons,
+            *(str(reason) for reason in reasons),
+        ])
+
+    def clear_global_pause_reasons(self, *prefixes: str) -> None:
+        """Clear matching machine-wide holds, preserving unrelated reasons."""
+
+        if not prefixes:
+            self._global_pause_reasons = []
+            return
+        self._global_pause_reasons = [
+            reason for reason in self._global_pause_reasons
+            if not any(reason.startswith(prefix) for prefix in prefixes)
+        ]
+
+    def request_shutdown(self) -> None:
+        """Stop the active expensive operation without failing its job.
+
+        The daemon uses this for SIGTERM/SIGINT.  The operation monitor reports
+        a typed shutdown interruption, its child is reaped, and the job remains
+        in a recoverable state for the next daemon start.  The caller's
+        cancellation event is deliberately not set: that event means a user
+        cancellation, while shutdown is identified by its typed reason.
+
+        The first accepted terminal intent wins.  A user cancellation accepted
+        before shutdown is not relabelled as a daemon stop, and shutdown that
+        arrives first cannot be overwritten by a later cancel command.
+        """
+
+        with self._operation_state_lock:
+            self._shutdown_requested = True
+            if not self._active_cancel:
+                self._active_cancel = True
+                self._cancel_reason = "daemon-shutdown"
+
+    def _begin_operation(
+        self,
+        cancel_event: threading.Event,
+        job_id: str | None = None,
+    ) -> bool:
+        """Reset per-operation cancellation state and publish its event.
+
+        Returns whether this operation is starting during daemon shutdown.
+        A shutdown is process-wide, so a new operation always inherits the
+        shutdown intent even if the previous operation ended with a user
+        cancellation.  Without a shutdown, cancellation belongs only to the
+        current operation.
+        """
+
+        with self._operation_state_lock:
+            self._operation_generation += 1
+            if self._shutdown_requested:
+                self._active_cancel = True
+                self._cancel_reason = "daemon-shutdown"
+            else:
+                self._active_cancel = False
+                self._cancel_reason = None
+            self._active_cancel_event = cancel_event
+            self._active_cancel_job_id = job_id
+            return self._shutdown_requested
+
+    def _cancel_outcome(
+        self,
+        outcome: OperationState | None,
+        reasons: tuple[str, ...],
+    ) -> tuple[OperationState | None, tuple[str, ...]]:
+        """Apply an accepted terminal intent to a worker's result.
+
+        A cancellation or shutdown that was accepted before result
+        classification wins over both a late success and a concurrent worker
+        failure.  The typed reason keeps daemon shutdown recoverable and
+        distinct from an explicit user cancellation.
+        """
+
+        with self._operation_state_lock:
+            if not self._active_cancel:
+                return outcome, reasons
+            reason = self._cancel_reason
+        if reason == "daemon-shutdown":
+            return (
+                OperationState.INTERRUPTED,
+                tuple(dict.fromkeys((*reasons, "daemon-shutdown"))),
+            )
+        return (
+            OperationState.CANCELLED,
+            tuple(dict.fromkeys((*reasons, "user-cancelled"))),
+        )
+
+    def _end_operation(self) -> None:
+        with self._operation_state_lock:
+            self._active_cancel_event = None
+            self._active_cancel_job_id = None
+
+    @staticmethod
+    def _release_slot(slot: Any, worker_done: threading.Event | None) -> None:
+        """Release the processing slot only after the worker really exits.
+
+        A Python thread cannot be killed safely.  If a legacy worker ignores
+        cancellation, the slot remains held until its ``worker_done`` event
+        fires.  This prevents a late worker from overlapping the next encode,
+        calibration or capability probe.
+        """
+
+        if worker_done is None or worker_done.is_set():
+            try:
+                slot.__exit__(None, None, None)
+            except Exception:
+                pass
+            return
+
+        def release() -> None:
+            worker_done.wait()
+            try:
+                slot.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=release,
+            name="mediaflow-slot-release",
+            daemon=True,
+        ).start()
+
+    def _cleanup_after_worker(self, job_id: str, worker_done: threading.Event | None) -> None:
+        """Remove a failed job's work only after its worker has exited."""
+
+        with self._operation_state_lock:
+            generation = self._operation_generation
+        if worker_done is None or worker_done.is_set():
+            self._clean_work(job_id)
+            return
+        key = (job_id, generation)
+        with self._deferred_cleanup_lock:
+            if key in self._deferred_cleanups:
+                return
+            self._deferred_cleanups.add(key)
+
+        def cleanup() -> None:
+            worker_done.wait()
+            try:
+                with self._operation_state_lock:
+                    if self._operation_generation != generation:
+                        # A retried attempt owns this job directory now.  The
+                        # new attempt performs its own pre-encode cleanup.
+                        return
+                self._clean_work(job_id)
+            finally:
+                with self._deferred_cleanup_lock:
+                    self._deferred_cleanups.discard(key)
+
+        threading.Thread(
+            target=cleanup,
+            name="mediaflow-worker-cleanup",
+            daemon=True,
+        ).start()
 
     def housekeeping(self) -> None:
         if self.notifier is None:
@@ -216,7 +499,12 @@ class Engine:
             self.notifier.send_review_reminders(reviews)
         except Exception:
             log.warning("review reminder failed", exc_info=True)
-        reasons = sorted(set(self._pause_reasons) | ({"user-paused"} if self._user_paused else set()))
+        reasons = sorted(
+            set(self._pause_reasons)
+            | set(self._global_pause_reasons)
+            | set(self._encode_pause_reasons)
+            | ({"user-paused"} if self._user_paused else set())
+        )
         key = ",".join(reasons)
         prev_key = self.store.get_setting("pause_key", "")
         if key != prev_key:
@@ -302,6 +590,10 @@ class Engine:
         for _ in range(40):
             job = self.store.get_job(job_id)
             if not job or job["state"] in TERMINAL or job["state"] == "REVIEW":
+                return
+            if self._shutdown_requested:
+                # A completed operation may have committed its next state, but
+                # shutdown must not start another stage or publish anything.
                 return
             state = job["state"]
             if state == "DETECTED":
@@ -452,22 +744,20 @@ class Engine:
     def _build_plan(self, job: dict, inspection: SourceInspection, preset: Mapping, identity: Mapping) -> dict:
         from .plan import ReviewRequired, build_plan  # local import avoids cycles
         caps = self._capabilities()
-        height = int(getattr(inspection.probe, "main_video", {}).get("height", 0) or 0)
-        speed = None
-        backend = self._choose_backend(preset)
         try:
-            speed = self.store.speed_get(job["preset"], backend, height)
-        except Exception:
-            speed = None
-        try:
+            # The planner is the sole authority for the selected backend and
+            # encoder.  Do not perform a second, weaker backend selection for
+            # the speed table: doing so allowed a QSV factor to be attached
+            # to a VAAPI plan (or to a software fallback).
             plan = build_plan(
                 source_path=inspection.main, probe=inspection.probe,
                 preset=preset, config=self._config_mapping(),
-                identity=identity, capabilities=caps, speed_factor=speed,
+                identity=identity, capabilities=caps, speed_factor=None,
                 plan_version=1, video_bytes=job.get("source_video_bytes"),
             )
         except ReviewRequired as exc:
             raise ReviewNeeded(exc.reason, getattr(exc, "detail", None)) from exc
+        self._apply_plan_speed(plan, job)
         plan["source_probe"] = getattr(inspection.probe, "raw", None)
         plan["job_id"] = job["id"]
         plan["source_entry"] = str(inspection.entry)
@@ -510,12 +800,35 @@ class Engine:
 
         def progress(info: Mapping[str, Any]) -> None:
             last.update(dict(info))
+            self._encode_progress = dict(info)
+            # Keep a monotonic media-work fraction for the disk reserve.  A
+            # malformed or regressing timestamp never lowers the fraction, and
+            # output growth by itself is not treated as progress.
+            try:
+                duration = float((plan.get("source") or {}).get("duration") or 0.0)
+                out_time = float(info.get("out_time_seconds"))
+                if duration > 0 and math.isfinite(out_time) and out_time >= 0:
+                    fraction = min(1.0, max(0.0, out_time / duration))
+                    self._encode_progress_fraction = max(
+                        self._encode_progress_fraction,
+                        fraction,
+                    )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._encode_partial_bytes = int(partial.stat().st_size)
+            except OSError:
+                self._encode_partial_bytes = 0
             self._write_progress(job["id"], "encoding", info)
 
         # Persist that the encoder is about to run.  If the process dies during
         # the encode, recovery sees this flag and counts a restart.  A job that
         # is merely waiting for a start gate has no flag and must not be
-        # mistaken for an interrupted encode.
+        # mistaken for an interrupted encode.  Interruption markers describe
+        # the *current* attempt and are cleared before a new attempt starts.
+        self.store.set_setting(f"encode-protection-interrupted:{job['id']}", "")
+        self.store.set_setting(f"encode-shutdown:{job['id']}", "")
+        self.store.set_setting(f"encode-deferred:{job['id']}", "")
         self.store.set_setting(f"encode-started:{job['id']}", str(self.clock()))
         try:
             result = self._run_encode_watched(job, plan, progress)
@@ -535,6 +848,19 @@ class Engine:
                 self._write_snapshot(job["id"])
             return False
         except Exception as exc:
+            with self._operation_state_lock:
+                cancel_reason = self._cancel_reason
+            if cancel_reason == "daemon-shutdown":
+                self._remove_partial(job["id"], out)
+                self.store.set_setting(f"encode-shutdown:{job['id']}", "daemon-shutdown")
+                self.store.event(job["id"], "encode-shutdown", "daemon-shutdown")
+                self._pause_reasons = ["daemon-shutdown"]
+                self._write_snapshot(job["id"])
+                return False
+            if cancel_reason == "user-cancelled":
+                self._remove_partial(job["id"], out)
+                self._fail_job(job["id"], "cancelled")
+                return False
             log.exception("encoder failed job=%s", job["id"])
             self._remove_partial(job["id"], out)
             if not self._source_exists(job):
@@ -549,40 +875,121 @@ class Engine:
                                       message=f"encode interrupted: {exc}")
                 self._write_snapshot(job["id"])
             return False
-        try:
-            failure: str | None = None
-            if hasattr(result, "ok") and not result.ok:
-                failure = f"encoder returned failure: {getattr(result, 'stderr_text', '')[:200]}"
-            elif hasattr(result, "returncode") and int(result.returncode) != 0:
-                failure = f"encoder exit {result.returncode}"
-            if failure is not None:
-                self._remove_partial(job["id"], out)
-                if not self._source_exists(job):
-                    self._fail_job(job["id"], "source-moved")
-                    return False
-                restarts = int(job.get("restarts", 0)) + 1
-                if restarts > int(_cfg(self.cfg, "max_restarts", 3)):
-                    self._fail_job(job["id"], f"encoder-error: {failure}")
-                else:
-                    self.store.update_job(job["id"], restarts=restarts)
-                    self.store.transition(job["id"], "PROBED", expect_from="ENCODING",
-                                          message=f"encode failed: {failure}")
-                    self._write_snapshot(job["id"])
+
+        # Typed supervision outcomes are authoritative.  A protection
+        # interruption is not an encoder failure and must not consume the
+        # restart budget; a stall or a process failure does.
+        outcome = getattr(result, "state", None)
+        worker_done = getattr(result, "worker_done", None)
+        reasons = tuple(getattr(result, "reasons", ()) or ())
+        with self._operation_state_lock:
+            cancel_reason = self._cancel_reason
+        # An accepted cancellation or shutdown wins over a late success and a
+        # concurrent worker failure.  The typed reason keeps shutdown distinct
+        # from an explicit user cancellation.
+        outcome, reasons = self._cancel_outcome(outcome, reasons)
+        shutdown = "daemon-shutdown" in reasons or cancel_reason == "daemon-shutdown"
+        if outcome is OperationState.DEFERRED:
+            # A busy exclusive slot means that no expensive operation ran.  It
+            # is a resumable deferral, not a protection interruption and not
+            # an encoder failure.
+            marker = ",".join(reasons)
+            self.store.set_setting(f"encode-deferred:{job['id']}", marker)
+            self.store.event(job["id"], "encode-deferred", marker)
+            self._pause_reasons = list(reasons)
+            self._write_snapshot(job["id"])
+            return False
+        if outcome is OperationState.INTERRUPTED:
+            self._remove_partial(job["id"], out, worker_done)
+            marker = ",".join(reasons)
+            if shutdown:
+                self.store.set_setting(f"encode-shutdown:{job['id']}", marker)
+                self.store.event(job["id"], "encode-shutdown", marker)
+            else:
+                self.store.set_setting(f"encode-protection-interrupted:{job['id']}", marker)
+                self.store.event(job["id"], "encode-protection-interrupted", marker)
+            self._pause_reasons = list(reasons)
+            self._write_snapshot(job["id"])
+            return False
+        if outcome is OperationState.CANCELLED:
+            self._remove_partial(job["id"], out, worker_done)
+            self._fail_job(job["id"], "cancelled", worker_done=worker_done)
+            return False
+        if outcome in {OperationState.STALLED, OperationState.TIMED_OUT}:
+            self._remove_partial(job["id"], out, worker_done)
+            restarts = int(job.get("restarts", 0)) + 1
+            reason = "stalled" if outcome is OperationState.STALLED else "timed-out"
+            if restarts > int(_cfg(self.cfg, "max_restarts", 3)):
+                self._fail_job(job["id"], f"{reason}-restart-limit", worker_done=worker_done)
+            else:
+                self.store.update_job(job["id"], restarts=restarts)
+                self.store.transition(job["id"], "PROBED", expect_from="ENCODING",
+                                      message=f"{reason}: supervised operation did not complete")
+                self._write_snapshot(job["id"])
+            return False
+
+        failure: str | None = None
+        if hasattr(result, "ok") and not result.ok:
+            detail = getattr(result, "stderr_text", None)
+            if detail is None:
+                detail = getattr(result, "stderr", "")
+            failure = f"encoder returned failure: {str(detail)[:200]}"
+        elif hasattr(result, "returncode") and int(result.returncode) != 0:
+            failure = f"encoder exit {result.returncode}"
+        if failure is not None:
+            self._remove_partial(job["id"], out, worker_done)
+            if not self._source_exists(job):
+                self._fail_job(job["id"], "source-moved", worker_done=worker_done)
                 return False
-        finally:
-            self._encode_paused = False
+            restarts = int(job.get("restarts", 0)) + 1
+            if restarts > int(_cfg(self.cfg, "max_restarts", 3)):
+                self._fail_job(job["id"], f"encoder-error: {failure}", worker_done=worker_done)
+            else:
+                self.store.update_job(job["id"], restarts=restarts)
+                self.store.transition(job["id"], "PROBED", expect_from="ENCODING",
+                                      message=f"encode failed: {failure}")
+                self._write_snapshot(job["id"])
+            return False
+        self._encode_paused = False
+        self.store.set_setting(f"encode-protection-interrupted:{job['id']}", "")
+        self.store.set_setting(f"encode-shutdown:{job['id']}", "")
+        self.store.set_setting(f"encode-deferred:{job['id']}", "")
         elapsed = time.monotonic() - started
         if not is_regular_file(out):
-            self._fail_job(job["id"], "encoder-no-output")
+            self._fail_job(job["id"], "encoder-no-output", worker_done=worker_done)
             return False
         fsync_file(out)
         fsync_dir(out.parent)
-        self._transition(self.store.get_job(job["id"]), "ENCODED",
-                         encode_seconds=elapsed, progress=100.0)
+        # Serialize the final cancellation check with the state commit.  A
+        # cancel or shutdown accepted before this lock is acquired wins; one
+        # accepted afterwards observes the already-committed ENCODED state.
+        committed = False
+        with self._operation_state_lock:
+            if not self._active_cancel:
+                self._transition(self.store.get_job(job["id"]), "ENCODED",
+                                 encode_seconds=elapsed, progress=100.0)
+                committed = True
+            else:
+                outcome, reasons = self._cancel_outcome(
+                    OperationState.SUCCEEDED, reasons
+                )
+        if not committed:
+            self._remove_partial(job["id"], out, worker_done)
+            if outcome is OperationState.INTERRUPTED:
+                marker = ",".join(reasons)
+                self.store.set_setting(f"encode-shutdown:{job['id']}", marker)
+                self.store.event(job["id"], "encode-shutdown", marker)
+                self._pause_reasons = list(reasons)
+            else:
+                self._fail_job(job["id"], "cancelled", worker_done=worker_done)
+            self._write_snapshot(job["id"])
+            return False
         return True
 
     def _invoke_encoder(self, plan: dict, progress: Callable,
-                        cancel_event: Any = None, pause_event: Any = None) -> Any:
+                        cancel_event: Any = None, pause_event: Any = None,
+                        monitor: Callable[[], ProtectionDecision] | None = None,
+                        supervision_policy: SupervisionPolicy | None = None) -> Any:
         if self.encoder is None:
             from .ffmpeg import FfmpegEncoder
             self.encoder = FfmpegEncoder(
@@ -601,94 +1008,251 @@ class Engine:
             kwargs["cancel_event"] = cancel_event
         if "pause_event" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
             kwargs["pause_event"] = pause_event
+        if monitor is not None and ("monitor" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())):
+            kwargs["monitor"] = monitor
+        if supervision_policy is not None and ("supervision_policy" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())):
+            kwargs["supervision_policy"] = supervision_policy
         return self.encoder.encode(plan, **kwargs)
 
+    def _encoder_uses_shared_supervision(self) -> bool:
+        """Whether the production encoder owns the shared process supervisor.
+
+        The production :class:`FfmpegEncoder` does.  Legacy injected test
+        encoders do not, so the engine keeps the shared callable boundary for
+        them.  Production encodes therefore have exactly one liveness owner,
+        not a nested process supervisor plus an outer stall detector.
+        """
+
+        import inspect
+
+        try:
+            params = inspect.signature(self.encoder.encode).parameters
+        except (AttributeError, TypeError, ValueError):
+            return False
+        return "monitor" in params and "supervision_policy" in params
+
     def _run_encode_watched(self, job: dict, plan: dict, progress: Callable) -> Any:
-        """Run an encoder while enforcing stall, pause, AC, space and thermal rules."""
+        """Run the encoder through the shared supervision boundary.
+
+        ``FfmpegEncoder`` remains the sole FFmpeg runner.  This wrapper owns
+        the operation-level contract: real-progress liveness, cancellation,
+        composed protection pauses, and typed terminal outcomes.  In
+        particular, a callback which merely repeats the same value never
+        refreshes the stall clock.
+        """
+        from .ffmpeg import EncodeResult
+
+        if self.encoder is None:
+            from .ffmpeg import FfmpegEncoder
+            self.encoder = FfmpegEncoder(
+                ffmpeg=str(_cfg(self.cfg, "ffmpeg", "/usr/lib/jellyfin-ffmpeg/ffmpeg")),
+                timeout=None,
+            )
         cancel = threading.Event()
         pause = threading.Event()
-        self._active_cancel = False
+        if self._begin_operation(cancel, job.get("id")):
+            with self._operation_state_lock:
+                reason = self._cancel_reason or "daemon-shutdown"
+            self._end_operation()
+            state = (
+                OperationState.INTERRUPTED
+                if reason == "daemon-shutdown"
+                else OperationState.CANCELLED
+            )
+            return EncodeResult(
+                output=Path(str(plan.get("working_output") or ".")),
+                returncode=-1,
+                stderr="the operation was not started because the daemon is shutting down",
+                state=state,
+                cancelled=state is OperationState.CANCELLED,
+                interrupted=state is OperationState.INTERRUPTED,
+                reasons=(reason,),
+            )
         self._encode_paused = False
         self._encode_pause_reasons = []
+        self._encode_progress = {}
+        self._encode_progress_fraction = 0.0
+        self._encode_partial_bytes = 0
+        self._space_checked_at = 0.0
+        self._space_checked_monotonic = 0.0
         self._thermal_above_since = None
         self._encode_temp_sensor = None
         self._encode_sensor_checked = False
-        box: dict[str, Any] = {}
-        errors: list[BaseException] = []
-        last_progress = [time.monotonic()]
 
-        def wrapped(info: Mapping[str, Any]) -> None:
-            last_progress[0] = time.monotonic()
-            progress(info)
-
-        def worker() -> None:
-            try:
-                box["result"] = self._invoke_encoder(plan, wrapped, cancel, pause)
-            except BaseException as exc:  # propagated to the daemon thread's caller
-                errors.append(exc)
-
-        thread = threading.Thread(target=worker, name=f"encode-{job['id']}", daemon=True)
-        thread.start()
-        stall_seconds = max(0.2, float(_cfg(self.cfg, "stall_minutes", 10)) * 60.0)
-        stalled = False
-        last_notice = 0.0
-        while thread.is_alive():
-            if not self._active_cancel:
+        def monitor() -> ProtectionDecision:
+            # Commands are serviced while the child is alive.  A user cancel
+            # is a typed cancellation, never a generic process failure.
+            with self._operation_state_lock:
+                active_cancel = self._active_cancel
+                cancel_reason = self._cancel_reason
+            if not active_cancel:
                 self._service_encode_commands(job, cancel)
-            if self._active_cancel:
-                if not cancel.is_set():
-                    cancel.set()
+                with self._operation_state_lock:
+                    active_cancel = self._active_cancel
+                    cancel_reason = self._cancel_reason
+            if active_cancel:
+                shutdown = cancel_reason == "daemon-shutdown"
+                reason = "daemon-shutdown" if shutdown else "user-cancelled"
+                return ProtectionDecision(
+                    ProtectionAction.TERMINATE,
+                    (reason,),
+                    detail=(
+                        "daemon is shutting down"
+                        if shutdown
+                        else "user cancelled the encode"
+                    ),
+                    kind="shutdown" if shutdown else "cancelled",
+                )
+
             reasons, should_pause = self._encoding_pause_state(job)
-            pause_method = str(_cfg(self.cfg, "pause_method", "sigstop"))
-            if pause_method != "sigstop":
-                should_pause = False
             if should_pause != self._encode_paused:
                 if should_pause:
-                    pause.set()
                     self._encode_paused = True
                     self._encode_pause_reasons = reasons
+                    pause.set()
                     self.store.event(job["id"], "encode-paused", ",".join(reasons))
                     log.warning("encoding paused job=%s reasons=%s", job["id"], reasons)
                 else:
-                    pause.clear()
                     self._encode_paused = False
                     self._encode_pause_reasons = []
+                    pause.clear()
                     self.store.event(job["id"], "encode-resumed", "conditions clear")
                     log.info("encoding resumed job=%s", job["id"])
                 self._write_progress(job["id"], "encoding",
                                      {"paused": self._encode_paused, "force": True})
             elif self._encode_paused and reasons != self._encode_pause_reasons:
                 self._encode_pause_reasons = reasons
-            if (not self._encode_paused and not self._active_cancel
-                    and time.monotonic() - last_progress[0] > stall_seconds):
-                stalled = True
-                cancel.set()
-                self.store.event(job["id"], "stalled",
-                                 f"no progress for {stall_seconds:.0f}s; killing encoder")
-                log.error("stall detected job=%s; cancelling encoder", job["id"])
-                break
-            now = time.monotonic()
-            if now - last_notice > 60:
-                last_notice = now
-                if self._encode_paused:
-                    self._write_progress(job["id"], "encoding",
-                                         {"paused": True, "paused_reasons": self._encode_pause_reasons,
-                                          "force": True})
-            thread.join(0.5)
-        thread.join(15.0)
-        if stalled:
-            raise EncodeStalled("no progress while process alive")
-        if thread.is_alive():
-            raise EncodeStalled("encoder did not stop after cancellation")
-        if errors:
-            if self._active_cancel:
-                raise EncodeCancelled("user cancelled")
-            raise errors[0]
-        if self._active_cancel:
-            raise EncodeCancelled("user cancelled")
-        return box.get("result")
+            if should_pause:
+                return ProtectionDecision(
+                    ProtectionAction.PAUSE,
+                    tuple(reasons),
+                    detail="operation paused by protection policy",
+                    kind="protection",
+                )
+            return ProtectionDecision(ProtectionAction.CONTINUE)
+
+        stall_seconds = max(
+            0.2, float(_cfg(self.cfg, "stall_minutes", 10)) * 60.0
+        )
+        policy = SupervisionPolicy(
+            stall_timeout=stall_seconds,
+            startup_grace=min(30.0, stall_seconds),
+            finalization_grace=min(30.0, stall_seconds),
+            monitor_interval=0.1,
+            terminate_grace=5.0,
+        )
+        native_supervision = self._encoder_uses_shared_supervision()
+
+        def operation(
+            report: Callable[[Mapping[str, Any]], None],
+            stop_event: threading.Event,
+        ) -> Any:
+            def wrapped(info: Mapping[str, Any]) -> None:
+                report(info)
+                progress(info)
+            worker_cancel = _CombinedEvent(cancel, stop_event)
+            return self._invoke_encoder(plan, wrapped, worker_cancel, pause)
+
+        slot = processing_slot(slot_path(self.cfg), timeout=0)
+        try:
+            slot.__enter__()
+        except SlotBusy:
+            self._end_operation()
+            return EncodeResult(
+                output=Path(str(plan.get("working_output") or ".")),
+                returncode=-1,
+                stderr="the expensive-operation slot is busy",
+                state=OperationState.DEFERRED,
+                deferred=True,
+                reasons=("processing-slot-busy",),
+            )
+        except OSError as exc:
+            self._end_operation()
+            return EncodeResult(
+                output=Path(str(plan.get("working_output") or ".")),
+                returncode=-1,
+                stderr=f"the expensive-operation slot is unavailable: {exc}",
+                state=OperationState.DEFERRED,
+                deferred=True,
+                reasons=("processing-slot-unavailable",),
+            )
+        watch = None
+        try:
+            with self._operation_state_lock:
+                active_cancel = self._active_cancel
+                cancel_reason = self._cancel_reason
+            if active_cancel:
+                state = (
+                    OperationState.INTERRUPTED
+                    if cancel_reason == "daemon-shutdown"
+                    else OperationState.CANCELLED
+                )
+                reason = cancel_reason or "user-cancelled"
+                return EncodeResult(
+                    output=Path(str(plan.get("working_output") or ".")),
+                    returncode=-1,
+                    stderr="the operation was cancelled before the encoder started",
+                    state=state,
+                    cancelled=state is OperationState.CANCELLED,
+                    interrupted=state is OperationState.INTERRUPTED,
+                    reasons=(reason,),
+                )
+            if native_supervision:
+                # The production encoder already owns ``run_process``.  Calling
+                # it directly avoids two competing stall clocks and two
+                # monitor callers.
+                result = self._invoke_encoder(
+                    plan,
+                    progress,
+                    cancel,
+                    pause,
+                    monitor=monitor,
+                    supervision_policy=policy,
+                )
+            else:
+                watch = supervise_callable(
+                    operation,
+                    policy=policy,
+                    progress_cb=None,
+                    cancel_event=cancel,
+                    pause_event=pause,
+                    monitor=monitor,
+                )
+        finally:
+            self._end_operation()
+            worker_done = watch.worker_done if watch is not None else None
+            self._release_slot(slot, worker_done)
+        if watch is None:
+            return result
+        if watch.state is OperationState.SUCCEEDED:
+            return watch.value
+        if watch.state is OperationState.STALLED:
+            self.store.event(job["id"], "stalled",
+                             "no real progress within the supervision limit")
+        return EncodeResult(
+            output=Path(str(plan.get("working_output") or ".")),
+            returncode=-1,
+            stderr=watch.reason or (str(watch.error) if watch.error is not None else ""),
+            state=watch.state,
+            cancelled=watch.state is OperationState.CANCELLED,
+            interrupted=watch.state is OperationState.INTERRUPTED,
+            deferred=watch.state is OperationState.DEFERRED,
+            stalled=watch.state is OperationState.STALLED,
+            reasons=tuple(watch.reasons or ()),
+            timeout_type=watch.timeout_type,
+            worker_done=watch.worker_done,
+            error=watch.error,
+        )
 
     def _service_encode_commands(self, job: dict, cancel: threading.Event) -> None:
+        with self._operation_state_lock:
+            if self._shutdown_requested:
+                # A daemon stop is process-wide.  Do not apply a new mutating
+                # command after shutdown has been accepted; the next daemon
+                # may service it against the recovered state.
+                return
         for cmd in self.store.pending_commands():
             name = cmd.get("command")
             payload = cmd.get("payload") or {}
@@ -712,8 +1276,11 @@ class Engine:
                     self.store.set_setting("pause_now_requested", "")
                     self.store.event(job["id"], "resume", "requested during encode")
                 elif name == "cancel" and (not target or target == job["id"]):
-                    self._active_cancel = True
-                    cancel.set()
+                    with self._operation_state_lock:
+                        if not self._active_cancel:
+                            self._active_cancel = True
+                            self._cancel_reason = "user-cancelled"
+                            cancel.set()
                     self.store.event(job["id"], "cancel", "requested during encode")
                 else:
                     continue
@@ -722,22 +1289,104 @@ class Engine:
                 self.store.command_done(cmd["id"], error=str(exc))
 
     def _encoding_pause_state(self, job: dict) -> tuple[list[str], bool]:
+        """Return composed pause reasons and whether the child must stop.
+
+        ``idle_after_job`` is only a user-pause policy.  It is never allowed
+        to bypass AC, thermal, space, Jellyfin or ffmpeg-change protection:
+        those conditions must stop the current expensive operation.
+        """
         reasons: list[str] = []
-        if self._user_paused and self.store.get_setting("pause_now_requested", ""):
-            reasons.append("user-paused")
+        protection: list[str] = []
+
+        def add(reason: str, *, protective: bool = True) -> None:
+            reason = str(reason)
+            if not reason or reason in reasons:
+                return
+            reasons.append(reason)
+            if protective and reason != "user-paused":
+                protection.append(reason)
+
+        if self._user_paused:
+            add("user-paused", protective=False)
+
+        # AC policy is independent from thermal policy and fails closed when
+        # the mains state is unknown.  Do not rely on a custom space guard to
+        # implement this safety condition.
+        if bool(_cfg(self.cfg, "pause_on_battery", True)):
+            try:
+                from .guards import GuardConfig, read_ac_state
+                ac_online = read_ac_state(GuardConfig.from_config(self.cfg))
+                if ac_online is False:
+                    add("on-battery")
+                elif ac_online is None:
+                    add("no-ac-source")
+            except Exception:
+                add("no-ac-source")
+                log.warning("could not read AC state; failing closed", exc_info=True)
+
+        # The mid-operation guard owns remaining-work space accounting.  Its
+        # legacy AC reason is de-duplicated with the explicit policy above.
+        # Custom guards in tests and deployments may expose only the legacy
+        # keyword, so pass the richer values opportunistically.
+        watchdog = max(
+            1.0, float(_cfg(self.cfg, "space_watchdog_seconds", 60))
+        )
+        # The watchdog cadence is monotonic.  Wall-clock jumps must not make a
+        # guard fire early or keep a live operation from being checked.
+        now = time.monotonic()
+        if now - self._space_checked_monotonic >= watchdog:
+            self._space_checked_monotonic = now
+            try:
+                if self.guards is not None and hasattr(self.guards, "mid_encode_gate"):
+                    kwargs: dict[str, Any] = {"source_size": job.get("source_size") or 0}
+                    remaining = self._remaining_encode_work(job)
+                    if remaining is not None:
+                        kwargs["remaining_work"] = remaining
+                        kwargs["output_consumed"] = self._encode_output_consumed(job)
+                    try:
+                        decision = self.guards.mid_encode_gate(**kwargs)
+                    except TypeError:
+                        decision = self.guards.mid_encode_gate(
+                            source_size=job.get("source_size") or 0
+                        )
+                    for reason in getattr(decision, "reasons", ()) or ():
+                        add(reason)
+                elif self.guards is None:
+                    from .guards import mid_encode_gate
+                    kwargs = {"source_size": job.get("source_size") or 0}
+                    remaining = self._remaining_encode_work(job)
+                    if remaining is not None:
+                        kwargs["remaining_work"] = remaining
+                        kwargs["output_consumed"] = self._encode_output_consumed(job)
+                    decision = mid_encode_gate(self._guard_cfg(), **kwargs)
+                    for reason in getattr(decision, "reasons", ()) or ():
+                        add(reason)
+            except Exception:
+                add("guard-error")
+                log.warning("mid-encode space/AC guard failed; pausing", exc_info=True)
+
+        # Jellyfin is a machine-level protection reason, not an AC/thermal
+        # alias.  Custom guard objects that do not expose it are left alone.
         try:
-            if self.guards is not None and hasattr(self.guards, "mid_encode_gate"):
-                decision = self.guards.mid_encode_gate(source_size=job.get("source_size") or 0)
-                reasons.extend(getattr(decision, "reasons", ()) or ())
+            jellyfin_active = False
+            if self.guards is not None and hasattr(self.guards, "jellyfin_transcoding"):
+                jellyfin_active = bool(self.guards.jellyfin_transcoding())
             elif self.guards is None:
-                from .guards import mid_encode_gate
-                decision = mid_encode_gate(self._guard_cfg(), source_size=job.get("source_size") or 0)
-                reasons.extend(getattr(decision, "reasons", ()) or ())
+                from .guards import jellyfin_transcoding
+                jellyfin_active = bool(jellyfin_transcoding(self._guard_cfg()))
+            if jellyfin_active:
+                add("jellyfin-transcoding")
         except Exception:
-            reasons.append("guard-error")
-            log.warning("mid-encode space/AC guard failed; pausing", exc_info=True)
-        # Thermal stop is last resort and only for the real guard configuration.
-        if self.guards is None and str(_cfg(self.cfg, "temp_sensor", "auto")) != "none":
+            add("jellyfin-guard-error")
+
+        # Machine-wide holds (notably an ffmpeg-change retest) are protection
+        # reasons too.  They are independent of the current job's gate state.
+        for reason in self._global_pause_reasons:
+            add(str(reason))
+
+        # Thermal policy is deliberately separate from AC.  It has its own
+        # hysteresis and sustain timer; an unknown sensor fails closed.
+        if str(_cfg(self.cfg, "temp_sensor", "auto")) != "none":
             try:
                 from .guards import (discover_temp_sensor, read_package_temp,
                                      thermal_should_pause, thermal_should_resume)
@@ -746,21 +1395,95 @@ class Engine:
                     self._encode_sensor_checked = True
                 temp = read_package_temp(self._encode_temp_sensor) if self._encode_temp_sensor else None
                 if temp is None:
-                    reasons.append("temp-sensor-missing")
-                elif thermal_should_resume(temp, self._guard_cfg()) and self._encode_paused:
-                    if "thermal" in " ".join(self._encode_pause_reasons):
-                        pass  # explicitly resume
+                    add("thermal-sensor-missing")
                 else:
-                    if temp >= float(_cfg(self.cfg, "thermal_pause_c", 85)):
-                        if self._thermal_above_since is None:
-                            self._thermal_above_since = self.clock()
-                    else:
+                    if thermal_should_resume(temp, self._guard_cfg()):
+                        self._encode_thermal_active = False
                         self._thermal_above_since = None
-                    if thermal_should_pause(temp, self._guard_cfg(), self._thermal_above_since):
-                        reasons.append("thermal")
+                    elif self._encode_thermal_active:
+                        # Stay stopped until the lower hysteresis threshold is
+                        # reached, even if the package cooled a little.
+                        add("thermal")
+                    else:
+                        if temp >= float(_cfg(self.cfg, "thermal_pause_c", 85)):
+                            if self._thermal_above_since is None:
+                                self._thermal_above_since = time.monotonic()
+                            elapsed = max(
+                                0.0,
+                                time.monotonic() - self._thermal_above_since,
+                            )
+                            if thermal_should_pause(
+                                temp,
+                                self._guard_cfg(),
+                                self._thermal_above_since,
+                                elapsed_seconds=elapsed,
+                            ):
+                                self._encode_thermal_active = True
+                                add("thermal")
+                        else:
+                            self._thermal_above_since = None
             except Exception:
-                reasons.append("thermal-sensor-error")
-        return reasons, bool(reasons)
+                add("thermal-sensor-error")
+
+        # A user pause may be deferred to the end of the current job only
+        # when the legacy idle_after_job method was explicitly selected.
+        pause_method = str(_cfg(self.cfg, "pause_method", "sigstop"))
+        should_pause = bool(protection)
+        if "user-paused" in reasons and pause_method != "idle_after_job":
+            should_pause = True
+        return reasons, should_pause
+
+    def _remaining_encode_work(self, job: dict) -> int | None:
+        """Return the bytes still needed for the in-flight operation.
+
+        The source video size is a conservative upper bound for the planned
+        output.  A monotonic media-progress fraction reduces that budget;
+        output growth alone never does so.  When progress is available, the
+        current partial size also gives a second, independent projection of
+        the remaining output.  The larger of the two projections is retained
+        so the space guard fails closed rather than under-reserving.
+        """
+        plan = job.get("plan") or {}
+        source = plan.get("source") if isinstance(plan.get("source"), Mapping) else {}
+        try:
+            gross = int(
+                source.get("video_bytes")
+                or job.get("source_video_bytes")
+                or source.get("size_bytes")
+                or job.get("source_size")
+                or 0
+            )
+        except (TypeError, ValueError):
+            gross = 0
+        if gross <= 0:
+            return None
+        fraction = min(1.0, max(0.0, float(self._encode_progress_fraction)))
+        if fraction <= 0.0:
+            # Before a real progress observation, retain the full conservative
+            # work budget.  A growing file is not proof that the encode is
+            # advancing and must not manufacture free space.
+            return gross
+        source_remaining = int(math.ceil(gross * (1.0 - fraction)))
+        consumed = self._encode_output_consumed(job)
+        projected_remaining = 0
+        if consumed > 0 and fraction > 0.0:
+            projected_total = int(math.ceil(consumed / fraction))
+            projected_remaining = max(0, projected_total - consumed)
+        return max(source_remaining, projected_remaining)
+
+    def _encode_output_consumed(self, job: dict) -> int:
+        """Return bytes actually present in the current partial output."""
+        plan = job.get("plan") or {}
+        out = Path(str(plan.get("working_output") or ""))
+        if not out.name or out.name in {".", ".."}:
+            return max(0, int(self._encode_partial_bytes or 0))
+        partial = out.with_name(out.name + ".partial")
+        try:
+            if partial.is_file() and not partial.is_symlink():
+                return int(partial.stat().st_size)
+        except OSError:
+            pass
+        return max(0, int(self._encode_partial_bytes or 0))
 
     # -- ENCODED / verification ----------------------------------------
     def _step_encoded(self, job: dict) -> bool:
@@ -788,15 +1511,231 @@ class Engine:
             self._pause_reasons = list(gate.reasons)
             return False
         verify_started = time.monotonic()
-        try:
-            result = self._invoke_verifier(plan, out)
-        except Exception as exc:
-            log.exception("verification raised job=%s", job["id"])
-            self._fail_job(job["id"], "verification-error", detail=str(exc))
+        cancel = threading.Event()
+        pause = threading.Event()
+        self.store.set_setting(f"verification-protection-interrupted:{job['id']}", "")
+        self.store.set_setting(f"verification-shutdown:{job['id']}", "")
+        self.store.set_setting(f"verification-deferred:{job['id']}", "")
+        self.store.set_setting(f"verification-interrupted:{job['id']}", "")
+        if self._begin_operation(cancel, job.get("id")):
+            with self._operation_state_lock:
+                reason = self._cancel_reason or "daemon-shutdown"
+            self._end_operation()
+            marker = "daemon-shutdown" if reason == "daemon-shutdown" else reason
+            self.store.set_setting(f"verification-shutdown:{job['id']}", marker)
+            self.store.event(job["id"], "verification-shutdown", marker)
+            self._pause_reasons = [marker]
             return False
-        if not getattr(result, "ok", False):
+
+        def verification_monitor() -> ProtectionDecision:
+            with self._operation_state_lock:
+                active_cancel = self._active_cancel
+                cancel_reason = self._cancel_reason
+            if not active_cancel:
+                self._service_encode_commands(job, cancel)
+                with self._operation_state_lock:
+                    active_cancel = self._active_cancel
+                    cancel_reason = self._cancel_reason
+            if active_cancel or cancel.is_set():
+                shutdown = cancel_reason == "daemon-shutdown"
+                reason = "daemon-shutdown" if shutdown else "user-cancelled"
+                return ProtectionDecision(
+                    ProtectionAction.TERMINATE,
+                    (reason,),
+                    detail=(
+                        "daemon is shutting down"
+                        if shutdown
+                        else "user cancelled verification"
+                    ),
+                    kind="shutdown" if shutdown else "cancelled",
+                )
+            reasons, should_pause = self._encoding_pause_state(job)
+            if should_pause:
+                pause.set()
+                self._encode_pause_reasons = list(reasons)
+                return ProtectionDecision(
+                    ProtectionAction.PAUSE,
+                    tuple(reasons),
+                    detail="verification paused by protection policy",
+                    kind="protection",
+                )
+            pause.clear()
+            self._encode_pause_reasons = []
+            return ProtectionDecision(ProtectionAction.CONTINUE)
+
+        stall_seconds = max(
+            0.2, float(_cfg(self.cfg, "stall_minutes", 10)) * 60.0
+        )
+        verification_policy = SupervisionPolicy(
+            stall_timeout=stall_seconds,
+            startup_grace=min(30.0, stall_seconds),
+            finalization_grace=min(30.0, stall_seconds),
+            monitor_interval=0.1,
+            terminate_grace=5.0,
+        )
+        shared_verifier = self._verifier_uses_shared_supervision()
+        watch = None
+        slot = processing_slot(slot_path(self.cfg), timeout=0)
+        try:
+            slot.__enter__()
+        except SlotBusy:
+            self._end_operation()
+            result = _VerificationWatchResult(
+                state=OperationState.DEFERRED,
+                reasons=("processing-slot-busy",),
+                deferred=True,
+                failures=["the expensive-operation slot is busy"],
+            )
+            slot = None  # type: ignore[assignment]
+        except OSError as exc:
+            self._end_operation()
+            result = _VerificationWatchResult(
+                state=OperationState.DEFERRED,
+                reasons=("processing-slot-unavailable",),
+                deferred=True,
+                failures=[f"the expensive-operation slot is unavailable: {exc}"],
+            )
+            slot = None  # type: ignore[assignment]
+        else:
+            try:
+                if shared_verifier:
+                    # The production verifier owns hashing, scans and decode
+                    # supervision.  The engine only supplies its typed monitor
+                    # and policy; it does not add a nested supervisor.
+                    result = self._invoke_verifier(
+                        plan,
+                        out,
+                        job=job,
+                        cancel_event=cancel,
+                        pause_event=pause,
+                        monitor=verification_monitor,
+                        supervision_policy=verification_policy,
+                    )
+                else:
+                    def operation(
+                        report: Callable[[Mapping[str, Any]], None],
+                        stop_event: threading.Event,
+                    ) -> Any:
+                        worker_cancel = _CombinedEvent(cancel, stop_event)
+
+                        def verifier_progress(info: Mapping[str, Any]) -> None:
+                            report(info)
+                            self._write_progress(job["id"], "verifying", info)
+
+                        return self._invoke_verifier(
+                            plan,
+                            out,
+                            job=job,
+                            cancel_event=worker_cancel,
+                            pause_event=pause,
+                            monitor=None,
+                            supervision_policy=None,
+                            progress_cb=verifier_progress,
+                            include_monitor=False,
+                        )
+
+                    watch = supervise_callable(
+                        operation,
+                        policy=verification_policy,
+                        progress_cb=None,
+                        cancel_event=cancel,
+                        pause_event=pause,
+                        monitor=verification_monitor,
+                    )
+                    if watch.state is OperationState.SUCCEEDED:
+                        result = watch.value
+                    else:
+                        result = _VerificationWatchResult(
+                            state=watch.state,
+                            failures=[watch.reason or str(watch.error or "verification failed")],
+                            reasons=tuple(watch.reasons or ()),
+                            timeout_type=watch.timeout_type,
+                            interrupted=watch.state is OperationState.INTERRUPTED,
+                            cancelled=watch.state is OperationState.CANCELLED,
+                            deferred=watch.state is OperationState.DEFERRED,
+                            stalled=watch.state is OperationState.STALLED,
+                            worker_done=watch.worker_done,
+                        )
+            except Exception as exc:
+                with self._operation_state_lock:
+                    cancel_reason = self._cancel_reason
+                if cancel_reason == "daemon-shutdown":
+                    result = _VerificationWatchResult(
+                        state=OperationState.INTERRUPTED,
+                        reasons=("daemon-shutdown",),
+                        failures=["daemon is shutting down"],
+                    )
+                elif cancel_reason == "user-cancelled":
+                    result = _VerificationWatchResult(
+                        state=OperationState.CANCELLED,
+                        reasons=("user-cancelled",),
+                        failures=["user cancelled verification"],
+                    )
+                else:
+                    log.exception("verification raised job=%s", job["id"])
+                    result = _VerificationWatchResult(
+                        state=OperationState.FAILED,
+                        failures=[str(exc)],
+                    )
+            finally:
+                self._end_operation()
+                if slot is not None:
+                    self._release_slot(
+                        slot,
+                        watch.worker_done if watch is not None else None,
+                    )
+
+        state = getattr(result, "state", OperationState.SUCCEEDED)
+        reasons = tuple(getattr(result, "reasons", ()) or ())
+        worker_done = getattr(result, "worker_done", None)
+        with self._operation_state_lock:
+            cancel_reason = self._cancel_reason
+        state, reasons = self._cancel_outcome(state, reasons)
+        shutdown = "daemon-shutdown" in reasons or cancel_reason == "daemon-shutdown"
+        if state is OperationState.DEFERRED:
+            # The exclusive slot was busy, so verification never started.  It
+            # is a resumable deferral rather than a protection interruption.
+            marker = ",".join(reasons)
+            self.store.set_setting(f"verification-deferred:{job['id']}", marker)
+            self.store.event(job["id"], "verification-deferred", marker)
+            self._pause_reasons = list(reasons)
+            return False
+        if state is OperationState.INTERRUPTED:
+            marker = ",".join(reasons)
+            if shutdown:
+                self.store.set_setting(f"verification-shutdown:{job['id']}", marker)
+                self.store.event(job["id"], "verification-shutdown", marker)
+            else:
+                self.store.set_setting(
+                    f"verification-protection-interrupted:{job['id']}", marker
+                )
+                self.store.event(
+                    job["id"], "verification-protection-interrupted", marker
+                )
+            self._pause_reasons = list(reasons)
+            return False
+        if state is OperationState.CANCELLED:
+            self._fail_job(job["id"], "cancelled", worker_done=worker_done)
+            return False
+        if state in {OperationState.STALLED, OperationState.TIMED_OUT}:
+            timeout_type = getattr(result, "timeout_type", None)
+            reason = f"verification-{state.value}"
+            if timeout_type:
+                reason += f":{timeout_type}"
+            self.store.set_setting(
+                f"verification-interrupted:{job['id']}", reason
+            )
+            self.store.event(job["id"], "verification-interrupted", reason)
+            self._fail_job(job["id"], reason, worker_done=worker_done)
+            return False
+        if state is not OperationState.SUCCEEDED or not getattr(result, "ok", False):
             failures = getattr(result, "failures", ["verification failed"])
-            self._fail_job(job["id"], "verification-failed", detail="; ".join(failures))
+            self._fail_job(
+                job["id"],
+                "verification-failed",
+                detail="; ".join(failures),
+                worker_done=worker_done,
+            )
             return False
         if getattr(result, "quality_floor_breach", False):
             if self.dry_run:
@@ -805,13 +1744,42 @@ class Engine:
             self._review(job, "quality-floor", "VERIFIED", {"output": str(out)})
             return False
         sha = getattr(result, "sha256", None) or sha256_file(out)
-        self.store.update_job(
-            job["id"], output_sha256=sha, output_size=getattr(result, "output_size", out.stat().st_size),
-            output_video_bytes=getattr(result, "output_video_bytes", video_bytes),
-            output_path=str(out),
-        )
-        self._transition(self.store.get_job(job["id"]), "VERIFIED",
-                         encode_seconds=job.get("encode_seconds") or (time.monotonic() - verify_started))
+        # Serialize the final cancellation check with the VERIFIED commit.  A
+        # cancellation accepted first suppresses the otherwise successful
+        # verifier; one accepted afterwards observes the committed state.
+        committed = False
+        with self._operation_state_lock:
+            if not self._active_cancel:
+                self.store.set_setting(f"verification-protection-interrupted:{job['id']}", "")
+                self.store.set_setting(f"verification-shutdown:{job['id']}", "")
+                self.store.set_setting(f"verification-deferred:{job['id']}", "")
+                self.store.set_setting(f"verification-interrupted:{job['id']}", "")
+                self.store.update_job(
+                    job["id"], output_sha256=sha,
+                    output_size=getattr(result, "output_size", out.stat().st_size),
+                    output_video_bytes=getattr(result, "output_video_bytes", video_bytes),
+                    output_path=str(out),
+                )
+                self._transition(
+                    self.store.get_job(job["id"]),
+                    "VERIFIED",
+                    encode_seconds=job.get("encode_seconds")
+                    or (time.monotonic() - verify_started),
+                )
+                committed = True
+            else:
+                state, reasons = self._cancel_outcome(
+                    OperationState.SUCCEEDED, reasons
+                )
+        if not committed:
+            if state is OperationState.INTERRUPTED:
+                marker = ",".join(reasons)
+                self.store.set_setting(f"verification-shutdown:{job['id']}", marker)
+                self.store.event(job["id"], "verification-shutdown", marker)
+                self._pause_reasons = list(reasons)
+            else:
+                self._fail_job(job["id"], "cancelled", worker_done=worker_done)
+            return False
         return True
 
     def _prepare_remux_fallback(self, job: dict, plan: dict) -> bool:
@@ -830,23 +1798,93 @@ class Engine:
         new["video"].pop("quality", None)
         new["video"].pop("encoder", None)
         new["video"].pop("backend", None)
+        # A remux has no encode-speed row.  Never carry the failed encode's
+        # estimate into the fallback; use the explicit copy estimate instead.
+        duration = float((new.get("source") or {}).get("duration") or 0.0)
+        new["estimated_seconds"] = duration if duration > 0 else None
+        new["speed_source"] = "copy-estimate" if duration > 0 else "missing"
+        new.pop("speed_factor", None)
         new["_ready"] = True
         new["working_output"] = str(self.work / job["id"] / f"out.{new.get('ext', 'mp4')}")
         self.store.update_job(job["id"], plan_json=new, plan_version=new["plan_version"],
                               output_path=None, output_sha256=None)
         return True
 
-    def _invoke_verifier(self, plan: dict, out: Path) -> Any:
+    def _ensure_verifier(self) -> Callable:
+        """Install the production verifier once and mark its ownership."""
+
         if self.verifier is None:
             from .verify import verify_output
-            self.verifier = lambda p, o: verify_output(
-                p, o, ffprobe=str(_cfg(self.cfg, "ffprobe", "/usr/lib/jellyfin-ffmpeg/ffprobe")),
-                ffmpeg=str(_cfg(self.cfg, "ffmpeg", "/usr/lib/jellyfin-ffmpeg/ffmpeg")),
-                min_output_kbps=float(_cfg(self.cfg, "min_output_kbps", 300)),
-                min_bpp=float(_cfg(self.cfg, "min_bpp", 0.01)),
-                progress_cb=lambda info: self._write_progress(plan.get("job_id", ""), "verifying", info),
-            )
-        return self.verifier(plan, out)
+
+            def default_verifier(p, o, **kwargs):
+                kwargs.setdefault(
+                    "ffprobe", str(_cfg(self.cfg, "ffprobe", "/usr/lib/jellyfin-ffmpeg/ffprobe"))
+                )
+                kwargs.setdefault(
+                    "ffmpeg", str(_cfg(self.cfg, "ffmpeg", "/usr/lib/jellyfin-ffmpeg/ffmpeg"))
+                )
+                kwargs.setdefault(
+                    "min_output_kbps", float(_cfg(self.cfg, "min_output_kbps", 300))
+                )
+                kwargs.setdefault("min_bpp", float(_cfg(self.cfg, "min_bpp", 0.01)))
+                kwargs.setdefault(
+                    "progress_cb",
+                    lambda info: self._write_progress(p.get("job_id", ""), "verifying", info),
+                )
+                return verify_output(p, o, **kwargs)
+
+            # The production verifier owns the shared supervision boundaries
+            # for hashing, scans and full decode.  The engine must not wrap
+            # it in a second callable supervisor.
+            default_verifier._mediaflow_shared_supervision = True  # type: ignore[attr-defined]
+            self.verifier = default_verifier
+        return self.verifier
+
+    def _verifier_uses_shared_supervision(self) -> bool:
+        verifier = self._ensure_verifier()
+        if bool(getattr(verifier, "_mediaflow_shared_supervision", False)):
+            return True
+        import inspect
+        try:
+            params = inspect.signature(verifier).parameters
+        except (TypeError, ValueError):
+            return False
+        return "monitor" in params and "supervision_policy" in params
+
+    def _invoke_verifier(
+        self,
+        plan: dict,
+        out: Path,
+        *,
+        job: dict | None = None,
+        cancel_event: Any = None,
+        pause_event: Any = None,
+        monitor: Any = None,
+        supervision_policy: SupervisionPolicy | None = None,
+        progress_cb: Callable | None = None,
+        include_monitor: bool = True,
+    ) -> Any:
+        verifier = self._ensure_verifier()
+        # Injected verifiers from applications/tests commonly have the old
+        # two-argument shape.  Pass the new controls only when accepted.
+        import inspect
+        try:
+            params = inspect.signature(verifier).parameters
+        except (TypeError, ValueError):
+            params = {}
+        kwargs: dict[str, Any] = {}
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if cancel_event is not None and ("cancel_event" in params or accepts_kwargs):
+            kwargs["cancel_event"] = cancel_event
+        if pause_event is not None and ("pause_event" in params or accepts_kwargs):
+            kwargs["pause_event"] = pause_event
+        if monitor is not None and include_monitor and ("monitor" in params or accepts_kwargs):
+            kwargs["monitor"] = monitor
+        if supervision_policy is not None and ("supervision_policy" in params or accepts_kwargs):
+            kwargs["supervision_policy"] = supervision_policy
+        if progress_cb is not None and ("progress_cb" in params or accepts_kwargs):
+            kwargs["progress_cb"] = progress_cb
+        return verifier(plan, out, **kwargs)
 
     # -- VERIFIED / naming ---------------------------------------------
     def _step_verified(self, job: dict) -> bool:
@@ -1306,14 +2344,21 @@ class Engine:
     # ------------------------------------------------------------------
     # failure, restart, recovery
     # ------------------------------------------------------------------
-    def _fail_job(self, job_id: str, reason: str, detail: str | None = None) -> None:
+    def _fail_job(
+        self,
+        job_id: str,
+        reason: str,
+        detail: str | None = None,
+        *,
+        worker_done: threading.Event | None = None,
+    ) -> None:
         job = self.store.get_job(job_id)
         if not job or job["state"] in TERMINAL:
             return
         log.warning("job failed id=%s reason=%s detail=%s", job_id, reason, detail)
         out = Path((job.get("plan") or {}).get("working_output") or "")
         if out:
-            self._remove_partial(job_id, out)
+            self._remove_partial(job_id, out, worker_done)
         if job["state"] != "REVIEW" and not job.get("parked_path"):
             try:
                 src = Path(job.get("source_path") or "")
@@ -1329,7 +2374,7 @@ class Engine:
         self.store.update_job(job_id, error=reason if not detail else f"{reason}: {detail}",
                               finished_at=self.clock(), phase="failed")
         self.store.transition(job_id, "FAILED", message=reason)
-        self._clean_work(job_id)
+        self._cleanup_after_worker(job_id, worker_done)
         self._write_snapshot(job_id)
         self._notify_failure(job, reason)
 
@@ -1345,10 +2390,32 @@ class Engine:
         self.store.update_job(job["id"], restarts=restarts)
         self.store.transition(job["id"], "PROBED", expect_from=job["state"], message=reason)
 
-    def _remove_partial(self, job_id: str, out: Path | None) -> None:
+    def _remove_partial(
+        self,
+        job_id: str,
+        out: Path | None,
+        worker_done: threading.Event | None = None,
+    ) -> None:
         # A planless job has no working_output. Path("") normalises to ".",
         # whose name is empty and whose with_name() raises; never guess a path.
         if out is None or not out.name or out.name in {".", ".."}:
+            return
+        with self._operation_state_lock:
+            generation = self._operation_generation
+        if worker_done is not None and not worker_done.is_set():
+            def cleanup() -> None:
+                worker_done.wait()
+                with self._operation_state_lock:
+                    if self._operation_generation != generation:
+                        # Do not remove a retried attempt's output.
+                        return
+                self._remove_partial(job_id, out)
+
+            threading.Thread(
+                target=cleanup,
+                name="mediaflow-partial-cleanup",
+                daemon=True,
+            ).start()
             return
         scratch = self.work / job_id
         for p in (out, out.with_name(out.name + ".partial")):
@@ -1409,7 +2476,27 @@ class Engine:
                     self._write_snapshot(job["id"])
                 elif state == "ENCODING":
                     started_flag = self.store.get_setting(f"encode-started:{job['id']}", "")
+                    protection_marker = self.store.get_setting(
+                        f"encode-protection-interrupted:{job['id']}", ""
+                    )
+                    shutdown_marker = self.store.get_setting(
+                        f"encode-shutdown:{job['id']}", ""
+                    )
                     leftovers = [p for p in (self.work / job["id"]).glob("out.*") if p.is_file()]
+                    self.store.set_setting(f"encode-started:{job['id']}", "")
+                    for p in leftovers:
+                        self.safety.remove(p, "startup-interrupted-encode", scratch=self.work / job["id"])
+                    if protection_marker or shutdown_marker:
+                        # A controlled protection/shutdown interruption is not
+                        # an encoder crash and must not consume the retry
+                        # budget.  Resume at PLANNED with the original intact.
+                        self.store.transition(job["id"], "PLANNED", expect_from="ENCODING",
+                                              message=("shutdown interrupted encoding" if shutdown_marker
+                                                       else "protection interrupted encoding"))
+                        self.store.event(job["id"], "recovery",
+                                         "controlled encode interruption; resumed at PLANNED")
+                        self._write_snapshot(job["id"])
+                        continue
                     if not started_flag and not leftovers:
                         # The job never left the start gate.  This is not an
                         # interrupted encode and must not consume a restart.
@@ -1419,10 +2506,7 @@ class Engine:
                                          "encode had not started; resumed planning")
                         self._write_snapshot(job["id"])
                         continue
-                    self.store.set_setting(f"encode-started:{job['id']}", "")
                     restarts = int(job.get("restarts", 0)) + 1
-                    for p in leftovers:
-                        self.safety.remove(p, "startup-interrupted-encode", scratch=self.work / job["id"])
                     if restarts > int(_cfg(self.cfg, "max_restarts", 3)):
                         self._fail_job(job["id"], "restart-limit: startup-interrupted")
                     else:
@@ -1435,6 +2519,25 @@ class Engine:
                     if not is_regular_file(out):
                         self._restart_from_probe(job, "startup-missing-output")
                     else:
+                        if state == "ENCODED":
+                            shutdown_marker = self.store.get_setting(
+                                f"verification-shutdown:{job['id']}", ""
+                            )
+                            protection_marker = self.store.get_setting(
+                                f"verification-protection-interrupted:{job['id']}", ""
+                            )
+                            if shutdown_marker:
+                                self.store.event(
+                                    job["id"],
+                                    "recovery",
+                                    "controlled verification shutdown; verification remains pending",
+                                )
+                            elif protection_marker:
+                                self.store.event(
+                                    job["id"],
+                                    "recovery",
+                                    "controlled verification interruption; verification remains pending",
+                                )
                         self._write_snapshot(job["id"])
                 elif state == "NAMED":
                     plan = job.get("plan") or {}
@@ -1591,15 +2694,18 @@ class Engine:
     def estimate_path(self, path: Path, *, preset_id: str | None = None) -> dict:
         plan = self.preview_plan(path, preset_id=preset_id)
         duration = float((plan.get("source") or {}).get("duration") or 0)
-        backend = (plan.get("video") or {}).get("backend") or "software"
-        height = int((plan.get("video") or {}).get("target_height") or
-                     (plan.get("video") or {}).get("height") or 0)
-        factor = None
-        try:
-            factor = self.store.speed_get(plan.get("preset") or "", backend, height)
-        except Exception:
-            factor = None
-        if factor and factor > 0:
+        backend, height = self._plan_speed_key(plan)
+        factor = self._speed_for_plan(plan)
+        action = str(plan.get("action") or "encode").strip().lower()
+        if action == "remux":
+            try:
+                seconds = float(plan.get("estimated_seconds"))
+            except (TypeError, ValueError):
+                seconds = 0.0
+            if seconds <= 0:
+                seconds = None
+            source = str(plan.get("speed_source") or "copy-estimate")
+        elif factor is not None and duration > 0:
             seconds = duration / factor
             source = "table"
         else:
@@ -1730,7 +2836,27 @@ class Engine:
         job = self.store.get_job(job_id)
         if not job or job["state"] in TERMINAL:
             raise CommandError(f"job is not active: {job_id}")
-        self._active_cancel = True
+        with self._operation_state_lock:
+            active_event = self._active_cancel_event
+            active_job_id = self._active_cancel_job_id
+            shutdown = self._shutdown_requested
+            unrelated_operation = (
+                active_event is not None and active_job_id != job_id
+            )
+            if not unrelated_operation and not self._active_cancel:
+                self._active_cancel = True
+                self._cancel_reason = "user-cancelled"
+        if shutdown:
+            # Shutdown was accepted first and keeps operations recoverable.
+            return self.store.get_job(job_id)
+        if active_event is not None and not unrelated_operation:
+            # The requested job owns the active operation.  Signal it and let
+            # its typed supervisor perform failure/cleanup with the worker's
+            # completion event; do not delete work under a live worker.
+            active_event.set()
+            return self.store.get_job(job_id)
+        # No operation for this job is active.  Fail it directly without
+        # touching another job's cancellation event.
         self._fail_job(job_id, "cancelled")
         return self.store.get_job(job_id)
 
@@ -1942,9 +3068,9 @@ class Engine:
                     source_size=job.get("source_size") or 0,
                     estimate_seconds=estimate,
                     window=None if force else window,
-                    speed_known=True if force else speed_known,
+                    speed_known=speed_known,
                     user_paused=self._user_paused,
-                    extra_reasons=tuple(r for r in self._pause_reasons if r == "ffmpeg-changed"),
+                    extra_reasons=tuple(self._global_pause_reasons),
                 )
             else:
                 from .guards import start_gate
@@ -1952,9 +3078,9 @@ class Engine:
                     self._guard_cfg(), source_size=job.get("source_size") or 0,
                     estimate_seconds=estimate,
                     window=None if force else window,
-                    speed_known=True if force else speed_known,
+                    speed_known=speed_known,
                     user_paused=self._user_paused,
-                    extra_reasons=tuple(r for r in self._pause_reasons if r.startswith("ffmpeg-changed")),
+                    extra_reasons=tuple(self._global_pause_reasons),
                 )
             if force:
                 schedule = {"estimate-exceeds-window", "estimate-cold-start", "outside-window"}
@@ -1968,15 +3094,30 @@ class Engine:
             return _SimpleDecision(False, reasons + [f"guard-error: {exc}"])
 
     def _space_gate(self, job: dict) -> Any:
+        """Reserve the bytes a publish may copy, not the source's old size."""
+
+        reserve = 0
+        try:
+            reserve = int(job.get("output_size") or 0)
+        except (TypeError, ValueError):
+            reserve = 0
+        if reserve <= 0:
+            plan = job.get("plan") or {}
+            try:
+                output = Path(plan.get("working_output") or "")
+                if output.is_file() and not output.is_symlink():
+                    reserve = output.stat().st_size
+            except OSError:
+                reserve = 0
         try:
             if self.guards is not None and hasattr(self.guards, "check_space"):
                 return self.guards.check_space(
-                    source_size=job.get("source_size") or 0,
+                    source_size=reserve,
                     db_path=Path(_cfg(self.cfg, "db_path", "/var/lib/mediaflow/state.db")),
                 )[1]
             from .guards import check_space
             return check_space(
-                self._guard_cfg(), source_size=job.get("source_size") or 0,
+                self._guard_cfg(), source_size=reserve,
                 db_path=Path(_cfg(self.cfg, "db_path", "/var/lib/mediaflow/state.db")),
             )[1]
         except Exception:
@@ -1992,17 +3133,87 @@ class Engine:
         except Exception:
             return self.cfg
 
+    def _plan_speed_key(self, plan: Mapping[str, Any]) -> tuple[str | None, int]:
+        """Return the one canonical speed-table key for a planned operation.
+
+        A remux has no encode backend and therefore has no encode-speed row.
+        For an encode the backend is the planner-selected backend and the
+        height is the *target* height, which is also the geometry used by
+        calibration and by post-encode updates.
+        """
+
+        if str(plan.get("action") or "encode").lower() != "encode":
+            return None, 0
+        video = plan.get("video") if isinstance(plan.get("video"), Mapping) else {}
+        backend = video.get("backend")
+        if not backend:
+            return None, 0
+        try:
+            height = int(video.get("target_height") or 0)
+        except (TypeError, ValueError):
+            height = 0
+        return (str(backend), height) if height > 0 else (None, 0)
+
+    def _speed_for_plan(self, plan: Mapping[str, Any]) -> float | None:
+        backend, height = self._plan_speed_key(plan)
+        if not backend or height <= 0:
+            return None
+        try:
+            factor = self.store.speed_get(
+                str(plan.get("preset") or ""), backend, height
+            )
+        except Exception:
+            return None
+        try:
+            factor = float(factor) if factor is not None else None
+        except (TypeError, ValueError):
+            return None
+        return factor if factor is not None and factor > 0 else None
+
+    def _apply_plan_speed(self, plan: dict, job: Mapping[str, Any] | None = None) -> None:
+        """Populate the estimate from the plan's authoritative speed key."""
+
+        duration = float((plan.get("source") or {}).get("duration") or 0)
+        action = str(plan.get("action") or "encode").strip().lower()
+        factor = self._speed_for_plan(plan)
+        if action == "remux":
+            # Remuxing is not an encode and has no backend speed-table row.
+            # Preserve the planner's explicit copy estimate (one times media
+            # time by default) instead of attaching another backend's factor.
+            estimate = plan.get("estimated_seconds")
+            try:
+                estimate = float(estimate) if estimate is not None else duration
+            except (TypeError, ValueError):
+                estimate = duration
+            plan["estimated_seconds"] = estimate if estimate > 0 else None
+            plan["speed_source"] = (
+                "copy-estimate" if plan.get("estimated_seconds") is not None else "missing"
+            )
+            plan.pop("speed_factor", None)
+        elif factor is not None and duration > 0:
+            plan["estimated_seconds"] = duration / factor
+            plan["speed_source"] = "table"
+            plan["speed_factor"] = factor
+        else:
+            plan["estimated_seconds"] = None
+            plan["speed_source"] = "missing"
+            plan.pop("speed_factor", None)
+
     def _estimate(self, job: dict, plan: dict) -> float | None:
         duration = float(plan.get("source", {}).get("duration") or 0)
-        backend = (plan.get("video") or {}).get("backend") or "software"
-        height = int((plan.get("video") or {}).get("target_height") or
-                     (plan.get("video") or {}).get("height") or 0)
-        try:
-            factor = self.store.speed_get(job["preset"], backend, height)
-        except Exception:
-            factor = None
-        if not factor or factor <= 0 or duration <= 0:
-            return plan.get("estimated_seconds")
+        action = str(plan.get("action") or "encode").strip().lower()
+        if action == "remux":
+            try:
+                estimate = float(plan.get("estimated_seconds"))
+            except (TypeError, ValueError):
+                estimate = 0.0
+            return estimate if estimate > 0 else None
+        factor = self._speed_for_plan(plan)
+        if factor is None or duration <= 0:
+            # Only the selected backend and canonical target-height key may
+            # establish an encode speed.  A stale estimate copied from an
+            # earlier plan is not authoritative.
+            return None
         return duration / factor
 
     def _video_bytes(self, path: Path, stream_index: int) -> int:
@@ -2200,7 +3411,12 @@ class Engine:
         payload = {
             "counts": counts, "queue": sum(v for k, v in counts.items() if k not in {"REVIEW"}),
             "reviews": counts.get("REVIEW", 0), "oldest_review_seconds": oldest_review,
-            "paused_reasons": sorted(set(self._pause_reasons) | ({"user-paused"} if self._user_paused else set())),
+            "paused_reasons": sorted(
+                set(self._pause_reasons)
+                | set(self._global_pause_reasons)
+                | set(self._encode_pause_reasons)
+                | ({"user-paused"} if self._user_paused else set())
+            ),
             "free_bytes": free,
             "trash_bytes": trash_size, "last_success": last_success, "updated_at": self.clock(),
             "dry_run": self.dry_run,
