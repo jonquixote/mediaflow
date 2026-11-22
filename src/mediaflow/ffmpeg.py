@@ -255,7 +255,7 @@ def build_command(
     """
     if not isinstance(plan, Mapping):
         raise PlanError(f"plan must be a mapping, got {type(plan).__name__}")
-    if plan.get("schema") not in (None, 1, "1"):
+    if plan.get("schema") not in (None, 1, "1", 2, "2"):
         raise PlanError(f"unsupported plan schema: {plan.get('schema')!r}")
     if sample is not None and not isinstance(sample, SampleSpec):
         raise PlanError("sample must be a SampleSpec")

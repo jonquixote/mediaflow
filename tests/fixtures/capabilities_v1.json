@@ -1,0 +1,8 @@
+{
+  "ffmpeg_version": "ffmpeg version old-Jellyfin",
+  "backends": {
+    "qsv": {"hevc8": true, "hevc10": false, "rate_control": "CQP"}
+  },
+  "libvmaf": false,
+  "tested_at": 1.0
+}

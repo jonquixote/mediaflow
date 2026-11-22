@@ -126,14 +126,18 @@ def _supervision_policy() -> SupervisionPolicy:
 
 def _capabilities(config: Any) -> dict[str, Any]:
     """The capability report the planner uses to pick a backend."""
+
+    # An explicitly injected dictionary (tests and in-process callers) is
+    # trusted; a persisted file must carry the tri-state schema marker.
+    injected = getattr(config, "capabilities", None)
+    if isinstance(injected, dict):
+        return injected
     path = getattr(config, "capabilities_path", None)
     if not path:
         return {}
-    try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    from .doctor import read_capabilities
+
+    return read_capabilities(path)
 
 
 def _has_filter(

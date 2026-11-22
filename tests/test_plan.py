@@ -279,7 +279,7 @@ def test_plan_matches_plan_schema(tmp_path):
         "action",
         "sidecar",
     }
-    assert plan["schema"] == 1
+    assert plan["schema"] == 2
     assert plan["preset"] == "test-preset"
     assert plan["review"] is None
     assert plan["action"] == "encode"

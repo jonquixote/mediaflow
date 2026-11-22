@@ -81,7 +81,9 @@ def test_command_queue(store):
     cid = store.enqueue_command("pause", {"now": True})
     pending = store.pending_commands()
     assert pending[0]["id"] == cid and pending[0]["payload"]["now"] is True
-    store.command_start(cid)
+    assert store.command_start(cid) is True
+    assert store.command_start(cid) is False  # no double execution
+    assert store.pending_commands()[0]["status"] == "running"
     store.command_done(cid)
     assert store.pending_commands() == []
 
