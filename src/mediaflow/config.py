@@ -11,7 +11,8 @@ wins over ``root`` in the file and the production media root is refused.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
+from enum import Enum
 import hashlib
 import math
 import os
@@ -30,7 +31,13 @@ __all__ = [
     "REDACTED",
     "Config",
     "ConfigError",
+    "ConfigReloadPlan",
+    "KEY_CLASS",
+    "ReloadClass",
     "Secrets",
+    "SecretReloadPlan",
+    "classify_config_change",
+    "classify_secret_change",
     "config_mtime_fingerprint",
     "load_config",
     "load_secrets",
@@ -48,6 +55,15 @@ REDACTED = "***"
 
 PAUSE_METHODS = frozenset({"sigstop", "idle_after_job"})
 TEMP_SENSORS = frozenset({"auto", "none"})
+
+
+class ReloadClass(str, Enum):
+    """How a configuration value may change while the daemon is running."""
+
+    LIVE = "live"                       # applied at the next gate/check
+    FUTURE_JOBS = "future-jobs"         # cached per operation/job; new work only
+    RESTART_REQUIRED = "restart"        # cached at construction; old value stays
+    REJECTED = "rejected"               # never accepted from config.toml
 
 #: Directory names below the pipeline root.  ``convert`` is the directory that
 #: contains one sub-directory per preset (``_pipeline/convert/movies``).
@@ -163,6 +179,10 @@ class Config:
     # --- internal sandbox/deployment overrides --------------------------
     state_dir: Path = DEFAULT_STATE_DIR
     runtime_dir: Path = DEFAULT_RUNTIME_DIR
+
+    # Monotonic generation of the complete configuration.  Not user-settable;
+    # a successful atomic reload increments it.  Plans bind to this value.
+    generation: int = 1
 
     def __post_init__(self) -> None:
         # Normalise the path fields even when constructed directly.  Keep the
@@ -388,7 +408,9 @@ _STRING_FIELDS = frozenset(
     }
 )
 _PATH_FIELDS = frozenset({"root", "state_dir", "runtime_dir"})
-_CONFIG_KEYS = frozenset(field.name for field in fields(Config))
+_CONFIG_KEYS = frozenset(
+    field.name for field in fields(Config) if field.name != "generation"
+)
 
 # Keep this explicit so a new Config field cannot silently be accepted by the
 # loader without a type/range rule.
@@ -400,6 +422,146 @@ if _CONFIG_KEYS != (
     | _PATH_FIELDS
 ):  # pragma: no cover - programming error
     raise RuntimeError("config field validation rules are incomplete")
+
+
+#: The single authoritative reload classification.  Every user-settable key is
+#: present exactly once.  ``generation`` is internal and therefore excluded.
+KEY_CLASS: dict[str, ReloadClass] = {
+    # Paths and binaries are cached at construction (engine paths, safety,
+    # encoder, open DB and lock file).  Changing them mid-flight would create
+    # a mixed generation, so the old effective value is retained.
+    "root": ReloadClass.RESTART_REQUIRED,
+    "state_dir": ReloadClass.RESTART_REQUIRED,
+    "runtime_dir": ReloadClass.RESTART_REQUIRED,
+    "ffmpeg": ReloadClass.RESTART_REQUIRED,
+    "poll_seconds": ReloadClass.RESTART_REQUIRED,
+    "review_reminder_days": ReloadClass.RESTART_REQUIRED,
+    "notify_cooldown_hours": ReloadClass.RESTART_REQUIRED,
+    # Per-operation policy and naming are captured when a job/operation starts.
+    "append_tmdbid": ReloadClass.FUTURE_JOBS,
+    "stall_minutes": ReloadClass.FUTURE_JOBS,
+    "temp_sensor": ReloadClass.FUTURE_JOBS,
+    # The rest are read at each gate/check and are safe between operations.
+    "ffprobe": ReloadClass.LIVE,
+    "dry_run": ReloadClass.LIVE,
+    "stable_seconds": ReloadClass.LIVE,
+    "trash_retention_days": ReloadClass.LIVE,
+    "failed_retention_days": ReloadClass.LIVE,
+    "min_free_gb": ReloadClass.LIVE,
+    "root_min_free_gb": ReloadClass.LIVE,
+    "max_trash_gb": ReloadClass.LIVE,
+    "space_watchdog_seconds": ReloadClass.LIVE,
+    "pause_when_jellyfin_transcoding": ReloadClass.LIVE,
+    "pause_on_battery": ReloadClass.LIVE,
+    "pause_method": ReloadClass.LIVE,
+    "start_if_temp_below_c": ReloadClass.LIVE,
+    "thermal_pause_c": ReloadClass.LIVE,
+    "thermal_resume_c": ReloadClass.LIVE,
+    "progress_seconds": ReloadClass.LIVE,
+    "max_restarts": ReloadClass.LIVE,
+    "min_output_kbps": ReloadClass.LIVE,
+    "min_bpp": ReloadClass.LIVE,
+    "jellyfin_user": ReloadClass.LIVE,
+}
+
+if set(KEY_CLASS) != _CONFIG_KEYS:  # pragma: no cover - programming error
+    raise RuntimeError("config reload classifications are incomplete")
+
+
+@dataclass(frozen=True)
+class ConfigReloadPlan:
+    """Result of validating a candidate configuration generation."""
+
+    effective_config: Config
+    live_changed: tuple[str, ...]
+    future_changed: tuple[str, ...]
+    restart_required: tuple[str, ...]
+    notes: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "generation": self.effective_config.generation,
+            "live_changed": list(self.live_changed),
+            "future_changed": list(self.future_changed),
+            "restart_required": list(self.restart_required),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass(frozen=True)
+class SecretReloadPlan:
+    """Secret rotations are restart-required and never carry values."""
+
+    changed: tuple[str, ...]
+    restart_required: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        # Deliberately no values, digests or lengths.
+        return {
+            "changed": list(self.changed),
+            "restart_required": list(self.restart_required),
+        }
+
+
+def classify_config_change(old: Config, new: Config) -> ConfigReloadPlan:
+    """Build an all-or-nothing plan for a candidate config generation.
+
+    Restart-required keys are copied from ``old`` into the effective config,
+    so no component can observe a half-applied generation.  The generation is
+    always advanced because the reload itself, and any live/future changes,
+    are now authoritative.
+    """
+
+    live: list[str] = []
+    future: list[str] = []
+    restart: list[str] = []
+    notes: list[str] = []
+    effective: dict[str, Any] = {}
+    for key, classification in KEY_CLASS.items():
+        old_value = getattr(old, key)
+        new_value = getattr(new, key)
+        if old_value == new_value:
+            continue
+        if classification is ReloadClass.RESTART_REQUIRED:
+            restart.append(key)
+            effective[key] = old_value
+            notes.append(f"restart-required:{key}")
+        elif classification is ReloadClass.FUTURE_JOBS:
+            future.append(key)
+            effective[key] = new_value
+        else:
+            live.append(key)
+            effective[key] = new_value
+    effective["generation"] = max(int(old.generation), int(new.generation)) + 1
+    return ConfigReloadPlan(
+        effective_config=replace(old, **effective),
+        live_changed=tuple(live),
+        future_changed=tuple(future),
+        restart_required=tuple(restart),
+        notes=tuple(notes),
+    )
+
+
+def classify_secret_change(old: Secrets | None, new: Secrets | None) -> SecretReloadPlan:
+    """Report a secret rotation without ever exposing either value."""
+
+    old_token = bool(getattr(old, "token", None))
+    new_token = bool(getattr(new, "token", None))
+    old_url = bool(getattr(old, "url", None))
+    new_url = bool(getattr(new, "url", None))
+    changed: list[str] = []
+    if old_token != new_token or (
+        old_token and new_token and getattr(old, "token") != getattr(new, "token")
+    ):
+        changed.append("tmdb_token")
+    if old_url != new_url or (
+        old_url and new_url and getattr(old, "url") != getattr(new, "url")
+    ):
+        changed.append("notify_url")
+    return SecretReloadPlan(
+        changed=tuple(changed),
+        restart_required=tuple(changed),
+    )
 
 _SECRET_KEY_NAMES = frozenset(
     {

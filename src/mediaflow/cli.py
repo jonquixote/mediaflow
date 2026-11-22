@@ -115,6 +115,8 @@ def _status_payload(cfg: Config, store: Store | None = None) -> dict:
             "reviews": counts.get("REVIEW", 0),
             "oldest_review_seconds": oldest, "paused_reasons": [], "free_bytes": free,
             "trash_bytes": 0, "last_success": None, "dry_run": cfg.dry_run,
+            "config_generation": int(getattr(cfg, "generation", 1) or 1),
+            "pending_config_generation": None, "restart_required": [],
             "updated_at": time.time()}
 
 
@@ -131,7 +133,10 @@ def cmd_status(args) -> int:
     lines = [
         f"state {'PAUSED' if data.get('paused_reasons') else 'running'}  dry-run {'on' if data.get('dry_run') else 'off'}",
         f"queue {data.get('queue', 0)}  reviews {data.get('reviews', 0)}",
+        f"config gen {data.get('config_generation', '?')}",
     ]
+    if data.get("restart_required"):
+        lines.append("restart required: " + ",".join(data["restart_required"])[:48])
     current = None
     try:
         progress = json.loads(cfg.progress_path.read_text(encoding="utf-8"))
@@ -382,7 +387,7 @@ def cmd_run(args) -> int:
             notifier = None
         daemon = Daemon(cfg, store, presets, config_path=_config_path(args),
                         presets_dir=_presets_dir(_config_path(args)),
-                        notifier=notifier)
+                        notifier=notifier, secrets=secrets)
         return daemon.run(once=args.once, force_job=args.force)
     finally:
         store.close()

@@ -8,6 +8,7 @@ replaced.  All file moves use :mod:`mediaflow.safety`.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .state import (
     ACTIVE_STATES,
@@ -176,7 +177,8 @@ class Engine:
                  guards: Any = None, notifier: Any = None,
                  identity_resolver: Callable | None = None,
                  clock: Callable[[], float] = time.time,
-                 dry_run_override: bool | None = None):
+                 dry_run_override: bool | None = None,
+                  secrets: Any = None):
         self.cfg = config
         self.store = store
         self.presets = dict(presets or {})
@@ -209,7 +211,7 @@ class Engine:
         self.guards = guards
         self.notifier = notifier
         self.identity_resolver = identity_resolver
-        self.secrets = _cfg(config, "secrets", None)
+        self.secrets = secrets if secrets is not None else _cfg(config, "secrets", None)
         self._started = False
         self._user_paused = store.get_setting("user_paused", "0") == "1"
         self._pause_reasons: list[str] = []
@@ -225,6 +227,13 @@ class Engine:
         self._active_cancel_job_id: str | None = None
         self._operation_state_lock = threading.RLock()
         self._operation_generation = 0
+        # A validated configuration generation waiting for a safe boundary.
+        # It is applied only when no expensive operation is active.
+        self.pending_config: Any | None = None
+        self.pending_presets: Mapping[str, Any] | None = None
+        self.pending_secrets: Any | None = None
+        self._restart_required: tuple[str, ...] = ()
+        self._generation_lock = threading.RLock()
         self._deferred_cleanup_lock = threading.Lock()
         self._deferred_cleanups: set[tuple[str, int]] = set()
         self._encode_paused = False
@@ -343,6 +352,70 @@ class Engine:
             reason for reason in self._global_pause_reasons
             if not any(reason.startswith(prefix) for prefix in prefixes)
         ]
+
+    def set_restart_required(self, reasons: Iterable[str]) -> None:
+        """Record and expose keys that require a daemon restart."""
+
+        with self._generation_lock:
+            self._restart_required = tuple(sorted({
+                str(reason) for reason in reasons if str(reason).strip()
+            }))
+
+    def apply_pending_config(self) -> bool:
+        """Atomically publish a validated configuration generation.
+
+        The swap is deferred while an expensive operation owns the operation
+        boundary, so a reload can never change an in-flight policy.  All derived
+        path/safety values are rebuilt from the same generation before the new
+        config becomes visible.
+        """
+
+        with self._generation_lock:
+            with self._operation_state_lock:
+                if self._active_cancel_event is not None:
+                    return False
+                if self.pending_config is None:
+                    return True
+                new_cfg = self.pending_config
+                new_presets = self.pending_presets
+                new_secrets = self.pending_secrets
+                self.pending_config = None
+                self.pending_presets = None
+                self.pending_secrets = None
+            self.cfg = new_cfg
+            if new_presets is not None:
+                self.presets = dict(new_presets)
+            if new_secrets is not None:
+                self.secrets = new_secrets
+            self.root = Path(_cfg(new_cfg, "root", self.root))
+            self.movies = Path(_cfg(new_cfg, "movies", self.root / "movies"))
+            self.pipeline = Path(_cfg(new_cfg, "pipeline", self.root / "_pipeline"))
+            self.convert = Path(_cfg(new_cfg, "convert", self.pipeline / "convert"))
+            explicit_convert = _cfg(new_cfg, "convert_movies", None)
+            if explicit_convert is not None:
+                self.convert_movies = Path(explicit_convert)
+            elif self.convert.name == "movies":
+                self.convert_movies = self.convert
+            else:
+                self.convert_movies = self.convert / "movies"
+            self.work = Path(_cfg(new_cfg, "work", self.pipeline / "work"))
+            self.review = Path(_cfg(new_cfg, "review", self.pipeline / "review"))
+            self.failed = Path(_cfg(new_cfg, "failed", self.pipeline / "failed"))
+            self.trash = Path(_cfg(new_cfg, "trash", self.pipeline / "trash"))
+            self.inbox = Path(_cfg(new_cfg, "inbox", self.pipeline / "inbox"))
+            self.log_dir = Path(_cfg(new_cfg, "log_dir",
+                                    Path(_cfg(new_cfg, "state_dir", "/var/lib/mediaflow")) / "logs"))
+            self.status_path = Path(_cfg(new_cfg, "status_path",
+                                        Path(_cfg(new_cfg, "state_dir", "/var/lib/mediaflow")) / "status.json"))
+            self.progress_path = Path(_cfg(new_cfg, "progress_path",
+                                          Path(_cfg(new_cfg, "state_dir", "/var/lib/mediaflow")) / "progress.json"))
+            self.capabilities_path = Path(_cfg(new_cfg, "capabilities_path",
+                                              Path(_cfg(new_cfg, "state_dir", "/var/lib/mediaflow")) / "capabilities.json"))
+            self.dry_run = bool(_cfg(new_cfg, "dry_run", True))
+            self.safety = FileSafety(self.root, self.work, self.trash)
+            self._user_paused = self.store.get_setting("user_paused", "0") == "1"
+        self.write_status()
+        return True
 
     def request_shutdown(self) -> None:
         """Stop the active expensive operation without failing its job.
@@ -691,11 +764,39 @@ class Engine:
 
     # -- PLANNED --------------------------------------------------------
     def _step_plan(self, job: dict) -> bool:
+        if not self._preset_available(job["preset"]):
+            # A removed or disabled preset is a hold for queued/planned work.
+            # Jobs already past PLANNING continue under their recorded plan.
+            self._pause_reasons = [f"preset-unavailable:{job['id']}"]
+            return False
         if job.get("plan") and job.get("dry_run") == self.dry_run:
-            self._transition(job, "ENCODING")
-            return True
+            plan = job["plan"]
+            expected_generation = int(getattr(self.cfg, "generation", 1) or 1)
+            generation_changed = (
+                plan.get("config_generation") != expected_generation
+                or plan.get("plan_schema") != 2
+            )
+            fingerprint_changed = (
+                plan.get("preset_fingerprint")
+                != self._preset_fingerprint(self._preset(job["preset"]))
+            )
+            # A SIZE-2 fallback carries its own plan version and must not be
+            # silently replaced by a fresh encode plan after a reload.
+            if (generation_changed or fingerprint_changed) and not plan.get("fallback_from"):
+                self.store.event(
+                    job["id"], "replanned",
+                    "configuration generation or preset identity changed",
+                )
+                self.store.update_job(
+                    job["id"], plan_json=None, dry_run=self.dry_run, plan_version=0,
+                )
+                job = self.store.get_job(job["id"])
+            else:
+                self._transition(job, "ENCODING")
+                return True
         if job.get("plan") and job.get("dry_run") != self.dry_run:
-            # Explicit dry_run flip: forget the dry-run plan and build once.
+            # Explicit dry-run flip: forget the plan and build once in either
+            # direction.  A flip back to dry-run parks the job at PLANNED.
             self.store.update_job(job["id"], plan_json=None, dry_run=self.dry_run, plan_version=0)
             job = self.store.get_job(job["id"])
         try:
@@ -717,7 +818,11 @@ class Engine:
             self._fail_job(job["id"], "planning-failed", detail=str(exc))
             return False
         plan["plan_version"] = 1
+        plan["schema"] = 2
+        plan["plan_schema"] = 2
         plan["dry_run"] = bool(self.dry_run)
+        plan["config_generation"] = int(getattr(self.cfg, "generation", 1) or 1)
+        plan["preset_fingerprint"] = self._preset_fingerprint(self._preset(job["preset"]))
         plan.setdefault("working_output", str(self.work / job["id"] / f"out.{plan['ext']}"))
         self.store.update_job(
             job["id"], plan_json=plan, plan_version=1, dry_run=self.dry_run,
@@ -752,6 +857,11 @@ class Engine:
         except ReviewRequired as exc:
             raise ReviewNeeded(exc.reason, getattr(exc, "detail", None)) from exc
         self._apply_plan_speed(plan, job)
+        # Bind the plan to the exact configuration generation and preset that
+        # defined it.  Safety settings are deliberately not bound: they are
+        # read from the current generation on every gate/check.
+        plan["config_generation"] = int(getattr(self.cfg, "generation", 1) or 1)
+        plan["preset_fingerprint"] = self._preset_fingerprint(preset)
         plan["source_probe"] = getattr(inspection.probe, "raw", None)
         plan["job_id"] = job["id"]
         plan["source_entry"] = str(inspection.entry)
@@ -1256,7 +1366,8 @@ class Engine:
             target = payload.get("job_id")
             if target and target != job["id"] and name == "cancel":
                 continue
-            self.store.command_start(cmd["id"])
+            if not self.store.command_start(cmd["id"]):
+                continue  # another loop already claimed it
             try:
                 if name == "pause":
                     self._user_paused = True
@@ -2281,6 +2392,7 @@ class Engine:
         self.store.clear_review(job_id)
         if reason == "duplicate":
             self.store.transition(job_id, "PUBLISHED", expect_from="REVIEW", message="replace intent")
+            self.store.complete_intent(intent)
         else:
             self.store.transition(job_id, resume, expect_from="REVIEW", message="review accepted")
         self._write_snapshot(job_id)
@@ -2453,6 +2565,17 @@ class Engine:
     def recover(self) -> None:
         """Idempotently resume every persisted state. DB wins over snapshots."""
         self._check_paths()
+        # Machine-wide holds that survive a process restart are persisted
+        # independently of job rows.  Resolved holds are cleared by the daemon
+        # before engine.start(), so recovery cannot resurrect them.
+        persistent = []
+        for key in ("ffmpeg_changed_hold", "capability_unknown_hold",
+                    "ffmpeg_missing_hold"):
+            reason = self.store.get_setting(key, "")
+            if reason:
+                persistent.append(reason)
+        if persistent:
+            self.add_global_pause_reasons(persistent)
         self._reconcile_review_windows()
         self._finish_intents()
         for job in self.store.list_jobs(include_done=False):
@@ -2612,6 +2735,7 @@ class Engine:
                     self.store.transition(job["id"], "PUBLISHED", expect_from="REVIEW",
                                           message="replace completed")
                     self._write_snapshot(job["id"])
+                self.store.complete_intent(intent["id"])
             except Exception:
                 log.exception("replace intent failed id=%s", intent["id"])
         for intent in self.store.pending_intents("restore"):
@@ -2649,7 +2773,7 @@ class Engine:
                     "kind": "replaced-library-item", "job_id": job_id, "path": str(dest),
                     "replaced_at": self.clock(),
                 })
-        self.store.complete_intent(intent["id"])
+        # The caller completes the intent only after the job state is committed.
 
     # ------------------------------------------------------------------
     # read-only previews and estimates
@@ -2751,7 +2875,8 @@ class Engine:
     # ------------------------------------------------------------------
     def process_commands(self) -> None:
         for cmd in self.store.pending_commands():
-            self.store.command_start(cmd["id"])
+            if not self.store.command_start(cmd["id"]):
+                continue  # another loop already claimed it
             try:
                 result = self.execute_command(cmd["command"], cmd["payload"])
                 self.store.command_done(cmd["id"])
@@ -3098,30 +3223,42 @@ class Engine:
             return _SimpleDecision(False, reasons + [f"guard-error: {exc}"])
 
     def _space_gate(self, job: dict) -> Any:
-        """Reserve the bytes a publish may copy, not the source's old size."""
+        """Apply the SAF-8 source reserve plus any publish copy fallback.
 
-        reserve = 0
+        Publishing stages with a hard link where possible, so no extra space
+        is normally needed.  On filesystems without hard-link support it copies
+        the output, so those bytes are reserved additively on top of the
+        normative ``max(1.2 * source_size, min_free_gb)`` admission envelope.
+        """
+
+        copy_reserve = 0
         try:
-            reserve = int(job.get("output_size") or 0)
+            copy_reserve = int(job.get("output_size") or 0)
         except (TypeError, ValueError):
-            reserve = 0
-        if reserve <= 0:
+            copy_reserve = 0
+        if copy_reserve <= 0:
             plan = job.get("plan") or {}
             try:
                 output = Path(plan.get("working_output") or "")
                 if output.is_file() and not output.is_symlink():
-                    reserve = output.stat().st_size
+                    copy_reserve = output.stat().st_size
             except OSError:
-                reserve = 0
+                copy_reserve = 0
+        try:
+            source_size = int(job.get("source_size") or 0)
+        except (TypeError, ValueError):
+            source_size = 0
         try:
             if self.guards is not None and hasattr(self.guards, "check_space"):
                 return self.guards.check_space(
-                    source_size=reserve,
+                    source_size=source_size,
+                    additional_required_bytes=copy_reserve,
                     db_path=Path(_cfg(self.cfg, "db_path", "/var/lib/mediaflow/state.db")),
                 )[1]
             from .guards import check_space
             return check_space(
-                self._guard_cfg(), source_size=reserve,
+                self._guard_cfg(), source_size=source_size,
+                additional_required_bytes=copy_reserve,
                 db_path=Path(_cfg(self.cfg, "db_path", "/var/lib/mediaflow/state.db")),
             )[1]
         except Exception:
@@ -3229,10 +3366,9 @@ class Engine:
             return path.stat().st_size
 
     def _capabilities(self) -> dict:
-        try:
-            return json.loads(self.capabilities_path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+        from .doctor import read_capabilities
+
+        return read_capabilities(self.capabilities_path)
 
     def _choose_backend(self, preset: Mapping) -> str:
         order = ((preset.get("video") or {}).get("backend_order") or ["qsv", "vaapi"])
@@ -3431,6 +3567,12 @@ class Engine:
             "free_bytes": free,
             "trash_bytes": trash_size, "last_success": last_success, "updated_at": self.clock(),
             "dry_run": self.dry_run,
+            "config_generation": int(getattr(self.cfg, "generation", 1) or 1),
+            "pending_config_generation": (
+                int(getattr(self.pending_config, "generation", 0) or 0)
+                if self.pending_config is not None else None
+            ),
+            "restart_required": sorted(self._restart_required),
         }
         atomic_write_json(self.status_path, payload)
         return payload
@@ -3475,6 +3617,16 @@ class Engine:
         if isinstance(preset, Mapping):
             return preset
         return getattr(preset, "raw", getattr(preset, "data", {}))
+
+    def _preset_fingerprint(self, preset: Any) -> str:
+        """Stable identity for the preset values that define a plan."""
+
+        raw = self._preset_raw(preset)
+        encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+    def _preset_available(self, preset_id: str) -> bool:
+        return self._preset_enabled(self._preset(preset_id))
 
     def _preset_enabled(self, preset: Any) -> bool:
         if preset is None:
