@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 import mediaflow.verify as verify_mod
 from mediaflow.ffmpeg import FFMPEG, FFPROBE
+from mediaflow.supervision import OperationState
 from mediaflow.verify import VideoVerifyResult, verify_output, video_packet_bytes
 
 
@@ -672,22 +674,20 @@ def test_saf2_decode_cannot_be_disabled() -> None:
     assert "verify_level" not in inspect.signature(verify_output).parameters
 
 
-def test_decode_check_covers_video_and_all_audio(monkeypatch, tmp_path: Path) -> None:
+def test_decode_check_covers_video_and_all_audio(tmp_path: Path) -> None:
     """SAF-2: a corrupt audio stream is caught by the full decode too."""
-    calls: list[list[str]] = []
-
-    class Ok:
-        returncode = 0
-        stderr = ""
-
-    def fake_run(argv, timeout):
-        calls.append(list(argv))
-        return Ok()
-
-    monkeypatch.setattr(verify_mod, "_run", fake_run)
-    ok, message = verify_mod._decode_check(tmp_path / "out.mp4", "/bin/ffmpeg", None)
+    args_file = tmp_path / "ffmpeg-args.txt"
+    fake_ffmpeg = _write_script(
+        tmp_path / "fake-ffmpeg",
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(args_file)!r}).write_text('\\n'.join(sys.argv[1:]))\n",
+    )
+    ok, message = verify_mod._decode_check(
+        tmp_path / "out.mp4", str(fake_ffmpeg), None
+    )
     assert ok, message
-    maps = [calls[0][i + 1] for i, token in enumerate(calls[0]) if token == "-map"]
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    maps = [args[i + 1] for i, token in enumerate(args) if token == "-map"]
     assert maps == ["0:v:0", "0:a?"]
 
 
@@ -709,6 +709,143 @@ def test_decode_failure_fails(media: dict, tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
+def test_packet_scan_aggregates_reordered_packets_incrementally(
+    tmp_path: Path,
+) -> None:
+    """SUP-1: packet order is not presentation order and memory is bounded."""
+    fake_ffprobe = _write_script(
+        tmp_path / "fake-ffprobe",
+        "print('0.000000,0.500000,100')\n"
+        "print('5.000000,0.500000,200')\n"
+        "print('1.000000,0.500000,300')\n",
+    )
+    events: list[dict] = []
+    outcome = verify_mod._scan_video_packets(
+        tmp_path / "out.mp4",
+        str(fake_ffprobe),
+        10,
+        progress_cb=events.append,
+    )
+    assert outcome.state is OperationState.SUCCEEDED
+    summary = outcome.value
+    assert summary.packet_count == 3
+    assert summary.video_bytes == 600
+    assert summary.presentation_end == pytest.approx(5.5)
+    assert events[-1]["phase"] == "packet-scan"
+    assert events[-1]["packet_count"] == 3
+
+
+@pytest.mark.integration
+def test_packet_scan_is_cancellable(tmp_path: Path) -> None:
+    """SUP-1: a noisy packet scan stops promptly when cancellation wins."""
+    fake_ffprobe = _write_script(
+        tmp_path / "fake-ffprobe",
+        "import time\n"
+        "for i in range(100000):\n"
+        "    print(f'{i / 100.0:.6f},0.010000,1', flush=True)\n"
+        "time.sleep(30)\n",
+    )
+    cancel = threading.Event()
+    events: list[dict] = []
+
+    def progress(event: dict) -> None:
+        events.append(event)
+        cancel.set()
+
+    outcome = verify_mod._scan_video_packets(
+        tmp_path / "out.mp4",
+        str(fake_ffprobe),
+        30,
+        cancel_event=cancel,
+        progress_cb=progress,
+    )
+    assert outcome.state is OperationState.CANCELLED
+    assert events
+    assert outcome.value is None
+
+
+def test_hash_is_cancellable_and_never_returns_a_partial_digest(
+    tmp_path: Path,
+) -> None:
+    """SUP-2: cancellation suppresses a late hash result."""
+    output = tmp_path / "out.bin"
+    output.write_bytes(b"x" * (3 * 1024 * 1024))
+    cancel = threading.Event()
+
+    def progress(event: dict) -> None:
+        if event.get("bytes", 0) >= verify_mod.HASH_CHUNK_SIZE:
+            cancel.set()
+
+    with pytest.raises(verify_mod.VerificationOperationError) as raised:
+        verify_mod._sha256_file(
+            output,
+            progress,
+            cancel_event=cancel,
+        )
+    assert raised.value.state is OperationState.CANCELLED
+    assert raised.value.phase == "hashing"
+
+
+@pytest.mark.integration
+def test_decode_timeout_is_typed_and_not_successful(tmp_path: Path) -> None:
+    """SUP-3: an overall decode timeout is distinct from a content failure."""
+    fake_ffmpeg = _write_script(
+        tmp_path / "fake-ffmpeg",
+        "import time\ntime.sleep(30)\n",
+    )
+    with pytest.raises(verify_mod.VerificationOperationError) as raised:
+        verify_mod._decode_check(tmp_path / "out.mp4", str(fake_ffmpeg), 0.2)
+    assert raised.value.state is OperationState.TIMED_OUT
+    assert raised.value.timeout_type == "overall"
+    assert raised.value.phase == "decode"
+
+
+@pytest.mark.integration
+def test_decode_protection_interruption_is_not_success(tmp_path: Path) -> None:
+    """SUP-3: protection interruption has a typed non-success outcome."""
+    fake_ffmpeg = _write_script(
+        tmp_path / "fake-ffmpeg",
+        "import time\ntime.sleep(30)\n",
+    )
+
+    def monitor():
+        return verify_mod.ProtectionDecision(
+            verify_mod.ProtectionAction.TERMINATE,
+            ("thermal",),
+            detail="too hot",
+        )
+
+    with pytest.raises(verify_mod.VerificationOperationError) as raised:
+        verify_mod._decode_check(
+            tmp_path / "out.mp4",
+            str(fake_ffmpeg),
+            30,
+            monitor=monitor,
+        )
+    assert raised.value.state is OperationState.INTERRUPTED
+    assert raised.value.reasons == ("thermal",)
+
+
+@pytest.mark.integration
+def test_frame_scan_count_is_distinct_from_packet_count(tmp_path: Path) -> None:
+    """SUP-1: decoded frames and container packets are separate measures."""
+    fake_ffprobe = _write_script(
+        tmp_path / "fake-ffprobe",
+        "print('0.000000,0.040000')\n"
+        "print('0.040000,0.040000')\n"
+        "print('0.080000,0.040000')\n",
+    )
+    outcome = verify_mod._scan_decoded_frames(
+        tmp_path / "out.mp4", str(fake_ffprobe), 10
+    )
+    assert outcome.state is OperationState.SUCCEEDED
+    summary = outcome.value
+    assert summary.frame_count == 3
+    assert summary.presentation_end == pytest.approx(0.12)
+    assert not hasattr(summary, "packet_count")
+
+
+@pytest.mark.integration
 def test_last_video_packet_must_match_container_duration(
     media: dict, monkeypatch
 ) -> None:
@@ -722,14 +859,20 @@ def test_last_video_packet_must_match_container_duration(
     )
     monkeypatch.setattr(
         verify_mod,
-        "_probe_video_packets",
-        lambda *args, **kwargs: [
-            {"pts_time": "0.0", "duration_time": "0.04", "size": "100"}
-        ],
+        "_scan_video_packets",
+        lambda *args, **kwargs: verify_mod._OperationOutcome(
+            state=OperationState.SUCCEEDED,
+            value=verify_mod.PacketScanSummary(
+                packet_count=1,
+                video_bytes=100,
+                presentation_end=0.04,
+            ),
+            phase="packet-scan",
+        ),
     )
     result = verify_output(plan, media["long"], min_output_kbps=1)
     assert not result.ok
-    assert any("last video packet" in failure for failure in result.failures)
+    assert any("video presentation tail" in failure for failure in result.failures)
 
 
 @pytest.mark.integration
@@ -738,14 +881,14 @@ def test_every_shellout_carries_protocol_whitelist_and_uses_argv(
 ) -> None:
     """SAF-13: ffprobe/ffmpeg subprocesses always include the whitelist."""
     commands: list[list[str]] = []
-    original_run = verify_mod.subprocess.run
+    original_run = verify_mod.run_process
 
     def capture(argv, *args, **kwargs):
         assert isinstance(argv, list)
         commands.append(list(argv))
         return original_run(argv, *args, **kwargs)
 
-    monkeypatch.setattr(verify_mod.subprocess, "run", capture)
+    monkeypatch.setattr(verify_mod, "run_process", capture)
     plan = _plan(
         media["source"],
         action="remux",
@@ -1096,8 +1239,8 @@ def test_bpp_is_not_evaluated_when_the_frame_count_is_unknown(
     """SAF-2: an unavailable frame count is surfaced, never silently skipped."""
     original = verify_mod._probe_json
 
-    def without_frame_count(path, ffprobe, timeout):
-        data = original(path, ffprobe, timeout)
+    def without_frame_count(path, ffprobe, timeout, **kwargs):
+        data = original(path, ffprobe, timeout, **kwargs)
         for stream in data.get("streams", []):
             if stream.get("codec_type") == "video":
                 stream.pop("nb_frames", None)

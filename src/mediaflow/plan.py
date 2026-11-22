@@ -2332,9 +2332,20 @@ def build_plan(
         estimate = float(estimated_seconds)
     elif factor > 0:
         estimate = duration / factor
+    elif action == "remux" and duration > 0:
+        # A stream copy has no encode-backend speed row.  Until it is
+        # measured separately, use a conservative one-times-media-time copy
+        # estimate so a scheduled remux is not mistaken for an encode with a
+        # missing table entry.
+        estimate = duration
     else:
         estimate = None
-    speed_source = "table" if factor > 0 else "missing"
+    if factor > 0:
+        speed_source = "table"
+    elif action == "remux" and estimate is not None:
+        speed_source = "copy-estimate"
+    else:
+        speed_source = "missing"
 
     if fallback_from is None and plan_version > 1 and action == "remux":
         fallback_from = "encode"

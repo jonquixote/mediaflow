@@ -3,6 +3,42 @@
 All notable changes to mediaflow. This project is pre-release until John
 completes the on-hardware checklist in `docs/RUNBOOK.md`.
 
+## [Unreleased]
+
+### Added
+
+- One shared supervision boundary for encode, verify, calibration trials,
+  capability probes and ffmpeg-change retests, with typed outcomes,
+  real-progress liveness, bounded startup/finalization allowances and one
+  exclusive expensive-operation slot.
+- Bounded, cancellable verification scans that aggregate packet and frame
+  records incrementally and use the maximum packet `pts + duration` as the
+  presentation tail.
+- Regressions for shutdown/cancellation precedence, controlled recovery,
+  non-cooperative worker ownership, capability unknowns, protection deferral,
+  net remaining-work space accounting and the canonical backend/speed key.
+
+### Changed
+
+- Mid-encode free-space checks reserve net remaining work plus an additive
+  emergency low-water allowance; published outputs reserve the copy size.
+- Calibration and capability probes hold the processing slot from their first
+  probe through cleanup and report incomplete results as unknown, never as a
+  false `False`.
+- Existing encoder, verifier, probe and guard call shapes remain compatible;
+  new supervision controls are passed only when accepted.
+
+### Fixed
+
+- Cancellation or shutdown now wins over a late successful result, and a
+  daemon shutdown is no longer relabelled as a user cancellation.
+- A controlled protection/shutdown encode interruption recovers at `PLANNED`
+  without consuming a restart; stalls and timeouts still do.
+- Verification interruptions, deferrals and shutdowns can no longer advance a
+  job to `VERIFIED`.
+- Remuxes use an explicit copy estimate instead of borrowing an encode
+  backend's speed-table row.
+
 ## [1.0.0] - 2026-11-18
 
 ### Added

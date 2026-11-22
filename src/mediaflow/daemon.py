@@ -113,11 +113,12 @@ class Daemon:
 
     def stop(self) -> None:
         self._stop.set()
+        self.engine.request_shutdown()
 
     def _install_signals(self) -> None:
         def handler(signum, frame):
             log.info("signal %s received", signum)
-            self._stop.set()
+            self.stop()
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -157,14 +158,27 @@ class Daemon:
             self.engine.cfg = new
             self.engine.dry_run = bool(getattr(new, "dry_run", True))
             self.engine.presets = dict(presets)
-            self.engine._pause_reasons = []
+            self.engine._pause_reasons = [
+                reason for reason in self.engine._pause_reasons
+                if not reason.startswith("config-invalid:")
+            ]
             self.store.event(None, "config-reload", "loaded")
             if old_dry != self.engine.dry_run:
                 self.store.event(None, "dry-run", f"changed to {self.engine.dry_run}")
             log.info("configuration reloaded")
         except Exception as exc:
             log.warning("config reload rejected; previous good config remains: %s", exc)
-            self.engine._pause_reasons = [f"config-invalid: {exc}"]
+            reason = f"config-invalid: {exc}"
+            self.engine.clear_global_pause_reasons("config-invalid:")
+            self.engine.add_global_pause_reasons([reason])
+            # Keep the legacy per-engine signal visible as well.  The global
+            # hold is authoritative and prevents unrelated work from erasing
+            # the invalid-config condition; this mirror preserves the public
+            # status behaviour of older releases.
+            self.engine._pause_reasons = sorted({
+                *self.engine._pause_reasons,
+                reason,
+            })
 
     def _check_ffmpeg(self) -> None:
         """Detect an unattended jellyfin-ffmpeg upgrade (SAF-12)."""
@@ -173,7 +187,8 @@ class Daemon:
             out = subprocess.run([ffmpeg, "-version"], capture_output=True, text=True, timeout=20)
             version = out.stdout.splitlines()[0] if out.stdout else "unknown"
         except Exception as exc:
-            self.engine._pause_reasons = ["ffmpeg-missing"]
+            self.engine.clear_global_pause_reasons("ffmpeg-")
+            self.engine.add_global_pause_reasons(["ffmpeg-missing"])
             log.warning("ffmpeg check failed: %s", exc)
             return
         cap_path = Path(getattr(self.config, "capabilities_path", "/var/lib/mediaflow/capabilities.json"))
@@ -185,23 +200,52 @@ class Daemon:
         if prior and prior != version:
             log.warning("ffmpeg version changed; queue paused pending capability tests")
             self.store.event(None, "ffmpeg-changed", "version mismatch")
-            self.engine._pause_reasons = ["ffmpeg-changed"]
+            self.engine.clear_global_pause_reasons("ffmpeg-changed")
+            self.engine.add_global_pause_reasons(["ffmpeg-changed"])
             try:
                 from .doctor import run_capability_tests
-                results = run_capability_tests(self.config)
-                if results.get("ok"):
+                # The daemon's stop event is the caller-owned cancellation for
+                # the retest.  Capability probes still own their own timeouts,
+                # AC/thermal monitor and exclusive slot.
+                results = run_capability_tests(
+                    self.config, cancel_event=self._stop
+                )
+                capability_status = str(results.get("status") or "ok")
+                if capability_status not in {"ok", "completed"}:
+                    reason = (
+                        f"ffmpeg-changed: capability tests {capability_status}"
+                    )
+                    self.engine.clear_global_pause_reasons("ffmpeg-changed")
+                    self.engine.add_global_pause_reasons([reason])
+                    self.store.event(
+                        None,
+                        "ffmpeg-changed",
+                        f"{reason}; reasons={','.join(results.get('reasons') or [])}",
+                    )
+                elif (
+                    (results.get("completed")
+                     if "completed" in results
+                     else str(results.get("status") or "") in {"ok", "completed"})
+                    and ("libvmaf" not in results or results.get("libvmaf") is not None)
+                ):
                     caps.update(results)
                     caps["ffmpeg_version"] = version
                     tmp = cap_path.with_suffix(".tmp")
                     tmp.write_text(json.dumps(caps, indent=2), encoding="utf-8")
                     os.replace(tmp, cap_path)
-                    self.engine._pause_reasons = []
+                    self.engine.clear_global_pause_reasons("ffmpeg-changed")
                     self.store.event(None, "ffmpeg-changed", "capability tests passed")
                 else:
-                    self.engine._pause_reasons = ["ffmpeg-changed: capability tests failed"]
+                    self.engine.clear_global_pause_reasons("ffmpeg-changed")
+                    self.engine.add_global_pause_reasons([
+                        "ffmpeg-changed: capability tests failed"
+                    ])
             except Exception as exc:
                 log.warning("capability tests unavailable: %s", exc)
-                self.engine._pause_reasons = ["ffmpeg-changed: capability tests failed"]
+                self.engine.clear_global_pause_reasons("ffmpeg-changed")
+                self.engine.add_global_pause_reasons([
+                    "ffmpeg-changed: capability tests failed"
+                ])
             return
         if not prior:
             caps["ffmpeg_version"] = version

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,14 @@ from mediaflow.calibrate import calibrate, format_calibration
 from mediaflow.ffmpeg import FFMPEG, FFPROBE, build_command
 from mediaflow.plan import ProbeResult
 from mediaflow.presets import Audio, Meta, Preset, Schedule, Skip, Subtitles, Video
+from mediaflow.supervision import (
+    OperationState,
+    ProtectionAction,
+    ProtectionDecision,
+    SlotBusy,
+    processing_slot,
+    slot_path,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -42,6 +52,11 @@ class _Config:
         self.trash = self.root / "_pipeline" / "trash"
         self.capabilities_path = self.state_dir / "capabilities.json"
         self.dry_run = False
+        # The synthetic sandbox has no meaningful AC/sensor contract.  Keep
+        # the calibration test deterministic; production's default remains
+        # fail-closed for unknown AC state.
+        self.pause_on_battery = False
+        self.temp_sensor = "none"
         self.min_output_kbps = 300
         self.min_bpp = 0.01
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -272,12 +287,20 @@ def test_a_4k_source_is_measured_at_the_planned_geometry(
     monkeypatch.setattr(calibrate_mod, "probe_media", lambda *a, **k: _probe_4k(source))
     config = _Config(tmp_path, capabilities={})
     preset = _preset(allow_software=True, max_width=1920, max_height=1080)
+    store = _Store()
 
-    result = _run(source, config, seconds=1, preset=preset)
+    result = _run(source, config, seconds=1, preset=preset, store=store)
 
     assert result["status"] == "ok", result.get("reason")
     assert result["source_geometry"] == {"width": 3840, "height": 2160}
     assert result["target_geometry"] == {"width": 1920, "height": 1080}
+    assert len(store.seeds) == 1
+    seeded_preset, seeded_backend, seeded_height, seeded_factor = store.seeds[0]
+    assert seeded_preset == "test-encode"
+    assert seeded_backend == "software"
+    assert seeded_height == 1080
+    assert seeded_factor > 0
+    assert result["seeded"]["height"] == 1080
     command = result["rows"][0]["command"]
     vf = command[command.index("-vf") + 1]
     assert "scale=1920:1080" in vf
@@ -544,3 +567,139 @@ def test_the_result_reports_what_it_measured(tmp_path: Path, source: Path) -> No
     text = format_calibration(result)
     assert "video-encode-only" in text
     assert "balanced" in text
+
+
+# ---------------------------------------------------------------------------
+# bounded expensive-operation supervision
+# ---------------------------------------------------------------------------
+
+
+def test_machine_protection_defers_before_a_source_probe(
+    tmp_path: Path, source: Path, monkeypatch
+) -> None:
+    """SUP-2/SAF-14: protection defers calibration instead of probing."""
+
+    def unexpected_probe(*args, **kwargs):
+        raise AssertionError("the source was probed despite protection deferral")
+
+    monkeypatch.setattr(calibrate_mod, "probe_media", unexpected_probe)
+    cancel = threading.Event()
+    pause = threading.Event()
+    monitor = lambda: ProtectionDecision(
+        ProtectionAction.DEFER,
+        ("on-battery",),
+        detail="machine protection deferred calibration",
+    )
+
+    result = _run(
+        source,
+        _Config(tmp_path),
+        seconds=1,
+        preset=_preset(allow_software=True),
+        cancel_event=cancel,
+        pause_event=pause,
+        monitor=monitor,
+    )
+
+    assert result["status"] == "deferred"
+    assert result["state"] == OperationState.DEFERRED.value
+    assert result["deferred"] is True
+    assert result["reasons"] == ["on-battery"]
+    assert result["rows"] == []
+    assert result["seeded"] is None
+    assert not cancel.is_set(), "calibration must not mutate caller cancellation"
+    assert not pause.is_set(), "calibration must not mutate caller pause state"
+
+
+def test_a_busy_processing_slot_defers_without_probing(
+    tmp_path: Path, source: Path, monkeypatch
+) -> None:
+    """SUP-2/SAF-14: a busy operation slot prevents every calibration probe."""
+
+    def unexpected_probe(*args, **kwargs):
+        raise AssertionError("calibration probed while the operation slot was busy")
+
+    monkeypatch.setattr(calibrate_mod, "probe_media", unexpected_probe)
+    config = _Config(tmp_path)
+
+    with processing_slot(slot_path(config), timeout=0):
+        result = _run(
+            source,
+            config,
+            seconds=1,
+            preset=_preset(allow_software=True),
+        )
+
+    assert result["status"] == "deferred"
+    assert result["state"] == OperationState.DEFERRED.value
+    assert result["reasons"] == ["processing-slot-busy"]
+    assert result["rows"] == []
+
+
+def test_calibration_holds_the_slot_through_every_expensive_phase(
+    tmp_path: Path, source: Path, monkeypatch
+) -> None:
+    """SUP-2/SAF-14: probe, filters, trials and cleanup share one slot."""
+
+    active = {"value": False}
+    phases: list[str] = []
+
+    @contextmanager
+    def tracked_slot(path, **_kwargs):
+        active["value"] = True
+        try:
+            yield path
+        finally:
+            active["value"] = False
+
+    def require_slot(phase: str) -> None:
+        assert active["value"], f"{phase} ran outside the processing slot"
+        phases.append(phase)
+
+    def fake_probe(*args, **kwargs):
+        require_slot("probe")
+        return _probe_4k(source)
+
+    def fake_filter(*args, **kwargs):
+        require_slot("filter")
+        return True
+
+    def fake_frames(*args, **kwargs):
+        require_slot("frame-count")
+        return None
+
+    def fake_trial(**kwargs):
+        require_slot("trial")
+        return {
+            "quality": int(kwargs["quality"]),
+            "size_bytes": 1024,
+            "encode_seconds": 1.0,
+            "speed_factor": 1.0,
+            "score": None,
+            "metric": "n/a",
+            "frames": None,
+            "valid": True,
+            "reason": None,
+            "command": ["stub"],
+        }
+
+    def fake_cleanup(_config, _path):
+        require_slot("cleanup")
+
+    monkeypatch.setattr(calibrate_mod, "processing_slot", tracked_slot)
+    monkeypatch.setattr(calibrate_mod, "probe_media", fake_probe)
+    monkeypatch.setattr(calibrate_mod, "_has_filter", fake_filter)
+    monkeypatch.setattr(calibrate_mod, "_expected_frames", fake_frames)
+    monkeypatch.setattr(calibrate_mod, "_run_trial", fake_trial)
+    monkeypatch.setattr(calibrate_mod, "_remove_scratch", fake_cleanup)
+
+    result = _run(
+        source,
+        _Config(tmp_path),
+        seconds=1,
+        preset=_preset(allow_software=True),
+    )
+
+    assert result["status"] == "ok", result.get("reason")
+    assert phases == ["probe", "filter", "frame-count", "trial", "cleanup"]
+    assert active["value"] is False

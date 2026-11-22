@@ -28,6 +28,7 @@ from mediaflow.guards import (
     discover_temp_sensor,
     estimate_fits,
     jellyfin_transcoding,
+    MachineProtectionMonitor,
     mid_encode_gate,
     read_ac_state,
     read_package_temp,
@@ -255,6 +256,34 @@ def test_mid_encode_uses_half_the_minimum_reserve(cfg: GuardConfig):
     assert before.reasons == ("space-low",)
     assert mid_status.required_bytes == 20 * GIB
     assert mid.ok is True
+
+
+def test_net_remaining_work_is_additive_to_the_emergency_reserve(
+    cfg: GuardConfig,
+):
+    """The in-flight reserve is net work plus emergency low-water."""
+
+    disk = FakeDisk(
+        free=100 * GIB,
+        overrides={cfg.pipeline: 25 * GIB},
+    )
+    status, decision = check_space(
+        cfg,
+        source_size=100 * GIB,
+        remaining_work=5 * GIB,
+        output_consumed=9 * GIB,
+        mid_encode=True,
+        disk_usage=disk,
+    )
+
+    # 5 GiB of net remaining work + 20 GiB emergency reserve.  The source
+    # size is not used for an in-flight reservation and consumed bytes are
+    # not subtracted from the already-net remaining value a second time.
+    assert status.required_bytes == 25 * GIB
+    assert status.remaining_work_bytes == 5 * GIB
+    assert status.output_consumed_bytes == 9 * GIB
+    assert status.emergency_required_bytes == 20 * GIB
+    assert decision.ok is True
 
 
 def test_root_and_db_filesystems_are_checked(cfg: GuardConfig):
@@ -757,3 +786,23 @@ def test_mid_encode_gate_passes_and_ignores_start_only_gates(cfg: GuardConfig):
 def test_mid_encode_gate_fails_closed_without_ac(cfg: GuardConfig):
     decision = mid_encode_gate(cfg, source_size=0, disk_usage=FakeDisk())
     assert decision.reasons == ("no-ac-source",)
+
+
+def test_machine_protection_monitor_honours_the_thermal_sustain_delay(cfg: GuardConfig):
+    """SUP-3: a high reading alone does not pause before the sustain period."""
+
+    add_hwmon(cfg, 0, "coretemp", {1: 85000}, {1: "Package id 0"})
+    cfg.temp_sensor = "auto"
+    set_ac(cfg, 1)
+    now = [100.0]
+    monitor = MachineProtectionMonitor(cfg, clock=lambda: now[0])
+
+    assert monitor().action == guards.ProtectionAction.CONTINUE
+
+    now[0] += 59.0
+    assert monitor().action == guards.ProtectionAction.CONTINUE
+
+    now[0] += 2.0
+    decision = monitor()
+    assert decision.action == guards.ProtectionAction.PAUSE
+    assert decision.reasons == ("thermal",)

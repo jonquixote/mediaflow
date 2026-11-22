@@ -25,6 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from .supervision import (
+    OperationState,
+    ProgressCallback as SupervisionProgressCallback,
+    ProtectionDecision,
+    SupervisionPolicy,
+    run_process,
+)
+
 log = logging.getLogger(__name__)
 
 FFMPEG = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
@@ -596,10 +604,26 @@ class EncodeResult:
     log_path: Path | None = None
     cancelled: bool = False
     timed_out: bool = False
+    state: OperationState = OperationState.SUCCEEDED
+    interrupted: bool = False
+    deferred: bool = False
+    stalled: bool = False
+    reasons: tuple[str, ...] = ()
+    timeout_type: str | None = None
+    #: Set by the shared callable supervisor when a legacy worker may still be
+    #: running after its typed terminal outcome.  Resource owners keep their
+    #: lock until this event fires.
+    worker_done: threading.Event | None = None
+    error: BaseException | None = None
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0 and not self.cancelled and not self.timed_out
+        return (
+            self.returncode == 0
+            and not self.cancelled
+            and not self.timed_out
+            and self.state is OperationState.SUCCEEDED
+        )
 
     @property
     def success(self) -> bool:
@@ -824,6 +848,9 @@ class FfmpegEncoder:
         log_path: Path | str | None = None,
         output_path: Path | str | None = None,
         stderr_limit: int = DEFAULT_STDERR_LIMIT,
+        supervision_policy: SupervisionPolicy | None = None,
+        monitor: Callable[[], ProtectionDecision] | None = None,
+        stall_timeout: float | None = None,
     ):
         self.ffmpeg = str(ffmpeg)
         if output is None:
@@ -836,6 +863,9 @@ class FfmpegEncoder:
             stderr_log = log_path
         self.stderr_log = Path(stderr_log) if stderr_log is not None else None
         self.stderr_limit = max(1, int(stderr_limit))
+        self.supervision_policy = supervision_policy
+        self.monitor = monitor
+        self.stall_timeout = stall_timeout
 
     def encode(
         self,
@@ -851,6 +881,8 @@ class FfmpegEncoder:
         software: bool | None = None,
         sample: SampleSpec | None = None,
         video_only: bool = False,
+        monitor: Callable[[], ProtectionDecision] | None = None,
+        supervision_policy: SupervisionPolicy | None = None,
     ) -> EncodeResult:
         """Run ffmpeg for ``plan`` and return an :class:`EncodeResult`.
 
@@ -899,18 +931,8 @@ class FfmpegEncoder:
             raise PlanError(f"cannot create fresh partial output: {exc}") from None
         duration = _plan_duration(plan)
         started = time.monotonic()
-        process_env = dict(os.environ)
-        if env:
-            process_env.update({str(k): str(v) for k, v in env.items()})
-
-        stderr_handle = tempfile.TemporaryFile()
-        cancelled = False
-        timed_out = False
-        returncode = -1
         progress_state: dict[str, Any] = {}
         last_progress: dict[str, Any] = {}
-        proc: subprocess.Popen | None = None
-        paused = False
 
         def notify(event: dict[str, Any]) -> None:
             if progress_cb is not None:
@@ -920,129 +942,55 @@ class FfmpegEncoder:
                 "out_time_seconds": 0.0, "speed": None, "eta": None,
                 "eta_seconds": None, "elapsed": 0.0})
 
-        try:
-            proc = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=stderr_handle,
-                env=process_env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                close_fds=True,
-            )
-            assert proc.stdout is not None
-            lines: queue.Queue[str | None] = queue.Queue()
+        def parse_progress(line: str, _state: dict[str, str]) -> Mapping[str, Any] | None:
+            if not _parse_progress_line(line, progress_state):
+                return None
+            event = _progress_event(progress_state, duration, time.monotonic() - started)
+            last_progress.update(event)
+            return event
 
-            def read_progress() -> None:
-                try:
-                    for line in proc.stdout:  # type: ignore[union-attr]
-                        lines.put(line)
-                except (OSError, ValueError):
-                    pass
-                finally:
-                    lines.put(None)
-
-            threading.Thread(
-                target=read_progress, name="ffmpeg-progress", daemon=True
-            ).start()
-
-            while True:
-                if pause_event is not None and proc.poll() is None:
-                    try:
-                        should_pause = bool(pause_event.is_set())
-                    except Exception:
-                        should_pause = False
-                    if should_pause and not paused:
-                        try:
-                            os.kill(proc.pid, signal.SIGSTOP)
-                            paused = True
-                            notify({"phase": "encoding", "paused": True,
-                                    "out_time_seconds": last_progress.get("out_time_seconds"),
-                                    "percent": last_progress.get("percent")})
-                        except OSError:
-                            paused = False
-                    elif not should_pause and paused:
-                        try:
-                            os.kill(proc.pid, signal.SIGCONT)
-                            paused = False
-                            notify({"phase": "encoding", "paused": False,
-                                    "out_time_seconds": last_progress.get("out_time_seconds"),
-                                    "percent": last_progress.get("percent"),
-                                    "resumed": True})
-                        except OSError:
-                            paused = False
-                if cancel_event is not None and cancel_event.is_set():
-                    cancelled = True
-                    if paused:
-                        try:
-                            os.kill(proc.pid, signal.SIGCONT)
-                        except OSError:
-                            pass
-                        paused = False
-                    _terminate(proc)
-                    break
-                if (
-                    effective_timeout is not None
-                    and time.monotonic() - started > effective_timeout
-                ):
-                    timed_out = True
-                    _terminate(proc)
-                    break
-                try:
-                    line = lines.get(timeout=0.2)
-                except queue.Empty:
-                    if proc.poll() is not None:
-                        break
-                    continue
-                if line is None:
-                    break
-                if _parse_progress_line(line, progress_state):
-                    event = _progress_event(
-                        progress_state, duration, time.monotonic() - started
-                    )
-                    last_progress = event
-                    notify(event)
-
-            # Drain any progress lines already queued after the child exits.
-            while True:
-                try:
-                    line = lines.get_nowait()
-                except queue.Empty:
-                    break
-                if line is None:
-                    break
-                if _parse_progress_line(line, progress_state):
-                    event = _progress_event(
-                        progress_state, duration, time.monotonic() - started
-                    )
-                    last_progress = event
-                    notify(event)
-            returncode = proc.wait()
-            if progress_state and not last_progress and proc.returncode == 0:
-                last_progress = _progress_event(
-                    progress_state, duration, time.monotonic() - started
-                )
-                notify(last_progress)
-        except FileNotFoundError as exc:
-            returncode = 127
-            stderr_handle.write(f"ffmpeg executable not found: {exc}\n".encode())
-        except Exception as exc:  # launch or selector failure
-            if proc is not None and proc.poll() is None:
-                _terminate(proc)
-            returncode = 126
-            stderr_handle.write(f"failed to run ffmpeg: {exc}\n".encode())
-        finally:
-            if paused and proc is not None and proc.poll() is None:
-                try:
-                    os.kill(proc.pid, signal.SIGCONT)
-                except OSError:
-                    pass
-            elapsed = time.monotonic() - started
-            stderr_text = _bounded_stderr(stderr_handle, self.stderr_limit)
-            stderr_handle.close()
+        base_policy = supervision_policy or self.supervision_policy or SupervisionPolicy()
+        # The public encoder timeout is an overall wall-clock limit.  A
+        # caller-supplied stall timeout is independent and is deliberately not
+        # inferred from the reported ffmpeg speed.
+        policy = SupervisionPolicy(
+            stall_timeout=(self.stall_timeout if self.stall_timeout is not None
+                           else base_policy.stall_timeout),
+            startup_grace=base_policy.startup_grace,
+            finalization_grace=base_policy.finalization_grace,
+            overall_timeout=(effective_timeout if effective_timeout is not None
+                             else base_policy.overall_timeout),
+            monitor_interval=base_policy.monitor_interval,
+            terminate_grace=base_policy.terminate_grace,
+        )
+        effective_monitor = monitor if monitor is not None else self.monitor
+        process_result = run_process(
+            command,
+            policy=policy,
+            progress_parser=parse_progress,
+            progress_cb=notify,
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            monitor=effective_monitor,
+            env=env,
+            stderr_limit=self.stderr_limit,
+        )
+        returncode = process_result.returncode
+        elapsed = process_result.elapsed
+        stderr_text = process_result.stderr
+        operation_state = process_result.state
+        cancelled = operation_state is OperationState.CANCELLED
+        timed_out = operation_state is OperationState.TIMED_OUT
+        interrupted = operation_state is OperationState.INTERRUPTED
+        deferred = operation_state is OperationState.DEFERRED
+        stalled = operation_state is OperationState.STALLED
+        if process_result.reason and operation_state in {
+            OperationState.INTERRUPTED,
+            OperationState.DEFERRED,
+            OperationState.STALLED,
+            OperationState.TIMED_OUT,
+        }:
+            stderr_text = _append_note(stderr_text, process_result.reason)
 
         if cancelled:
             stderr_text = _append_note(stderr_text, "encode cancelled")
@@ -1050,6 +998,10 @@ class FfmpegEncoder:
             stderr_text = _append_note(
                 stderr_text, f"encode timed out after {effective_timeout}s"
             )
+        if interrupted:
+            stderr_text = _append_note(stderr_text, "encode interrupted by protection")
+        if deferred:
+            stderr_text = _append_note(stderr_text, "encode deferred by protection")
 
         log_file: Path | None = None
         if self.stderr_log is not None:
@@ -1061,7 +1013,15 @@ class FfmpegEncoder:
                 log.exception("could not write encoder stderr log: %s", self.stderr_log)
 
         output_size = 0
-        if returncode == 0 and not cancelled and not timed_out:
+        if (
+            returncode == 0
+            and operation_state is OperationState.SUCCEEDED
+            and not cancelled
+            and not timed_out
+            and not interrupted
+            and not deferred
+            and not stalled
+        ):
             problem = _publish_partial(partial, final)
             if problem is not None:
                 stderr_text = _append_note(stderr_text, problem)
@@ -1095,6 +1055,12 @@ class FfmpegEncoder:
             log_path=log_file,
             cancelled=cancelled,
             timed_out=timed_out,
+            state=operation_state,
+            interrupted=interrupted,
+            deferred=deferred,
+            stalled=stalled,
+            reasons=process_result.reasons,
+            timeout_type=process_result.timeout_type,
         )
         if not result.ok:
             log.warning(

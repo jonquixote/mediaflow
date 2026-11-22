@@ -7,12 +7,25 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .guards import MachineProtectionMonitor
 from .safety import SafetyError, check_one_filesystem
+from .supervision import (
+    OperationState,
+    ProcessResult,
+    ProtectionAction,
+    ProtectionDecision,
+    SlotBusy,
+    SupervisionPolicy,
+    processing_slot,
+    run_process,
+    slot_path,
+)
 
 FFMPEG_DEFAULT = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 FFPROBE_DEFAULT = "/usr/lib/jellyfin-ffmpeg/ffprobe"
@@ -48,19 +61,74 @@ class DoctorReport:
         }
 
 
+def _run_supervised(
+    argv: list[str],
+    timeout: float = 60.0,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+) -> ProcessResult:
+    """Run one command through the shared process owner."""
+
+    return run_process(
+        argv,
+        policy=SupervisionPolicy(
+            stall_timeout=None,
+            startup_grace=min(30.0, max(0.0, float(timeout))),
+            finalization_grace=min(30.0, max(0.0, float(timeout))),
+            overall_timeout=timeout if timeout and timeout > 0 else None,
+            monitor_interval=0.2,
+            terminate_grace=5.0,
+        ),
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+
+
 def _run(argv: list[str], timeout: float = 60.0) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    """Compatibility subprocess result backed by the shared process owner."""
+
+    process = _run_supervised(argv, timeout)
+    if process.state is OperationState.TIMED_OUT:
+        raise subprocess.TimeoutExpired(argv, timeout)
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        process.stdout,
+        process.stderr,
+    )
+
+
+def _ffmpeg_version_process(
+    ffmpeg: str,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+) -> tuple[ProcessResult, str | None, str | None]:
+    """Return the typed version probe and its parsed value/error."""
+
+    process = _run_supervised(
+        [ffmpeg, "-version"],
+        timeout=20,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+    if process.state is not OperationState.SUCCEEDED:
+        detail = (process.reason or process.stderr or "ffmpeg version did not complete")[-300:]
+        return process, None, detail
+    lines = (process.stdout or "").splitlines()
+    return process, (lines[0] if lines else "unknown"), None
 
 
 def _ffmpeg_version(ffmpeg: str) -> tuple[str | None, str | None]:
-    try:
-        proc = _run([ffmpeg, "-version"], timeout=20)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return None, str(exc)
-    if proc.returncode != 0:
-        return None, (proc.stderr or proc.stdout).strip()[:300]
-    lines = (proc.stdout or "").splitlines()
-    return (lines[0] if lines else "unknown"), None
+    process, version, error = _ffmpeg_version_process(ffmpeg)
+    if process.state is not OperationState.SUCCEEDED:
+        return None, error
+    return version, None
 
 
 def _rate_control(stderr: str) -> str:
@@ -74,8 +142,18 @@ def _rate_control(stderr: str) -> str:
     return "unknown"
 
 
-def _encode_probe(ffmpeg: str, backend: str, ten_bit: bool, output: Path,
-                  quality: int = 24, timeout: float = 90.0) -> dict:
+def _encode_probe(
+    ffmpeg: str,
+    backend: str,
+    ten_bit: bool,
+    output: Path,
+    quality: int = 24,
+    timeout: float = 90.0,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+) -> dict:
     common = [
         ffmpeg, "-hide_banner", "-nostdin", "-v", "debug",
         "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30:duration=3",
@@ -106,64 +184,381 @@ def _encode_probe(ffmpeg: str, backend: str, ten_bit: bool, output: Path,
         argv += ["-tag:v", "hvc1", "-f", "mp4", str(output)]
     else:
         raise ValueError(backend)
-    try:
-        proc = _run(argv, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": False, "hevc8": False, "hevc10": False,
-                "rate_control": "unknown", "error": str(exc)[:300]}
-    ok = proc.returncode == 0 and output.exists() and output.stat().st_size > 1000
+    process = run_process(
+        argv,
+        policy=SupervisionPolicy(
+            stall_timeout=None,
+            overall_timeout=timeout if timeout and timeout > 0 else None,
+            monitor_interval=0.2,
+            terminate_grace=5.0,
+        ),
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+    if process.state not in {OperationState.SUCCEEDED, OperationState.FAILED}:
+        return {
+            "available": None,
+            "hevc8": None,
+            "hevc10": None,
+            "rate_control": "unknown",
+            "error": (process.reason or process.stderr or "probe did not complete")[-500:],
+            "state": process.state.value,
+            "reasons": list(process.reasons),
+            "timeout_type": process.timeout_type,
+            "spawn_failed": False,
+            "incomplete": True,
+            "command": [a for a in argv if str(output) not in a][:4] + ["..."],
+        }
+    if process.state is OperationState.FAILED and process.spawn_failed:
+        return {
+            "available": None,
+            "hevc8": None,
+            "hevc10": None,
+            "rate_control": "unknown",
+            "error": (process.reason or process.stderr or "probe could not start")[-500:],
+            "state": process.state.value,
+            "reasons": list(process.reasons),
+            "timeout_type": process.timeout_type,
+            "spawn_failed": True,
+            "incomplete": True,
+            "command": [a for a in argv if str(output) not in a][:4] + ["..."],
+        }
+    ok = (
+        process.state is OperationState.SUCCEEDED
+        and output.exists()
+        and output.stat().st_size > 1000
+    )
     return {
         "available": ok,
         "hevc8": ok and not ten_bit,
         "hevc10": ok and ten_bit,
-        "rate_control": _rate_control(proc.stderr or ""),
-        "error": None if ok else (proc.stderr or "")[-500:],
+        "rate_control": _rate_control(process.stderr or ""),
+        "error": None if ok else (process.stderr or "")[-500:],
+        "state": process.state.value,
+        "reasons": list(process.reasons),
+        "timeout_type": process.timeout_type,
+        "spawn_failed": False,
+        "incomplete": False,
         "command": [a for a in argv if str(output) not in a][:4] + ["..."],
     }
 
 
-def run_capability_tests(config: Any, *, ffmpeg: str | None = None,
-                         backends: Iterable[str] = ("qsv", "vaapi", "software"),
-                         timeout: float = 90.0) -> dict:
-    """Run the 8-bit and 10-bit tests and return capabilities.json content.
-
-    The exact shipped-preset option set is represented by quality=24 and
-    look-ahead for QSV.  A 10-bit failure is a capability result, not a crash.
-    """
-    ffmpeg = ffmpeg or str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
-    version, version_error = _ffmpeg_version(ffmpeg)
-    results: dict[str, Any] = {
-        "ffmpeg_version": version, "version_error": version_error,
-        "tested_at": time.time(), "render_node": str(RENDER_NODE),
-        "backends": {},
-    }
-    with tempfile.TemporaryDirectory(prefix="mediaflow-caps-") as td:
-        for backend in backends:
-            eight = _encode_probe(ffmpeg, backend, False, Path(td) / f"{backend}-8.mp4",
-                                  timeout=timeout)
-            ten = _encode_probe(ffmpeg, backend, True, Path(td) / f"{backend}-10.mp4",
-                                timeout=timeout)
-            results["backends"][backend] = {
-                "available": bool(eight.get("available") or ten.get("available")),
-                "hevc8": bool(eight.get("available")),
-                "hevc10": bool(ten.get("available")),
-                "rate_control": eight.get("rate_control") if eight.get("available") else ten.get("rate_control"),
-                "rate_control_10bit": ten.get("rate_control"),
-                "error": eight.get("error") if not eight.get("available") else None,
-                "error_10bit": ten.get("error") if not ten.get("available") else None,
-            }
-            # Keep planner-friendly flat keys used by Engine._choose_backend.
-            results[backend] = {
-                "hevc8": bool(eight.get("available")),
-                "hevc10": bool(ten.get("available")),
-                "rate_control": results["backends"][backend]["rate_control"],
-            }
-    results["ok"] = any(v["hevc8"] for v in results["backends"].values())
+def _event_is_set(event: Any) -> bool:
+    if event is None:
+        return False
     try:
-        results["libvmaf"] = any("libvmaf" in line for line in
-                                 _run([ffmpeg, "-filters"], timeout=20).stdout.splitlines())
+        return bool(event.is_set())
     except Exception:
-        results["libvmaf"] = False
+        return False
+
+
+def _capability_decision(results: dict[str, Any], decision: Any) -> dict[str, Any]:
+    """Map a machine decision to an exact capability outcome."""
+
+    action = ProtectionAction(decision.action)
+    reasons = list(getattr(decision, "reasons", ()) or ())
+    detail = str(getattr(decision, "reason_text", "") or "")
+    if action is ProtectionAction.PAUSE:
+        results.update(
+            status="paused",
+            state=OperationState.PAUSED.value,
+            deferred=False,
+            completed=False,
+            reasons=reasons,
+            ok=False,
+            reason=detail or "capability tests are paused",
+        )
+    elif action is ProtectionAction.DEFER:
+        results.update(
+            status="deferred",
+            state=OperationState.DEFERRED.value,
+            deferred=True,
+            completed=False,
+            reasons=reasons,
+            ok=False,
+            reason=detail or "machine protection deferred capability tests",
+        )
+    elif action is ProtectionAction.TERMINATE:
+        cancelled = str(getattr(decision, "kind", "")) == "cancelled"
+        results.update(
+            status="cancelled" if cancelled else "interrupted",
+            state=(OperationState.CANCELLED if cancelled else OperationState.INTERRUPTED).value,
+            deferred=False,
+            completed=False,
+            reasons=reasons,
+            ok=False,
+            reason=detail or ("operation cancelled" if cancelled else "protection interrupted capability tests"),
+        )
+    return results
+
+
+def _incomplete_capability(
+    results: dict[str, Any],
+    state: OperationState,
+    *,
+    reasons: Iterable[str] = (),
+    timeout_type: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Record an incomplete result without inventing unsupported facts."""
+
+    status = {
+        OperationState.CANCELLED: "cancelled",
+        OperationState.INTERRUPTED: "interrupted",
+        OperationState.DEFERRED: "deferred",
+        OperationState.TIMED_OUT: "timed-out",
+        OperationState.STALLED: "stalled",
+        OperationState.FAILED: "failed",
+    }.get(state, "failed")
+    merged = list(dict.fromkeys([
+        *(str(item) for item in results.get("reasons", []) or []),
+        *(str(item) for item in reasons),
+    ]))
+    results.update(
+        status=status,
+        state=state.value,
+        deferred=state is OperationState.DEFERRED,
+        completed=False,
+        reasons=merged,
+        timeout_type=timeout_type,
+        ok=False,
+        reason=reason or "capability probe did not complete",
+    )
+    return results
+
+
+def run_capability_tests(
+    config: Any,
+    *,
+    ffmpeg: str | None = None,
+    backends: Iterable[str] = ("qsv", "vaapi", "software"),
+    timeout: float = 90.0,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+) -> dict:
+    """Run capability probes under one slot and shared supervision.
+
+    Capability facts are tri-state.  A completed probe may establish
+    ``True`` or ``False``; an incomplete, deferred or spawn-failed probe is
+    ``None``.  The second bit-depth probe is not started after an incomplete
+    first probe, while a completed 8-bit fact remains available if the
+    10-bit probe later times out.  Incomplete reports are never persisted over
+    a valid capability file.
+    """
+
+    ffmpeg = ffmpeg or str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
+    results: dict[str, Any] = {
+        "status": "ok",
+        "state": OperationState.SUCCEEDED.value,
+        "deferred": False,
+        "completed": False,
+        "reasons": [],
+        "timeout_type": None,
+        "ok": False,
+        "reason": None,
+        "ffmpeg_version": None,
+        "version_error": None,
+        "tested_at": time.time(),
+        "render_node": str(RENDER_NODE),
+        "backends": {},
+        "libvmaf": None,
+    }
+
+    cancel = cancel_event if cancel_event is not None else threading.Event()
+    pause = pause_event if pause_event is not None else threading.Event()
+    protection = monitor if monitor is not None else MachineProtectionMonitor(
+        config,
+        cancel_event=cancel,
+        pause_event=pause,
+        defer_on_protection=True,
+    )
+    try:
+        initial = protection()
+    except Exception as exc:
+        return _incomplete_capability(
+            results,
+            OperationState.FAILED,
+            reasons=["protection-monitor-error"],
+            reason=f"protection monitor failed: {exc}",
+        )
+    if initial.action is not ProtectionAction.CONTINUE:
+        return _capability_decision(results, initial)
+    if _event_is_set(pause):
+        return _capability_decision(
+            results,
+            ProtectionDecision(
+                ProtectionAction.PAUSE,
+                ("caller-paused",),
+                detail="capability tests are paused by the caller",
+            ),
+        )
+    if _event_is_set(cancel):
+        return _capability_decision(
+            results,
+            ProtectionDecision(
+                ProtectionAction.TERMINATE,
+                ("user-cancelled",),
+                detail="operation cancelled",
+                kind="cancelled",
+            ),
+        )
+
+    slot = processing_slot(slot_path(config), timeout=0)
+    try:
+        slot.__enter__()
+    except SlotBusy:
+        return _incomplete_capability(
+            results,
+            OperationState.DEFERRED,
+            reasons=["processing-slot-busy"],
+            reason="the expensive-operation slot is busy",
+        )
+    except OSError as exc:
+        return _incomplete_capability(
+            results,
+            OperationState.FAILED,
+            reasons=["processing-slot-unavailable"],
+            reason=f"the expensive-operation slot is unavailable: {exc}",
+        )
+
+    try:
+        version_process, version, version_error = _ffmpeg_version_process(
+            ffmpeg,
+            cancel_event=cancel,
+            pause_event=pause,
+            monitor=protection,
+        )
+        results["ffmpeg_version"] = version
+        results["version_error"] = version_error
+        if version_process.state is not OperationState.SUCCEEDED:
+            state = version_process.state
+            if state is OperationState.FAILED and not version_process.spawn_failed:
+                state = OperationState.FAILED
+            return _incomplete_capability(
+                results,
+                state,
+                reasons=version_process.reasons,
+                timeout_type=version_process.timeout_type,
+                reason=version_error or "ffmpeg version probe did not complete",
+            )
+
+        with tempfile.TemporaryDirectory(prefix="mediaflow-caps-") as td:
+            for backend in backends:
+                eight = _encode_probe(
+                    ffmpeg,
+                    backend,
+                    False,
+                    Path(td) / f"{backend}-8.mp4",
+                    timeout=timeout,
+                    cancel_event=cancel,
+                    pause_event=pause,
+                    monitor=protection,
+                )
+                ten: dict[str, Any] | None = None
+                if not eight.get("incomplete"):
+                    ten = _encode_probe(
+                        ffmpeg,
+                        backend,
+                        True,
+                        Path(td) / f"{backend}-10.mp4",
+                        timeout=timeout,
+                        cancel_event=cancel,
+                        pause_event=pause,
+                        monitor=protection,
+                    )
+
+                incomplete = eight if eight.get("incomplete") else (ten if ten and ten.get("incomplete") else None)
+                if incomplete is not None:
+                    state = OperationState(incomplete.get("state") or OperationState.FAILED.value)
+                    hevc8 = None if eight.get("incomplete") else bool(eight.get("available"))
+                    hevc10 = None if ten is None or ten.get("incomplete") else bool(ten.get("available"))
+                    known_available = True if hevc8 is True or hevc10 is True else None
+                    results["backends"][backend] = {
+                        "available": known_available,
+                        "hevc8": hevc8,
+                        "hevc10": hevc10,
+                        "rate_control": eight.get("rate_control") or "unknown",
+                        "rate_control_10bit": (ten or {}).get("rate_control") or "unknown",
+                        "error": eight.get("error"),
+                        "error_10bit": (ten or {}).get("error"),
+                        "state": state.value,
+                        "timeout_type": incomplete.get("timeout_type"),
+                    }
+                    results[backend] = {
+                        "hevc8": hevc8,
+                        "hevc10": hevc10,
+                        "rate_control": results["backends"][backend]["rate_control"],
+                    }
+                    return _incomplete_capability(
+                        results,
+                        state,
+                        reasons=incomplete.get("reasons") or (),
+                        timeout_type=incomplete.get("timeout_type"),
+                        reason="capability probe did not complete",
+                    )
+
+                eight_available = bool(eight.get("available"))
+                ten_available = bool((ten or {}).get("available"))
+                results["backends"][backend] = {
+                    "available": eight_available or ten_available,
+                    "hevc8": eight_available,
+                    "hevc10": ten_available,
+                    "rate_control": (
+                        eight.get("rate_control")
+                        if eight_available
+                        else (ten or {}).get("rate_control")
+                    ),
+                    "rate_control_10bit": (ten or {}).get("rate_control"),
+                    "error": eight.get("error") if not eight_available else None,
+                    "error_10bit": (ten or {}).get("error") if not ten_available else None,
+                    "state": OperationState.SUCCEEDED.value,
+                }
+                results[backend] = {
+                    "hevc8": eight_available,
+                    "hevc10": ten_available,
+                    "rate_control": results["backends"][backend]["rate_control"],
+                }
+
+            filters = _run_supervised(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-protocol_whitelist",
+                    "file,crypto,data",
+                    "-filters",
+                ],
+                timeout=20,
+                cancel_event=cancel,
+                pause_event=pause,
+                monitor=protection,
+            )
+            if filters.state is not OperationState.SUCCEEDED:
+                results["libvmaf"] = None
+                return _incomplete_capability(
+                    results,
+                    filters.state,
+                    reasons=filters.reasons,
+                    timeout_type=filters.timeout_type,
+                    reason=filters.reason or "libvmaf filter probe did not complete",
+                )
+            results["libvmaf"] = any(
+                "libvmaf" in line for line in (filters.stdout or "").splitlines()
+            )
+    finally:
+        try:
+            slot.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    results["status"] = "ok"
+    results["state"] = OperationState.SUCCEEDED.value
+    results["completed"] = True
+    results["deferred"] = False
+    results["ok"] = any(
+        value.get("hevc8") is True for value in results["backends"].values()
+    )
     return results
 
 
@@ -235,11 +630,21 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
             checks.append(Check(f"{label}-binary", "fail", f"not executable: {exe}"))
         else:
             checks.append(Check(f"{label}-binary", "ok", exe))
-    version, verr = _ffmpeg_version(ffmpeg)
-    if version:
-        checks.append(Check("ffmpeg-version", "ok", version, {"version": version}))
+    # Capability probes own their ffmpeg version subprocess.  This avoids a
+    # second version probe outside the processing slot and keeps a busy slot
+    # from starting any capability-related process.
+    caps = run_capability_tests(config, ffmpeg=ffmpeg) if run_capabilities else {}
+    if run_capabilities:
+        version = caps.get("ffmpeg_version")
+        verr = caps.get("version_error")
+        version_status = "ok" if version else ("warn" if caps else "fail")
     else:
-        checks.append(Check("ffmpeg-version", "fail", verr or "unknown"))
+        version, verr = _ffmpeg_version(ffmpeg)
+        version_status = "ok" if version else "fail"
+    if version:
+        checks.append(Check("ffmpeg-version", version_status, version, {"version": version}))
+    else:
+        checks.append(Check("ffmpeg-version", version_status, verr or "unknown"))
 
     # render node
     if RENDER_NODE.exists() and os.access(RENDER_NODE, os.R_OK | os.W_OK):
@@ -250,32 +655,68 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
         checks.append(Check("render-node", "warn", f"missing {RENDER_NODE}; hardware encode unavailable"))
 
     # capability tests
-    caps = run_capability_tests(config, ffmpeg=ffmpeg) if run_capabilities else {}
     if caps:
+        capability_status = str(caps.get("status") or "ok")
+        completed = (
+            bool(caps.get("completed"))
+            if "completed" in caps
+            else capability_status in {"ok", "completed"}
+        )
+        if not completed:
+            checks.append(Check(
+                "capability-state",
+                "warn",
+                caps.get("reason") or f"capability tests {capability_status}",
+                {
+                    "status": capability_status,
+                    "state": caps.get("state"),
+                    "reasons": caps.get("reasons") or [],
+                },
+            ))
         for backend, result in (caps.get("backends") or {}).items():
-            status = "ok" if result.get("hevc8") else "warn"
+            hevc8 = result.get("hevc8")
+            hevc10 = result.get("hevc10")
+            if hevc8 is None and hevc10 is None:
+                checks.append(Check(
+                    f"encode-{backend}", "warn",
+                    "capability is unknown because the probe did not complete",
+                    result,
+                ))
+                continue
+            status = "ok" if hevc8 is True else "warn"
+            eight_text = "yes" if hevc8 is True else ("no" if hevc8 is False else "unknown")
+            ten_text = "yes" if hevc10 is True else ("no" if hevc10 is False else "unknown")
             checks.append(Check(
                 f"encode-{backend}", status,
-                f"HEVC 8-bit={'yes' if result.get('hevc8') else 'no'}, "
-                f"10-bit={'yes' if result.get('hevc10') else 'no'}, "
+                f"HEVC 8-bit={eight_text}, 10-bit={ten_text}, "
                 f"rate-control={result.get('rate_control') or 'unknown'}",
                 result,
             ))
         hardware = {name: result
                     for name, result in (caps.get("backends") or {}).items()
                     if name in {"qsv", "vaapi"}}
-        hardware_8bit = any(r.get("hevc8") for r in hardware.values())
-        hardware_10bit = any(r.get("hevc10") for r in hardware.values())
+        hardware_8bit = any(r.get("hevc8") is True for r in hardware.values())
+        hardware_10bit = any(r.get("hevc10") is True for r in hardware.values())
+        hardware_8_unknown = any(r.get("hevc8") is None for r in hardware.values())
         if not hardware_8bit:
-            checks.append(Check("hardware-encode", "warn",
-                                "no hardware HEVC 8-bit encoder; only MKV remuxes will work"))
-        try:
-            _write_capabilities(config, caps)
-        except OSError:
-            checks.append(Check("capabilities-write", "warn", "could not write capabilities.json"))
-        checks.append(Check("hevc-10bit", "ok" if hardware_10bit else "warn",
-                            "hardware 10-bit HEVC available" if hardware_10bit else
-                            "hardware 10-bit HEVC unavailable; 10bit-no-hw REVIEW path active"))
+            detail = (
+                "hardware HEVC 8-bit capability is unknown"
+                if hardware_8_unknown
+                else "no hardware HEVC 8-bit encoder; only MKV remuxes will work"
+            )
+            checks.append(Check("hardware-encode", "warn", detail))
+        if completed and caps.get("libvmaf") is not None:
+            try:
+                _write_capabilities(config, caps)
+            except OSError:
+                checks.append(Check("capabilities-write", "warn", "could not write capabilities.json"))
+        if hardware_10bit:
+            ten_detail = "hardware 10-bit HEVC available"
+        elif any(r.get("hevc10") is None for r in hardware.values()):
+            ten_detail = "hardware 10-bit HEVC capability is unknown"
+        else:
+            ten_detail = "hardware 10-bit HEVC unavailable; 10bit-no-hw REVIEW path active"
+        checks.append(Check("hevc-10bit", "ok" if hardware_10bit else "warn", ten_detail))
 
     # temperature sensor
     try:

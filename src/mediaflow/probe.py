@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .supervision import OperationState, run_process
+
 DEFAULT_FFPROBE = "/usr/lib/jellyfin-ffmpeg/ffprobe"
 DEFAULT_TIMEOUT = 120
 PROTOCOL_WHITELIST = "file,crypto,data"
@@ -71,6 +73,23 @@ class UnsupportedFormat(ProbeError):
     """The probed container is not in :data:`ALLOWED_FORMATS`."""
 
 
+class ProbeInterrupted(ProbeError):
+    """A supervised probe ended before it produced a complete result."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        state: OperationState,
+        reasons: tuple[str, ...] = (),
+        timeout_type: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.state = state
+        self.reasons = tuple(reasons)
+        self.timeout_type = timeout_type
+
+
 def container_allowed(format_name: str | None) -> bool:
     """Return True only for the explicit container allowlist.
 
@@ -109,12 +128,22 @@ def ffprobe_json(
     extra_args: Sequence[str],
     ffprobe: str | Path = DEFAULT_FFPROBE,
     timeout: float = DEFAULT_TIMEOUT,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
 ) -> dict[str, Any]:
     """Run ffprobe with a safe argv and return one JSON object.
 
     ``extra_args`` are appended after the mandatory protocol whitelist and
     before ``-of json``.  No shell is used.  Any non-zero exit, timeout,
     spawn failure or unparsable output raises :class:`ProbeFailed`.
+
+    When supervision arguments are supplied, the probe is owned by the shared
+    process supervisor.  Cancellation, protection interruption, deferral and
+    timeout then retain their typed outcome in :class:`ProbeInterrupted`.
+    The legacy call shape remains available to callers that do not need
+    operation-level cancellation.
     """
     p = _validate_regular_file(path)
     if any(arg == "-protocol_whitelist" for arg in extra_args):
@@ -132,25 +161,67 @@ def ffprobe_json(
         "json",
         str(p),
     ]
-    try:
-        completed = subprocess.run(
+    supervised = cancel_event is not None or pause_event is not None or monitor is not None
+    if supervised:
+        from .supervision import SupervisionPolicy
+
+        process = run_process(
             argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            shell=False,
+            policy=SupervisionPolicy(
+                stall_timeout=None,
+                startup_grace=min(30.0, max(0.0, float(timeout))),
+                finalization_grace=min(30.0, max(0.0, float(timeout))),
+                overall_timeout=timeout if timeout and timeout > 0 else None,
+                monitor_interval=0.2,
+                terminate_grace=5.0,
+            ),
+            cancel_event=cancel_event,
+            pause_event=pause_event,
+            monitor=monitor,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise ProbeFailed(f"ffprobe timed out after {timeout}s for {p}") from exc
-    except OSError as exc:
-        raise ProbeFailed(f"could not run ffprobe: {exc}") from exc
-    if completed.returncode != 0:
-        detail = (completed.stderr or "").strip().splitlines()
+        if process.state is not OperationState.SUCCEEDED:
+            if process.state in {
+                OperationState.CANCELLED,
+                OperationState.INTERRUPTED,
+                OperationState.DEFERRED,
+                OperationState.TIMED_OUT,
+                OperationState.STALLED,
+            }:
+                raise ProbeInterrupted(
+                    process.reason or "ffprobe did not complete",
+                    state=process.state,
+                    reasons=process.reasons,
+                    timeout_type=process.timeout_type,
+                )
+            detail = (process.stderr or "").strip().splitlines()
+            message = detail[-1] if detail else (process.reason or "unknown error")
+            raise ProbeFailed(f"ffprobe failed ({process.returncode}) for {p}: {message}")
+        stdout = process.stdout
+        stderr = process.stderr
+        returncode = process.returncode
+    else:
+        try:
+            completed = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProbeFailed(f"ffprobe timed out after {timeout}s for {p}") from exc
+        except OSError as exc:
+            raise ProbeFailed(f"could not run ffprobe: {exc}") from exc
+        stdout = completed.stdout
+        stderr = completed.stderr
+        returncode = completed.returncode
+    if returncode != 0:
+        detail = (stderr or "").strip().splitlines()
         message = detail[-1] if detail else "unknown error"
-        raise ProbeFailed(f"ffprobe failed ({completed.returncode}) for {p}: {message}")
+        raise ProbeFailed(f"ffprobe failed ({returncode}) for {p}: {message}")
     try:
-        payload = json.loads(completed.stdout or "")
+        payload = json.loads(stdout or "")
     except json.JSONDecodeError as exc:
         raise ProbeFailed(f"ffprobe returned invalid JSON for {p}") from exc
     if not isinstance(payload, dict):
@@ -267,6 +338,10 @@ def probe_media(
     path: str | Path,
     ffprobe: str | Path = DEFAULT_FFPROBE,
     timeout: float = DEFAULT_TIMEOUT,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
 ) -> ProbeResult:
     """Probe a regular file and enforce the container allowlist (SAF-13).
 
@@ -284,6 +359,9 @@ def probe_media(
         ["-show_format", "-show_streams", "-show_chapters"],
         ffprobe=ffprobe,
         timeout=timeout,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
     )
     result = ProbeResult(path=p, raw=raw)
     if not container_allowed(result.format_name):

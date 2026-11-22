@@ -69,3 +69,46 @@ stable_seconds = 3
         assert daemon.engine.cfg.stable_seconds == 3
     finally:
         store.close()
+
+
+def test_ffmpeg_change_retest_is_cancellable_and_keeps_old_capabilities(tmp_path, monkeypatch):
+    """SUP-2/3: a stopped daemon cannot overwrite capability evidence."""
+
+    path, cfg = _config(tmp_path)
+    caps_path = Path(cfg.capabilities_path)
+    caps_path.parent.mkdir(parents=True, exist_ok=True)
+    original = {"ffmpeg_version": "old", "backends": {"qsv": {"hevc8": True}}}
+    caps_path.write_text(json.dumps(original), encoding="utf-8")
+    store = Store(cfg.db_path)
+    store.initialize()
+    calls = []
+
+    class Completed:
+        stdout = "ffmpeg version new\n"
+
+    monkeypatch.setattr("mediaflow.daemon.subprocess.run", lambda *a, **k: Completed())
+
+    def fake_tests(config, **kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "cancelled",
+            "state": "cancelled",
+            "completed": False,
+            "ok": False,
+            "reasons": ["user-cancelled"],
+        }
+
+    monkeypatch.setattr("mediaflow.doctor.run_capability_tests", fake_tests)
+    try:
+        daemon = Daemon(cfg, store, {}, config_path=path)
+        daemon._stop.set()
+        daemon._check_ffmpeg()
+
+        assert calls and calls[0]["cancel_event"] is daemon._stop
+        assert json.loads(caps_path.read_text()) == original
+        assert any(
+            "capability tests cancelled" in reason
+            for reason in daemon.engine.pause_reasons
+        )
+    finally:
+        store.close()
