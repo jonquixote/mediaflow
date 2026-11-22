@@ -25,8 +25,11 @@ scripts/check.sh
 Exact results:
 
 - traceability and generated invariants: `6 passed in 0.21s`
-- unit and integration: `782 passed in 42.04s`
-- full suite including slow, crash and chaos tests: `782 passed in 41.50s`
+- unit and integration: `782 passed in 41.86s`
+- full suite including slow, crash and chaos tests: `782 passed in 41.35s`
+
+The same command was repeated after the no-ff merge to `main` with identical
+counts.
 
 The previous Pass A baseline was 731 tests; this pass adds 51 regression tests.
 
