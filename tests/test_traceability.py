@@ -14,7 +14,10 @@ SPEC = ROOT / "docs" / "SPEC.md"
 INVARIANTS = ROOT / "docs" / "INVARIANTS.md"
 TESTS = ROOT / "tests"
 
-ID_RE = re.compile(r"\b(?:SAF|SCHED|ENC|REV|MP4|MKV|SIZE|SUP)-\d+\b")
+ID_RE = re.compile(
+    r"\b(?:SAF|SCHED|ENC|REV|MP4|MKV|SIZE|SUP|STATE|CONFIG|COMPAT)-\d+\b"
+)
+
 
 
 def _registry() -> dict:
