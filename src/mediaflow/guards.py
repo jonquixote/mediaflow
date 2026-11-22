@@ -347,6 +347,7 @@ class SpaceStatus:
     remaining_work_bytes: int = 0
     emergency_required_bytes: int = 0
     output_consumed_bytes: int = 0
+    additional_required_bytes: int = 0
 
 
 def _free_bytes(disk_usage: Callable[[Any], Any], path: Path) -> int | None:
@@ -441,6 +442,7 @@ def check_space(
     remaining_work: int | None = None,
     output_consumed: int = 0,
     emergency_low_water: int | None = None,
+    additional_required_bytes: int = 0,
     mid_encode: bool = False,
     db_path: Path | None = None,
     disk_usage: Callable[[Any], Any] | None = None,
@@ -488,6 +490,12 @@ def check_space(
             required = remaining_bytes + emergency_bytes
     else:
         required = int(math.ceil(max(1.2 * source_bytes, min_free_gb * GIB)))
+
+    # Additive work-specific reserve (for example the bytes a publish may copy
+    # when a hard link is unavailable).  It never replaces the source-based
+    # SAF-8 reservation.
+    additional = max(0, int(math.ceil(_number(additional_required_bytes, 0.0))))
+    required += additional
 
     pipeline = _cfg_path(cfg, "pipeline", Path("/srv/media/_pipeline"))
     free = _free_bytes(usage, pipeline)
@@ -560,6 +568,7 @@ def check_space(
         remaining_work_bytes=(remaining_bytes or 0),
         emergency_required_bytes=emergency_bytes,
         output_consumed_bytes=consumed_bytes,
+        additional_required_bytes=additional,
     )
     return status, decision
 

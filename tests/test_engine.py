@@ -227,6 +227,32 @@ def test_dry_run_moves_nothing_and_replans_once(env):
     assert job["state"] == "DONE"
 
 
+def test_dry_run_true_to_false_and_false_to_true_replan_once(env):
+    """A dry-run flip re-plans a PLANNED job once in either direction."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    counts = []
+    _fake_inspect(eng)
+    _fake_plan(eng, counter=counts)
+    _auto_identity(eng)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="PLANNED",
+        dry_run=False, plan_json={"stale": True},
+    )
+
+    eng.dry_run = True
+    assert eng._step_plan(store.get_job(job["id"])) is False
+    assert len(counts) == 1
+    assert store.get_job(job["id"])["dry_run"] is True
+
+    eng.dry_run = False
+    assert eng._step_plan(store.get_job(job["id"])) is True
+    assert len(counts) == 2
+    assert store.get_job(job["id"])["dry_run"] is False
+
+
 def test_review_parks_original_and_reject_leaves_it(env):
     """[REV-1] A review parks the source; reject closes without deleting it."""
     cfg, store, eng, _ = env
@@ -593,7 +619,7 @@ def test_recovery_adopts_retire_window(env):
     eng.tick()
     job = store.list_jobs()[0]
     # simulate DB still PUBLISHED while trash already contains the job
-    store.transition(job["id"], "PUBLISHED", expect_from="DONE")
+    store.update_job(job["id"], state="PUBLISHED")
     store.update_job(job["id"], manifest_path=None)
     # DONE work was cleaned; create a fake working output for recovery inspection
     work = cfg.work / job["id"]
@@ -1436,7 +1462,8 @@ def test_publish_space_reserve_uses_the_output_copy_not_the_source(env):
     decision = eng._space_gate(job)
 
     assert decision.ok is True
-    assert calls[0]["source_size"] == 1234
+    assert calls[0]["source_size"] == 9_000_000
+    assert calls[0]["additional_required_bytes"] == 1234
 
 
 def test_engine_uses_the_planned_backend_and_target_height_speed_key(env):
@@ -1599,3 +1626,222 @@ def test_post_encode_speed_update_uses_the_planned_backend_and_target_height(env
 
     assert store.speed_get("test-preset", "qsv", 1080) == pytest.approx(1.3)
     assert store.speed_get("test-preset", "vaapi", 1080) == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Pass C: one job-state model
+# ---------------------------------------------------------------------------
+
+
+def test_plan_binds_generation_and_preset_fingerprint(env):
+    """A plan records the configuration generation and preset identity."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    _fake_inspect(eng)
+    _fake_plan(eng)
+    _auto_identity(eng)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="PLANNED",
+    )
+    assert eng._step_plan(store.get_job(job["id"])) is True
+    plan = store.get_job(job["id"])["plan"]
+    assert plan["config_generation"] == getattr(cfg, "generation", 1)
+    assert plan["preset_fingerprint"] == eng._preset_fingerprint(eng.presets["test-preset"])
+
+
+def test_legacy_plan_is_replanned_before_execution(env):
+    """A persisted pre-v2 plan is not executed with changed semantics."""
+
+    import json
+
+    fixture = Path(__file__).parent / "fixtures" / "plan_pre_pass_a.json"
+    legacy_plan = json.loads(fixture.read_text(encoding="utf-8"))
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    counts = []
+    _fake_inspect(eng)
+    _fake_plan(eng, counter=counts)
+    _auto_identity(eng)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="PLANNED",
+        plan_json=legacy_plan,
+    )
+    assert eng._step_plan(store.get_job(job["id"])) is True
+    current = store.get_job(job["id"])
+    assert current["plan"]["schema"] == 2
+    assert len(counts) == 1
+    assert current["restarts"] == 0
+
+
+def test_plan_is_deliberately_replanned_when_generation_changes(env):
+    """A stale generation triggers a fresh plan without consuming a restart."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    counts = []
+    _fake_inspect(eng)
+    _fake_plan(eng, counter=counts)
+    _auto_identity(eng)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="PLANNED",
+        plan_json={"stale": True, "config_generation": 0, "fallback_from": None},
+        restarts=2,
+    )
+    cfg.generation = 9
+    eng.cfg = cfg
+
+    assert eng._step_plan(store.get_job(job["id"])) is True
+    assert len(counts) == 1
+    current = store.get_job(job["id"])
+    assert current["restarts"] == 2
+    assert current["plan"]["config_generation"] == 9
+    assert any(event["kind"] == "replanned" for event in store.events(job["id"]))
+
+
+def test_disabled_preset_pauses_a_planned_job_but_not_a_running_one(env):
+    """Preset removal is a hold for queued work, not a silent job failure."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="PLANNED",
+        plan_json={"working_output": str(cfg.work / "job" / "out.mp4")},
+    )
+    eng.presets = {}
+
+    assert eng._step_plan(store.get_job(job["id"])) is False
+    assert store.get_job(job["id"])["state"] == "PLANNED"
+    assert any("preset-unavailable" in reason for reason in eng.pause_reasons)
+
+    running = store.create_job(
+        preset="test-preset", source_rel="other", source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="ENCODED",
+    )
+    eng._write_snapshot(running["id"])  # no failure just because preset vanished
+    assert store.get_job(running["id"])["state"] == "ENCODED"
+
+
+def test_restored_job_does_not_block_a_fresh_drop(env):
+    """RESTORED is terminal for scanning even though its history remains."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    first = store.list_jobs()[0]
+    assert first["state"] == "DONE"
+
+    eng.restore(first["id"])
+    assert store.get_job(first["id"])["state"] == "RESTORED"
+
+    _source(cfg)
+    eng.tick()
+
+    jobs = store.list_jobs(include_done=True)
+    fresh = [job for job in jobs if job["id"] != first["id"]]
+    assert len(fresh) == 1
+    assert fresh[0]["id"] != first["id"]
+    assert store.get_job(first["id"])["state"] == "RESTORED"
+    restored = store.get_job(first["id"])
+    assert restored["manifest_path"] and Path(restored["trash_path"]).exists()
+
+
+def test_an_active_job_still_blocks_a_fresh_drop(env):
+    """Only terminal history stops blocking; real active work still does."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="REVIEW",
+    )
+    eng.scan()
+    assert len(store.list_jobs()) == 1
+
+
+def test_persistent_machine_holds_compose_after_recovery(env):
+    """FFmpeg/capability holds survive a restart until they are resolved."""
+
+    cfg, store, eng, _ = env
+    store.set_setting("ffmpeg_changed_hold", "ffmpeg-changed: capability tests failed")
+    store.set_setting("capability_unknown_hold", "capability-unknown")
+    store.set_setting("ffmpeg_missing_hold", "")
+
+    eng.recover()
+
+    reasons = eng.pause_reasons
+    assert "ffmpeg-changed: capability tests failed" in reasons
+    assert "capability-unknown" in reasons
+    assert not any("ffmpeg-missing" in reason for reason in reasons)
+
+
+def test_recovery_is_idempotent(env):
+    """A second recovery pass emits no new recovery events."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    eng.recover()
+    before = [event for event in store.events(None) if event["kind"] == "recovery"]
+    # events(None) returns all job-agnostic events only; also count job ones.
+    before_count = sum(
+        1 for job in store.list_jobs(include_done=True)
+        for event in store.events(job["id"]) if event["kind"] == "recovery"
+    ) + len(before)
+
+    eng.recover()
+    after_count = sum(
+        1 for job in store.list_jobs(include_done=True)
+        for event in store.events(job["id"]) if event["kind"] == "recovery"
+    ) + len([event for event in store.events(None) if event["kind"] == "recovery"])
+
+    assert after_count == before_count
+
+
+def test_status_and_queue_agree_about_restored_history(env):
+    """Terminal history is visible in `history`, not in the active queue."""
+
+    from mediaflow.cli import _status_payload
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    job = store.list_jobs()[0]
+    eng.restore(job["id"])
+
+    status = eng.write_status()
+    fallback = _status_payload(cfg, store)
+    assert status["history"] == fallback["history"] == {"RESTORED": 1}
+    assert status["queue"] == fallback["queue"] == 0
+    assert status["reviews"] == fallback["reviews"] == 0
+
+
+def test_recovery_does_not_recreate_terminal_work_directories(env):
+    """RESTORED history stays visible without resurrecting job scratch."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    job = store.list_jobs()[0]
+    eng.restore(job["id"])
+    work = cfg.work / job["id"]
+    assert not work.exists()
+
+    eng.recover()
+    eng.recover()
+
+    assert not work.exists()
+    assert store.get_job(job["id"])["state"] == "RESTORED"
+

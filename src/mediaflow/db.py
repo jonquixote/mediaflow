@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import time
 import uuid
@@ -13,10 +14,28 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .safety import fsync_dir
+from .state import (
+    INTENT_KINDS,
+    JobState,
+    REVIEW_REASONS,
+    command_status,
+    INTENT_KINDS,
+    TERMINAL_STATES as _TERMINAL_STATES,
+    in_clause,
+    is_valid_transition,
+    values,
+)
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Test hook: set to a migration's target version to simulate a kill point.
+MIGRATION_FAIL_AT: int | None = None
+
+#: Old speed rows were keyed by source height.  Reads only accept version 2
+#: (target height) rows; the legacy rows are retained for audit/re-keying.
+SPEED_KEY_VERSION = 2
 
 JOB_COLUMNS = {
     "id": "TEXT PRIMARY KEY",
@@ -58,9 +77,47 @@ JOB_COLUMNS = {
     "fail_count": "INTEGER NOT NULL DEFAULT 0",
     "last_error_at": "REAL",
     "adopted": "INTEGER NOT NULL DEFAULT 0",
+    # Pass C: explicit semantic generation markers for persisted records.
+    "plan_schema": "INTEGER NOT NULL DEFAULT 2",
+    "config_generation": "INTEGER NOT NULL DEFAULT 0",
+    "preset_fingerprint": "TEXT",
 }
 
-TERMINAL_STATES = ("DONE", "FAILED")
+# Compatibility alias: still a tuple of strings, but derived from the one
+# shared state model rather than hand-maintained here.
+TERMINAL_STATES: tuple[str, ...] = values(_TERMINAL_STATES)
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column(conn: sqlite3.Connection, table: str, name: str, ddl: str) -> None:
+    if name not in _columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add explicit semantic-generation markers without discarding history."""
+
+    if MIGRATION_FAIL_AT == 2:  # pragma: no cover - deterministic kill point
+        raise RuntimeError("simulated migration failure at v2")
+    _add_column(conn, "jobs", "plan_schema", "INTEGER NOT NULL DEFAULT 1")
+    _add_column(conn, "jobs", "config_generation", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "jobs", "preset_fingerprint", "TEXT")
+    _add_column(conn, "speed_table", "key_version", "INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        "UPDATE jobs SET plan_schema=1 WHERE plan_schema IS NULL OR plan_schema=0"
+    )
+    conn.execute(
+        "UPDATE speed_table SET key_version=1 WHERE key_version IS NULL OR key_version=0"
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('plan_semantics', '2')"
+    )
+
+
+MIGRATIONS: dict[int, Any] = {2: _migrate_v1_to_v2}
 
 
 class DatabaseError(RuntimeError):
@@ -93,64 +150,125 @@ class Store:
 
     # -- lifecycle ------------------------------------------------------
     def initialize(self) -> None:
-        with self._tx() as c:
+        """Open, validate and migrate the database to SCHEMA_VERSION.
+
+        A newer database is refused before any table is touched.  Older
+        databases are backed up first, then migrated in one transaction; the
+        version stamp is committed only after every step succeeds.  Re-running
+        initialize is idempotent.
+        """
+
+        with self._lock:
+            c = self._conn
             c.execute(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            cols = ", ".join(f"{k} {v}" for k, v in JOB_COLUMNS.items())
-            c.execute(f"CREATE TABLE IF NOT EXISTS jobs ({cols})")
-            c.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state)")
-            c.execute("CREATE INDEX IF NOT EXISTS jobs_preset_source ON jobs(preset, source_rel)")
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS events ("
-                " seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, ts REAL NOT NULL,"
-                " state TEXT, kind TEXT NOT NULL, message TEXT)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS stats ("
-                " id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, preset TEXT,"
-                " backend TEXT, finished_at REAL NOT NULL, bytes_before INTEGER,"
-                " bytes_after INTEGER, video_bytes_before INTEGER, video_bytes_after INTEGER,"
-                " encode_seconds REAL)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS speed_table ("
-                " preset TEXT NOT NULL, backend TEXT NOT NULL, bucket TEXT NOT NULL,"
-                " factor REAL NOT NULL, samples INTEGER NOT NULL DEFAULT 1,"
-                " updated_at REAL NOT NULL, PRIMARY KEY(preset, backend, bucket))"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS tmdb_cache ("
-                " cache_key TEXT PRIMARY KEY, body TEXT NOT NULL, fetched_at REAL NOT NULL)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS library_cache ("
-                " path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL,"
-                " probe TEXT, updated_at REAL NOT NULL)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS commands ("
-                " id TEXT PRIMARY KEY, command TEXT NOT NULL, payload TEXT NOT NULL,"
-                " status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,"
-                " started_at REAL, finished_at REAL, error TEXT)"
-            )
-            c.execute("CREATE INDEX IF NOT EXISTS commands_status ON commands(status, created_at)")
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS intents ("
-                " id TEXT PRIMARY KEY, kind TEXT NOT NULL, job_id TEXT NOT NULL,"
-                " payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',"
-                " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
-            )
-            c.execute("CREATE INDEX IF NOT EXISTS intents_status ON intents(status, kind)")
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS notifications ("
-                " event_key TEXT NOT NULL, job_id TEXT, sent_at REAL NOT NULL,"
-                " PRIMARY KEY(event_key, job_id))"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-            )
-            c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)", (str(SCHEMA_VERSION),))
+            rows = [r[0] for r in c.execute("PRAGMA integrity_check").fetchall()]
+            if rows != ["ok"]:
+                raise DatabaseError("state.db integrity_check failed: " + "; ".join(rows))
+            row = c.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            table_exists = c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone() is not None
+            if row is None and not table_exists:
+                stored = 0  # truly new database
+            elif row is None:
+                stored = 1  # pre-versioning v1 database
+            else:
+                try:
+                    stored = int(row[0])
+                except (TypeError, ValueError) as exc:
+                    raise DatabaseError(f"invalid schema_version: {row[0]!r}") from exc
+            if stored > SCHEMA_VERSION:
+                raise DatabaseError(
+                    f"state.db schema {stored} is newer than supported {SCHEMA_VERSION}; "
+                    "use a matching or newer mediaflow binary"
+                )
+            backup_path: Path | None = None
+            if 0 < stored < SCHEMA_VERSION:
+                backup_path = self.backup(self.path.parent / "backup", keep=3)
+                log.warning(
+                    "backed up state.db before migration path=%s from=%s to=%s",
+                    backup_path, stored, SCHEMA_VERSION,
+                )
+            try:
+                with self._tx() as c:
+                    cols = ", ".join(f"{k} {v}" for k, v in JOB_COLUMNS.items())
+                    c.execute(f"CREATE TABLE IF NOT EXISTS jobs ({cols})")
+                    c.execute("CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state)")
+                    c.execute(
+                        "CREATE INDEX IF NOT EXISTS jobs_preset_source ON jobs(preset, source_rel)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS events ("
+                        " seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, ts REAL NOT NULL,"
+                        " state TEXT, kind TEXT NOT NULL, message TEXT)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS stats ("
+                        " id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, preset TEXT,"
+                        " backend TEXT, finished_at REAL NOT NULL, bytes_before INTEGER,"
+                        " bytes_after INTEGER, video_bytes_before INTEGER, video_bytes_after INTEGER,"
+                        " encode_seconds REAL)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS speed_table ("
+                        " preset TEXT NOT NULL, backend TEXT NOT NULL, bucket TEXT NOT NULL,"
+                        " factor REAL NOT NULL, samples INTEGER NOT NULL DEFAULT 1,"
+                        " updated_at REAL NOT NULL, key_version INTEGER NOT NULL DEFAULT 2,"
+                        " PRIMARY KEY(preset, backend, bucket))"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS tmdb_cache ("
+                        " cache_key TEXT PRIMARY KEY, body TEXT NOT NULL, fetched_at REAL NOT NULL)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS library_cache ("
+                        " path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime REAL NOT NULL,"
+                        " probe TEXT, updated_at REAL NOT NULL)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS commands ("
+                        " id TEXT PRIMARY KEY, command TEXT NOT NULL, payload TEXT NOT NULL,"
+                        " status TEXT NOT NULL DEFAULT 'pending', created_at REAL NOT NULL,"
+                        " started_at REAL, finished_at REAL, error TEXT)"
+                    )
+                    c.execute(
+                        "CREATE INDEX IF NOT EXISTS commands_status ON commands(status, created_at)"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS intents ("
+                        " id TEXT PRIMARY KEY, kind TEXT NOT NULL, job_id TEXT NOT NULL,"
+                        " payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',"
+                        " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+                    )
+                    c.execute("CREATE INDEX IF NOT EXISTS intents_status ON intents(status, kind)")
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS notifications ("
+                        " event_key TEXT NOT NULL, job_id TEXT, sent_at REAL NOT NULL,"
+                        " PRIMARY KEY(event_key, job_id))"
+                    )
+                    c.execute(
+                        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                    )
+                    if 0 < stored < SCHEMA_VERSION:
+                        for version in range(stored + 1, SCHEMA_VERSION + 1):
+                            MIGRATIONS[version](c)
+                    c.execute(
+                        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version', ?)",
+                        (str(SCHEMA_VERSION),),
+                    )
+                    if backup_path is not None:
+                        c.execute(
+                            "INSERT OR REPLACE INTO meta(key,value) VALUES('last_migration_backup', ?)",
+                            (str(backup_path),),
+                        )
+            except Exception:
+                # The transaction rolled back, so the version stamp and schema
+                # are unchanged.  The pre-migration backup remains for rescue.
+                raise
         self.integrity_check()
 
     def close(self) -> None:
@@ -219,6 +337,58 @@ class Store:
         backups = sorted(Path(destination).glob("state-*.db"))
         return backups[-1] if backups else None
 
+    @staticmethod
+    def validate_backup(source: Path) -> None:
+        """Refuse a backup that is not a readable SQLite database."""
+
+        source = Path(source)
+        if not source.is_file():
+            raise DatabaseError(f"backup not found: {source}")
+        probe = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        try:
+            rows = [r[0] for r in probe.execute("PRAGMA integrity_check").fetchall()]
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"backup integrity check failed: {exc}") from exc
+        finally:
+            probe.close()
+        if rows != ["ok"]:
+            raise DatabaseError("backup integrity_check failed: " + "; ".join(rows))
+
+    def restore_from_backup(self, source: Path) -> Path:
+        """Atomically replace the active DB with a validated backup.
+
+        The current file is preserved with a `.corrupt-<stamp>` suffix; no job
+        history is discarded.  Callers must ensure the daemon is not running.
+        """
+
+        self.validate_backup(source)
+        source = Path(source)
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"-{time.time_ns() % 1_000_000_000:09d}"
+        preserved = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+        with self._lock:
+            self._conn.close()
+            if self.path.exists():
+                os.replace(self.path, preserved)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{self.path}{suffix}")
+                if sidecar.exists():
+                    sidecar.unlink()
+            tmp = self.path.with_name(f"{self.path.name}.restore-{stamp}")
+            with source.open("rb") as src, tmp.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+            os.replace(tmp, self.path)
+            fsync_dir(self.path.parent)
+            self._conn = sqlite3.connect(str(self.path), timeout=5.0, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=FULL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._closed = False
+        self.initialize()
+        return preserved
+
     # -- jobs -----------------------------------------------------------
     def create_job(self, *, preset: str, source_rel: str, source_path: str, state: str = "DETECTED",
                    now: float | None = None, **fields: Any) -> dict:
@@ -250,17 +420,22 @@ class Store:
             sql += " WHERE state IN (" + ",".join("?" for _ in states) + ")"
             args.extend(states)
         elif not include_done:
-            sql += " WHERE state NOT IN ('DONE','FAILED')"
+            clause, excluded = in_clause(_TERMINAL_STATES)
+            sql += f" WHERE state NOT IN ({clause})"
+            args.extend(excluded)
         sql += " ORDER BY created_at, id"
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
         return [_decode_job(dict(r)) for r in rows]
 
     def active_job_for(self, preset: str, source_rel: str) -> dict | None:
+        clause, excluded = in_clause(_TERMINAL_STATES)
+        sql = (
+            "SELECT * FROM jobs WHERE preset=? AND source_rel=? "
+            f"AND state NOT IN ({clause}) ORDER BY created_at DESC LIMIT 1"
+        )
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state NOT IN ('DONE','FAILED') "
-                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel)).fetchone()
+            row = self._conn.execute(sql, (preset, source_rel, *excluded)).fetchone()
         return _decode_job(dict(row)) if row else None
 
     def latest_job_for(self, preset: str, source_rel: str) -> dict | None:
@@ -271,10 +446,11 @@ class Store:
         return _decode_job(dict(row)) if row else None
 
     def get_review_by_source(self, preset: str, source_rel: str) -> dict | None:
+        review = values({JobState.REVIEW})[0]  # shared vocabulary
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state='REVIEW' "
-                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel)).fetchone()
+                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state=? "
+                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel, review)).fetchone()
         return _decode_job(dict(row)) if row else None
 
     def update_job(self, job_id: str, **fields: Any) -> dict:
@@ -292,7 +468,12 @@ class Store:
 
     def transition(self, job_id: str, to_state: str, *, expect_from: str | Iterable[str] | None = None,
                    message: str | None = None, **fields: Any) -> bool:
-        """Compare-and-set state transition. Returns False if expect_from did not match."""
+        """Compare-and-set state transition using the shared state model.
+
+        Returns ``False`` when ``expect_from`` does not match.  Structurally
+        impossible transitions raise :class:`DatabaseError`; recovery paths use
+        only legal transitions, so this cannot weaken crash handling.
+        """
         allowed = {k: self._encode_field(k, v) for k, v in fields.items()
                    if k in JOB_COLUMNS and k not in {"id", "created_at"}}
         allowed["state"] = to_state
@@ -301,11 +482,25 @@ class Store:
         args = list(allowed.values())
         sql = f"UPDATE jobs SET {sets} WHERE id=?"
         args.append(job_id)
+        expected: tuple[str, ...] | None = None
         if expect_from:
-            expected = [expect_from] if isinstance(expect_from, str) else list(expect_from)
-            sql += " AND state IN (" + ",".join("?" for _ in expected) + ")"
-            args.extend(expected)
+            expected = values(
+                [expect_from] if isinstance(expect_from, str) else list(expect_from)
+            )
+            clause, clause_values = in_clause(expected)
+            sql += f" AND state IN ({clause})"
+            args.extend(clause_values)
         with self._tx() as c:
+            row = c.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return False
+            source = str(row[0])
+            if expected is not None and source not in expected:
+                return False
+            if not is_valid_transition(source, to_state):
+                raise DatabaseError(
+                    f"invalid job transition {source} -> {to_state} for {job_id}"
+                )
             cur = c.execute(sql, args)
             if cur.rowcount != 1:
                 return False
@@ -324,13 +519,19 @@ class Store:
         return [dict(r) for r in rows]
 
     def set_review(self, job_id: str, reason: str, from_state: str, context: Mapping | None = None) -> None:
+        if reason not in REVIEW_REASONS:
+            raise ValueError(f"unknown review reason: {reason!r}")
+        if not is_valid_transition(from_state, JobState.REVIEW):
+            raise DatabaseError(f"invalid review transition from {from_state}")
+        review = values({JobState.REVIEW})[0]
         with self._tx() as c:
             c.execute(
-                "UPDATE jobs SET state='REVIEW', review_reason=?, review_from_state=?, review_context=?,"
+                "UPDATE jobs SET state=?, review_reason=?, review_from_state=?, review_context=?,"
                 " updated_at=? WHERE id=?",
-                (reason, from_state, json.dumps(context or {}, ensure_ascii=False, sort_keys=True), time.time(), job_id))
+                (review, reason, from_state,
+                 json.dumps(context or {}, ensure_ascii=False, sort_keys=True), time.time(), job_id))
             c.execute("INSERT INTO events(job_id,ts,state,kind,message) VALUES(?,?,?,?,?)",
-                      (job_id, time.time(), "REVIEW", "review", reason))
+                      (job_id, time.time(), review, "review", reason))
 
     def clear_review(self, job_id: str) -> None:
         self.update_job(job_id, review_reason=None, review_from_state=None, review_context=None)
@@ -363,13 +564,17 @@ class Store:
     def speed_get(self, preset: str, backend: str, height: int) -> float | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT factor FROM speed_table WHERE preset=? AND backend=? AND bucket=?",
-                (preset, backend, self.bucket(height))).fetchone()
+                "SELECT factor FROM speed_table WHERE preset=? AND backend=? AND bucket=? "
+                "AND key_version=?",
+                (preset, backend, self.bucket(height), SPEED_KEY_VERSION)).fetchone()
         return float(row[0]) if row else None
 
     def speed_has_any(self, preset: str) -> bool:
         with self._lock:
-            row = self._conn.execute("SELECT 1 FROM speed_table WHERE preset=? LIMIT 1", (preset,)).fetchone()
+            row = self._conn.execute(
+                "SELECT 1 FROM speed_table WHERE preset=? AND key_version=? LIMIT 1",
+                (preset, SPEED_KEY_VERSION),
+            ).fetchone()
         return row is not None
 
     def speed_seed(self, preset: str, backend: str, height: int, factor: float) -> None:
@@ -377,16 +582,22 @@ class Store:
             raise DatabaseError("speed factor must be positive")
         with self._tx() as c:
             c.execute(
-                "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at) VALUES(?,?,?,?,1,?) "
-                "ON CONFLICT(preset,backend,bucket) DO UPDATE SET factor=excluded.factor,samples=1,updated_at=excluded.updated_at",
-                (preset, backend, self.bucket(height), float(factor), time.time()))
+                "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at,key_version) "
+                "VALUES(?,?,?,?,1,?,?) ON CONFLICT(preset,backend,bucket) DO UPDATE SET "
+                "factor=excluded.factor,samples=1,updated_at=excluded.updated_at,"
+                "key_version=excluded.key_version",
+                (preset, backend, self.bucket(height), float(factor), time.time(),
+                 SPEED_KEY_VERSION))
 
     def speed_update(self, preset: str, backend: str, height: int, real_factor: float, alpha: float = 0.3) -> float:
         if not (real_factor > 0):
             raise DatabaseError("speed factor must be positive")
         with self._tx() as c:
-            row = c.execute("SELECT factor,samples FROM speed_table WHERE preset=? AND backend=? AND bucket=?",
-                            (preset, backend, self.bucket(height))).fetchone()
+            row = c.execute(
+                "SELECT factor,samples FROM speed_table WHERE preset=? AND backend=? "
+                "AND bucket=? AND key_version=?",
+                (preset, backend, self.bucket(height), SPEED_KEY_VERSION),
+            ).fetchone()
             if row:
                 value = alpha * real_factor + (1 - alpha) * float(row["factor"])
                 samples = int(row["samples"]) + 1
@@ -394,10 +605,12 @@ class Store:
                 value = real_factor
                 samples = 1
             c.execute(
-                "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at) VALUES(?,?,?,?,?,?) "
-                "ON CONFLICT(preset,backend,bucket) DO UPDATE SET factor=excluded.factor,"
-                "samples=excluded.samples,updated_at=excluded.updated_at",
-                (preset, backend, self.bucket(height), value, samples, time.time()))
+                "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at,key_version) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(preset,backend,bucket) DO UPDATE SET "
+                "factor=excluded.factor,samples=excluded.samples,updated_at=excluded.updated_at,"
+                "key_version=excluded.key_version",
+                (preset, backend, self.bucket(height), value, samples, time.time(),
+                 SPEED_KEY_VERSION))
         return value
 
     # -- TMDb cache -----------------------------------------------------
@@ -422,21 +635,29 @@ class Store:
     def pending_commands(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM commands WHERE status IN ('pending','running') ORDER BY created_at").fetchall()
+                "SELECT * FROM commands WHERE status IN (?,?) ORDER BY created_at",
+                (command_status("pending"), command_status("running"))).fetchall()
         return [_decode_command(dict(r)) for r in rows]
 
     def command_done(self, cmd_id: str, *, error: str | None = None) -> None:
         with self._tx() as c:
             c.execute("UPDATE commands SET status=?, finished_at=?, error=? WHERE id=?",
-                      ("failed" if error else "done", time.time(), error, cmd_id))
+                      (command_status("failed" if error else "done"), time.time(), error, cmd_id))
 
-    def command_start(self, cmd_id: str) -> None:
+    def command_start(self, cmd_id: str) -> bool:
+        """Atomically claim a pending command.  False means another owner won."""
+
         with self._tx() as c:
-            c.execute("UPDATE commands SET status='running', started_at=? WHERE id=? AND status='pending'",
-                      (time.time(), cmd_id))
+            cur = c.execute(
+                "UPDATE commands SET status=?, started_at=? WHERE id=? AND status=?",
+                (command_status("running"), time.time(), cmd_id, command_status("pending")),
+            )
+            return cur.rowcount == 1
 
     # -- intents --------------------------------------------------------
     def create_intent(self, kind: str, job_id: str, payload: Mapping) -> str:
+        if kind not in INTENT_KINDS:
+            raise ValueError(f"unknown intent kind: {kind!r}")
         intent_id = "int_" + uuid.uuid4().hex
         now = time.time()
         with self._tx() as c:
@@ -445,9 +666,11 @@ class Store:
         return intent_id
 
     def pending_intents(self, kind: str | None = None) -> list[dict]:
-        sql = "SELECT * FROM intents WHERE status='pending'"
-        args: list[Any] = []
+        sql = "SELECT * FROM intents WHERE status=?"
+        args: list[Any] = [command_status("pending")]
         if kind:
+            if kind not in INTENT_KINDS:
+                raise ValueError(f"unknown intent kind: {kind!r}")
             sql += " AND kind=?"
             args.append(kind)
         with self._lock:
@@ -456,7 +679,10 @@ class Store:
 
     def complete_intent(self, intent_id: str) -> None:
         with self._tx() as c:
-            c.execute("UPDATE intents SET status='done',updated_at=? WHERE id=?", (time.time(), intent_id))
+            c.execute(
+                "UPDATE intents SET status=?,updated_at=? WHERE id=?",
+                (command_status("done"), time.time(), intent_id),
+            )
 
     # -- library / settings --------------------------------------------
     def get_library_cache(self, path: str, size: int, mtime: float) -> dict | None:

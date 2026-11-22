@@ -6,11 +6,14 @@ stream indexes as reported by ffprobe. Paths in the plan are absolute.
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "preset": "1080p-balanced-mp4",
   "action": "encode",
   "container": "mp4",
   "plan_version": 1,
+  "plan_schema": 2,
+  "config_generation": 7,
+  "preset_fingerprint": "8c4ad0e2b19f6a3d",
   "fallback_from": null,
   "source": {
     "path": "/srv/media/_pipeline/convert/movies/.../movie.mkv",
@@ -89,6 +92,17 @@ stream indexes as reported by ffprobe. Paths in the plan are absolute.
 ```
 
 Rules:
+- `schema`/`plan_schema` 2 is the current semantic generation. Plans without
+  it were written before the stated-colour contract and are re-planned before
+  execution, never silently interpreted under the new meaning.
+- `config_generation` and `preset_fingerprint` bind plan-defining values to
+  the generation and preset that produced them. Safety-critical settings are
+  not bound: current values apply to resumed jobs. A changed generation or
+  preset triggers a deliberate re-plan at PLANNED without consuming a retry.
+- `video.color` carries only stated values; a missing key means “not stated”,
+  not “unknown but required”. `audio[].channel_layout` and `target_channels`
+  were absent before Pass A and are not silently invented when re-reading an
+  old plan.
 - `action=remux` means video stream copy. It can be selected by SIZE-1
   (already efficient) or be the preset's action.
 - `container=mkv` implies MKV remux rules; audio/subtitle streams are

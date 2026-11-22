@@ -1,6 +1,15 @@
 # mediaflow production configuration.
 # Secrets are NEVER stored here. Put them in /etc/mediaflow/tmdb.env and
 # /etc/mediaflow/notify.env (root:mediaflow, 0640).
+#
+# Reload behaviour is defined once in mediaflow.config.KEY_CLASS:
+#   restart-required: root, state_dir, runtime_dir, ffmpeg, poll_seconds,
+#                     review_reminder_days, notify_cooldown_hours
+#   future-jobs:      append_tmdbid, stall_minutes, temp_sensor
+#   live:             all other keys
+# Restart-required keys keep their old effective value until the daemon is
+# restarted; status reports the pending hold. Secret files reload only on
+# restart. See docs/SPEC.md section 10.1.
 
 root = "/srv/media"
 ffmpeg = "/usr/lib/jellyfin-ffmpeg/ffmpeg"

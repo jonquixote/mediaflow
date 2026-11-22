@@ -39,6 +39,37 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
+## [Unreleased]
+
+### Added
+
+- One shared job-state vocabulary (`mediaflow.state`) used by database queries,
+  engine transitions, CLI/status, notifications and retention. RESTORED is
+  terminal history and no longer blocks a re-drop.
+- Authoritative configuration reload classification with atomic generations,
+  pending restart holds and plan generation/preset binding.
+- Enforced database schema versioning with backed-up, ordered, idempotent
+  migrations and explicit semantic versions for plans, speed rows and
+  capability files.
+
+### Changed
+
+- Publish space checks now keep the SAF-8 source-size envelope and add the
+  publish copy bytes separately instead of replacing the source reservation.
+- Legacy plans are deliberately re-planned; legacy speed rows are retained but
+  ignored until re-seeded; unversioned capability files are unknown.
+- `status --json` reports config generation, pending generation and restart
+  holds; `doctor` reports schema version and last migration backup.
+
+### Fixed
+
+- A restored job could reappear as an active job and silently block a new drop.
+- Invalid-config holds were not cleared by a later valid reload.
+- Mixed configuration generations could leave paths, guards, secrets and the
+  encoder on different values.
+- An old database could be silently restamped as current and a newer database
+  downgraded by an older binary.
+
 ## [1.0.0] - 2026-11-18
 
 ### Added

@@ -61,7 +61,7 @@ class _Config:
         self.min_bpp = 0.01
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.capabilities_path.write_text(
-            json.dumps(capabilities or {}), encoding="utf-8"
+            json.dumps({"capabilities_schema": 2, **(capabilities or {})}), encoding="utf-8"
         )
 
 

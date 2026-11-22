@@ -77,7 +77,11 @@ def test_ffmpeg_change_retest_is_cancellable_and_keeps_old_capabilities(tmp_path
     path, cfg = _config(tmp_path)
     caps_path = Path(cfg.capabilities_path)
     caps_path.parent.mkdir(parents=True, exist_ok=True)
-    original = {"ffmpeg_version": "old", "backends": {"qsv": {"hevc8": True}}}
+    original = {
+        "capabilities_schema": 2,
+        "ffmpeg_version": "old",
+        "backends": {"qsv": {"hevc8": True}},
+    }
     caps_path.write_text(json.dumps(original), encoding="utf-8")
     store = Store(cfg.db_path)
     store.initialize()

@@ -44,17 +44,46 @@ def test_plan_and_review_json_roundtrip(store):
 def test_active_job_lookup_and_terminal(store):
     a = store.create_job(preset="p", source_rel="rel", source_path="/x/rel")
     assert store.active_job_for("p", "rel")["id"] == a["id"]
-    store.transition(a["id"], "DONE", expect_from="DETECTED")
+    store.update_job(a["id"], state="DONE")
     assert store.active_job_for("p", "rel") is None
     b = store.create_job(preset="p", source_rel="rel", source_path="/x/rel")
     assert b["id"] != a["id"]
+
+
+@pytest.mark.parametrize("state", ["DONE", "FAILED", "RESTORED"])
+def test_all_terminal_states_are_inactive(store, state):
+    job = store.create_job(preset="p", source_rel="rel", source_path="/x/rel")
+    store.update_job(job["id"], state=state)
+    assert store.active_job_for("p", "rel") is None
+    assert store.list_jobs(include_done=False) == []
+
+
+def test_transition_rejects_impossible_and_accepts_recovery_edges(store):
+    job = store.create_job(preset="p", source_rel="rel", source_path="/x/rel")
+    store.update_job(job["id"], state="ENCODING")
+    # Recovery of an interrupted encode goes to PROBED.
+    assert store.transition(job["id"], "PROBED", expect_from="ENCODING")
+    assert store.transition(job["id"], "FAILED", expect_from="PROBED")
+    with pytest.raises(DatabaseError):
+        store.transition(job["id"], "ENCODING", expect_from="FAILED")
+    # Idempotent adoption writes are allowed.
+    store.update_job(job["id"], state="PUBLISHED")
+    assert store.transition(job["id"], "PUBLISHED", expect_from="PUBLISHED")
+
+
+def test_intent_kind_is_validated(store):
+    job = store.create_job(preset="p", source_rel="f", source_path="/x/f")
+    with pytest.raises(ValueError):
+        store.create_intent("bogus", job["id"], {})
 
 
 def test_command_queue(store):
     cid = store.enqueue_command("pause", {"now": True})
     pending = store.pending_commands()
     assert pending[0]["id"] == cid and pending[0]["payload"]["now"] is True
-    store.command_start(cid)
+    assert store.command_start(cid) is True
+    assert store.command_start(cid) is False  # no double execution
+    assert store.pending_commands()[0]["status"] == "running"
     store.command_done(cid)
     assert store.pending_commands() == []
 

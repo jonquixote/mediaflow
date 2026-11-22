@@ -5,6 +5,54 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Sandbox verification - 2026-11-22 (Pass C: state and configuration coherence)
+
+Baseline verified before changes: `main`/`origin/main` at
+`f4c77c8f38a60a101536e8082918a2e93e2a979c`, `pass-b-integration` at
+`639b523ffc3b84eac226ab3a64743bd31618e285`, and `scripts/check.sh` reporting
+`6 passed`, `782 passed` and `782 passed`. Python 3.14.4, pytest 9.2.0 and
+Jellyfin ffmpeg 8.1.3-Jellyfin were used; `/dev/dri/renderD128` was not
+accessible and no hardware test ran.
+
+Final command:
+
+```sh
+cd /srv/agent-work/mediaflow
+scripts/check.sh
+```
+
+Exact results:
+
+- traceability and generated invariants: `6 passed in 0.22s`
+- unit and integration: `818 passed in 42.52s`
+- full suite including slow/crash/chaos: `818 passed in 42.46s`
+
+The delta from the verified 782-test baseline is 36 regression tests.
+
+Cases exercised:
+
+- Shared state classification, exhaustive guard against unclassified states,
+  transition validation and recovery edges including ENCODED/VERIFIED restart.
+- RESTORED re-drop, active-job blocking, status/history agreement and no
+  terminal work-directory churn.
+- Config key classification completeness, live/restart behaviour, secret
+  redaction, successful reload clearing only `config-invalid`, active-operation
+  deferral and same-second fingerprint detection.
+- Plan generation/preset binding, deliberate re-plan without retry consumption,
+  disabled-preset hold and dry-run flips in both directions.
+- v1 database migration with backup preservation, idempotence, failure
+  rollback and retry, forward-version refusal, backup restore, legacy plan
+  fixtures, legacy speed-key isolation and unversioned capability handling.
+- Persistent machine holds after recovery, recovery idempotence, atomic command
+  claim and the SAF-8 publish copy reserve.
+
+Not verified here:
+
+- Real migration of the production database and real daemon restart with the
+  new generation model.
+- Hardware encode, SIGTERM/systemd recovery, VMAF and large-file memory
+  behavior remain on-hardware items in `docs/QUESTIONS.md`.
+
 ## Sandbox verification - 2026-11-21 (Pass B: shared supervision and bounded verification)
 
 Environment: Linux x86_64, Python 3.14.4, pytest 9.2.0 and

@@ -2353,7 +2353,7 @@ def build_plan(
         raise PlanError(f"unsupported fallback_from: {fallback_from!r}")
 
     plan = {
-        "schema": 1,
+        "schema": 2,
         "preset": _preset_id(preset_map),
         "action": action,
         "container": effective_container,

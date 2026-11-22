@@ -181,6 +181,29 @@ Never move files from `movies/` by hand while the daemon is running. Use
 | `deferred` | The exclusive slot was busy or a bounded probe was protection-deferred; retry later. |
 | `paused` | Nonterminal intentional pause; the stall clock is suspended. |
 
+Recovery follows the state and its interruption markers:
+
+| State / marker | Recovery |
+|---|---|
+| DETECTED/STABLE | Remove stale partial; re-check stability; no restart consumed. |
+| PROBED/PLANNED | Remove stale partial; re-plan safely; no restart consumed. |
+| ENCODING, no marker, never started | Return to PLANNED; no restart consumed. |
+| ENCODING, no marker, started | Remove partial; return to PROBED with one restart. |
+| ENCODING + `encode-shutdown` | Remove partial; return to PLANNED; no restart consumed. |
+| ENCODING + `encode-protection-interrupted` | Same controlled recovery as shutdown. |
+| ENCODED/VERIFIED, output missing | Re-plan from PROBED with one restart. |
+| ENCODED, verification interruption markers | Stay ENCODED; verification retried; no hash recorded. |
+| NAMED, matching library marker | Adopt PUBLISHED; no re-publish. |
+| PUBLISHED, trash found | Adopt RETIRED and write manifest. |
+| PUBLISHED, destination missing | Return to NAMED. |
+| RETIRED, manifest present | Archive stats/speed once, then DONE and clean work. |
+| DONE/FAILED/RESTORED | Clean work if present; history remains queryable. |
+| Pending `replace` intent | Re-run idempotent move, commit state, then complete intent. |
+| Pending `restore` intent | Re-run idempotent moves, commit RESTORED, then complete intent. |
+| `pending`/`running` command | Re-dispatch once via atomic claim; commands for missing jobs fail cleanly. |
+
+Recovery is idempotent: a second pass emits no new recovery events.
+
 Recovery follows the outcome, not just the state:
 
 - **Daemon shutdown during encoding:** the owned child is stopped and reaped,
@@ -199,6 +222,46 @@ Recovery follows the outcome, not just the state:
 - **Non-cooperative legacy worker:** the exclusive slot and job work directory
   remain held until that worker exits. Do not manually remove its work while
   it is alive.
+
+### Job states, holds and re-drops
+
+`mediaflow.state` is the single state vocabulary. Active and REVIEW jobs block
+a fresh drop of the same preset/source name; DONE, FAILED and RESTORED do not.
+A RESTORED job keeps its manifest, trash copies and history in status `history`
+and in `queue --json`; it is not a failure and is not counted in the active
+queue. Restoring again needs a fresh drop and a new job id.
+
+Configuration generation and persistent holds are shown by `status --json`:
+`config_generation`, `pending_config_generation`, `restart_required` and
+`paused_reasons`. A restart-required change is not an invalid config; it is a
+visible hold until the daemon restarts. FFmpeg-change and capability-unknown
+holds survive a restart until a complete capability run resolves them.
+
+### Upgrade, migration and rollback
+
+The database version is enforced at startup. An older database is backed up to
+`/var/lib/mediaflow/backup/` before ordered, transactional migrations; a newer
+database is refused without modification. Job history is never discarded. If
+a migration fails, the transaction rolls back and the backup remains. To
+rollback, stop the daemon, keep the current file for inspection, copy the
+newest `state-*.db` backup back as `state.db`, then start the daemon and run
+`doctor`; the ordered migrations will be applied again.
+
+Legacy records are handled deliberately: pre-stated-colour plans are
+re-planned before execution, legacy speed rows are retained but ignored until
+re-calibrated, and unversioned capability files are treated as unknown. See
+`docs/PLAN_SCHEMA.md` for the record format.
+
+### Publish and disk accounting
+
+Publish stages in `_pipeline/work/<job>/pub`. On the normal same-filesystem
+path the final step is a hard link followed by one `rename()` into `movies/`,
+so no additional copy space is needed. If hard links are unavailable, the
+output is copied; those bytes are reserved **in addition** to the normative
+`max(1.2 * source_size, min_free_gb)` admission envelope. A crash before the
+rename leaves the library untouched and recovery re-stages the publish; a
+crash after the rename is adopted only when the hidden marker and output hash
+match.
 
 ## 8. Heat, power and schedules
 

@@ -31,6 +31,28 @@ FFMPEG_DEFAULT = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 FFPROBE_DEFAULT = "/usr/lib/jellyfin-ffmpeg/ffprobe"
 RENDER_NODE = Path("/dev/dri/renderD128")
 
+#: Capability files gained an explicit schema in Pass C.  Older files may be
+#: read for diagnostics but must not establish backend facts.
+CAPABILITIES_SCHEMA = 2
+
+
+def capabilities_are_current(data: Any) -> bool:
+    """Whether a capability file was produced by tri-state probing."""
+
+    if not isinstance(data, dict):
+        return False
+    return data.get("capabilities_schema") in (CAPABILITIES_SCHEMA, str(CAPABILITIES_SCHEMA))
+
+
+def read_capabilities(path: str | Path) -> dict:
+    """Read a capability file, treating pre-version records as unknown."""
+
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if capabilities_are_current(data) else {}
+
 
 @dataclass
 class Check:
@@ -350,6 +372,7 @@ def run_capability_tests(
 
     ffmpeg = ffmpeg or str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
     results: dict[str, Any] = {
+        "capabilities_schema": CAPABILITIES_SCHEMA,
         "status": "ok",
         "state": OperationState.SUCCEEDED.value,
         "deferred": False,
@@ -784,9 +807,27 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
 
     # DB and backup
     try:
-        from .db import Store
+        from .db import SCHEMA_VERSION, Store
         store = Store(Path(getattr(config, "db_path")))
         store.integrity_check()
+        with store._lock:
+            version_row = store._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+            migration_row = store._conn.execute(
+                "SELECT value FROM meta WHERE key='last_migration_backup'"
+            ).fetchone()
+        current_version = int(version_row[0]) if version_row else 0
+        checks.append(Check(
+            "db-schema",
+            "ok" if current_version == SCHEMA_VERSION else "fail",
+            f"schema {current_version} (supported {SCHEMA_VERSION})",
+        ))
+        checks.append(Check(
+            "last-migration",
+            "ok" if migration_row else "warn",
+            f"backup {migration_row[0]}" if migration_row else "no schema migration performed",
+        ))
         backup = store.newest_backup(Path(getattr(config, "backup_dir")))
         store.close()
         if backup:
@@ -799,6 +840,23 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
             checks.append(Check("db-backup", "warn", "no backup yet"))
     except Exception as exc:
         checks.append(Check("db-integrity", "fail", f"refusing to trust state: {exc}"))
+
+    # configuration generation and reload classification
+    from .config import KEY_CLASS, ReloadClass
+    restart_keys = sorted(
+        key for key, value in KEY_CLASS.items()
+        if value is ReloadClass.RESTART_REQUIRED
+    )
+    checks.append(Check(
+        "config-generation", "ok",
+        f"generation {int(getattr(config, 'generation', 1) or 1)}",
+        {"generation": int(getattr(config, "generation", 1) or 1)},
+    ))
+    checks.append(Check(
+        "config-reload", "ok",
+        f"{len(KEY_CLASS)} keys classified; {len(restart_keys)} require restart",
+        {"restart_required": restart_keys},
+    ))
 
     # secrets in config and permissions
     if _config_has_secrets(config_path):

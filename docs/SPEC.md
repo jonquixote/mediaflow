@@ -48,6 +48,21 @@ library. `_pipeline/` contains `inbox/`, `convert/movies/<preset>/`, `work/`,
 locks under `/run/mediaflow/`. Directories are setgid `2775` and the service
 uses `UMask=0002`. A human moving an entry into a preset folder is the trigger.
 
+### 3.1 One state model and persisted generations
+
+`mediaflow.state` is the only definition of job states, review reasons, intent
+kinds, command statuses and legal transitions. Active, terminal, resumable,
+review and user-visible classifications, and the SQL placeholders used by the
+database, are generated from that model. `RESTORED` is terminal for scanning
+and queueing; its manifest, trash copies and history remain visible to status,
+listings and retention (STATE-1).
+
+`state.db` carries an enforced schema version. Older databases are backed up
+and migrated by ordered, idempotent, transactional steps; newer databases are
+refused before modification. Plans, speed rows and capability files carry
+explicit semantic generations rather than relying on unchanged JSON shapes
+(COMPAT-1).
+
 SQLite `state.db` is authoritative. WAL, `synchronous=FULL` and
 `busy_timeout=5000`; integrity check at startup; nightly backup keeping three
 generations. The fsync chain is: write and fsync file, fsync directory, commit
@@ -62,8 +77,13 @@ lock when the daemon is down. Secrets live only in env files.
 DETECTED -> STABLE -> PROBED -> PLANNED -> ENCODING -> ENCODED -> VERIFIED
          -> NAMED -> PUBLISHED -> RETIRED -> DONE
    ENCODED -> PLANNED (SIZE-2 fallback)
-   any state -> REVIEW | FAILED
+   PUBLISHED -> RETIRED -> DONE -> RESTORED
+   any active state -> REVIEW | FAILED
 ```
+
+A `RESTORED` job is terminal history: the same preset/source path may be
+dropped again and creates a fresh job. Active and REVIEW jobs still block a
+fresh drop.
 
 The poller scans every 30 seconds. STABLE waits for unchanged size and mtime
 and no temp markers. PROBED validates the container allowlist, finds the main
@@ -184,6 +204,9 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-12** liveness: restart limit, stall detector, ffmpeg-version change pauses until capability tests pass.
 - **SAF-13** untrusted input: protocol whitelist, format allowlist, regular files only.
 - **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
+- **STATE-1** one shared job-state vocabulary; RESTORED is terminal history and does not block a re-drop.
+- **CONFIG-1** keyed reload classification, atomic generations and plan binding; restart-required changes stay visibly pending.
+- **COMPAT-1** enforced schema versions, backed-up ordered migrations and explicit semantic generations for plans/speed/capabilities.
 - **SUP-1** bounded verification scans; packet bytes and counts are aggregated without retaining packet records; presentation end is the maximum packet pts + duration.
 - **SUP-2** cancellation/protection wins over late success; partial results are discarded; children and exclusive resources remain owned until the worker exits.
 - **SUP-3** typed terminal outcomes; only uninterrupted success may publish or seed; controlled encode recovery does not consume a restart.
@@ -219,6 +242,23 @@ sent for failures, lingering reviews, paused queues and purge summaries.
 Secrets live only in `tmdb.env` and `notify.env`, mode 0640 root:mediaflow.
 Invalid reloads keep the previous good config. A dry-run flip is logged and
 re-plans PLANNED jobs once.
+
+#### 10.1 Reload classification
+
+The machine-readable authority is `KEY_CLASS` in `mediaflow.config`. The table
+below is its human-readable mirror; the code is authoritative if they differ.
+
+| Class | Keys | Effect |
+|---|---|---|
+| restart-required | `root`, `state_dir`, `runtime_dir`, `ffmpeg`, `poll_seconds`, `review_reminder_days`, `notify_cooldown_hours` | Old effective value stays until restart; status shows `restart-required:*`. |
+| future-jobs | `append_tmdbid`, `stall_minutes`, `temp_sensor` | Captured per operation/job; new operations use the new value. |
+| live | `ffprobe`, `dry_run`, `stable_seconds`, `trash_retention_days`, `failed_retention_days`, `min_free_gb`, `root_min_free_gb`, `max_trash_gb`, `space_watchdog_seconds`, `pause_when_jellyfin_transcoding`, `pause_on_battery`, `pause_method`, `start_if_temp_below_c`, `thermal_pause_c`, `thermal_resume_c`, `progress_seconds`, `max_restarts`, `min_output_kbps`, `min_bpp`, `jellyfin_user` | Applied between operations at the next gate/check. |
+| rejected | any secret-like or unknown key | `config.toml` never holds secrets; unknown keys are errors. |
+
+`dry_run = true` is a start gate: PLANNED jobs re-plan once in either
+direction. Work already past PLANNING completes under its recorded plan; no
+new move starts while dry-run is on. Secret files are reloaded only on daemon
+restart, and their values never appear in reload events, status or diffs.
 
 No new configuration key is required for shared supervision: the existing
 `stall_minutes`, `space_watchdog_seconds`, `min_free_gb`, `min_free_gb / 2`

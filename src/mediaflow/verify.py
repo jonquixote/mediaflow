@@ -273,7 +273,7 @@ def _plan_view(
 ) -> tuple[str, str, Mapping, float, Mapping, list[Mapping], list[Mapping]]:
     if not isinstance(plan, Mapping):
         raise PlanError(f"plan must be a mapping, got {type(plan).__name__}")
-    if plan.get("schema") not in (None, 1, "1"):
+    if plan.get("schema") not in (None, 1, "1", 2, "2"):
         raise PlanError(f"unsupported plan schema: {plan.get('schema')!r}")
     container = _container(plan)
     action = str(_require(plan, "action", "plan")).strip().lower()

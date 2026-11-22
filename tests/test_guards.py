@@ -258,6 +258,22 @@ def test_mid_encode_uses_half_the_minimum_reserve(cfg: GuardConfig):
     assert mid.ok is True
 
 
+def test_publish_copy_reserve_is_additive_to_the_source_envelope(cfg: GuardConfig):
+    """SAF-8: a small output never replaces the source-size reservation."""
+
+    disk = FakeDisk(free=49 * GIB)
+    status, decision = check_space(
+        cfg,
+        source_size=40 * GIB,
+        additional_required_bytes=2 * GIB,
+        disk_usage=disk,
+    )
+    # max(1.2 * 40 GiB, 40 GiB) + 2 GiB = 50 GiB
+    assert status.required_bytes == 50 * GIB
+    assert status.additional_required_bytes == 2 * GIB
+    assert "space-low" in decision.reasons
+
+
 def test_net_remaining_work_is_additive_to_the_emergency_reserve(
     cfg: GuardConfig,
 ):

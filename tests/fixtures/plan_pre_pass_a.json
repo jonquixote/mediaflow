@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "preset": "legacy-preset",
+  "action": "encode",
+  "container": "mp4",
+  "plan_version": 1,
+  "source": {
+    "path": "/tmp/movie.mkv",
+    "duration": 60.0,
+    "size_bytes": 1000,
+    "video_bytes": 900,
+    "main_video_index": 0
+  },
+  "video": {
+    "index": 0,
+    "codec": "h264",
+    "width": 1920,
+    "height": 1080,
+    "target_width": 1280,
+    "target_height": 720,
+    "pix_fmt": "yuv420p",
+    "color": {"primaries": null, "transfer": null, "space": null, "range": "tv"}
+  },
+  "audio": [
+    {"index": 1, "source_codec": "dts", "channels": 6, "action": "transcode", "codec": "eac3", "bitrate": 448}
+  ],
+  "subtitles": [],
+  "sidecars": [],
+  "ext": "mp4",
+  "destination_rel": "Movie (2001)/Movie (2001).mp4",
+  "dry_run": false,
+  "review": null
+}
