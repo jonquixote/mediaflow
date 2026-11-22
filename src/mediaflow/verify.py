@@ -29,15 +29,32 @@ ffprobe/ffmpeg call carries the protocol whitelist from [SAF-13].
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import logging
 import math
 import stat
 import subprocess
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from .supervision import (
+    NON_SUCCESS_STATES,
+    OperationCancelled,
+    OperationDeferred,
+    OperationInterrupted,
+    OperationState,
+    ProtectionAction,
+    ProtectionDecision,
+    SupervisionPolicy,
+    byte_work_value,
+    run_process,
+    supervise_callable,
+)
 
 from .ffmpeg import (
     FFMPEG,
@@ -109,6 +126,70 @@ class VideoVerifyResult:
     bpp_frame_basis: str | None = None
     bpp_note: str | None = None
     warnings: list[str] = field(default_factory=list)
+    #: Typed operation outcome.  ``ok`` is true only for a completed,
+    #: uninterrupted verification.
+    state: OperationState = OperationState.SUCCEEDED
+    interrupted: bool = False
+    cancelled: bool = False
+    deferred: bool = False
+    stalled: bool = False
+    timeout_type: str | None = None
+    timeout_phase: str | None = None
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PacketScanSummary:
+    """Bounded aggregate of one video packet scan.
+
+    ``presentation_end`` is the maximum ``pts + duration`` observed across
+    all packets.  It is deliberately not the timestamp of the last packet:
+    packet order is not presentation order.
+    """
+
+    packet_count: int
+    video_bytes: int
+    presentation_end: float | None = None
+    packets: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class FrameScanSummary:
+    """Bounded aggregate of one decoded-video frame scan."""
+
+    frame_count: int
+    presentation_end: float | None = None
+
+
+@dataclass(frozen=True)
+class _OperationOutcome:
+    """Internal typed outcome for one supervised verification step."""
+
+    state: OperationState
+    value: Any = None
+    reason: str | None = None
+    reasons: tuple[str, ...] = ()
+    timeout_type: str | None = None
+    phase: str = ""
+
+
+class VerificationOperationError(RuntimeError):
+    """A verification step ended before it could produce a valid result."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        state: OperationState,
+        reasons: tuple[str, ...] = (),
+        timeout_type: str | None = None,
+        phase: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.state = state
+        self.reasons = tuple(reasons)
+        self.timeout_type = timeout_type
+        self.phase = phase
 
 
 class ProbeError(RuntimeError):
@@ -222,6 +303,8 @@ def _plan_view(
 
 
 def _run(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess:
+    """Compatibility helper for callers outside the production verifier."""
+
     return subprocess.run(
         argv,
         stdin=subprocess.DEVNULL,
@@ -232,8 +315,73 @@ def _run(argv: list[str], timeout: float | None) -> subprocess.CompletedProcess:
     )
 
 
+def _event_is_set(event: Any) -> bool:
+    if event is None:
+        return False
+    try:
+        return bool(event.is_set())
+    except Exception:
+        return False
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or text.casefold() in {"n/a", "nan", "none", "unknown"}:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _step_policy(
+    base: SupervisionPolicy | None,
+    timeout: float | None,
+    *,
+    progress: bool,
+) -> SupervisionPolicy:
+    """Build one step policy without losing the caller's type distinctions."""
+
+    base = base or SupervisionPolicy()
+    overall = timeout if timeout is not None and timeout > 0 else base.overall_timeout
+    return SupervisionPolicy(
+        stall_timeout=(base.stall_timeout if progress else None),
+        startup_grace=base.startup_grace,
+        finalization_grace=base.finalization_grace,
+        overall_timeout=overall,
+        monitor_interval=base.monitor_interval,
+        terminate_grace=base.terminate_grace,
+    )
+
+
+def _raise_terminal(outcome: _OperationOutcome) -> None:
+    """Raise for an interrupted/deferred/cancelled/timed-out operation."""
+
+    if outcome.state is OperationState.SUCCEEDED:
+        return
+    if outcome.state is OperationState.FAILED:
+        return
+    raise VerificationOperationError(
+        outcome.reason or f"verification {outcome.phase} did not complete",
+        state=outcome.state,
+        reasons=outcome.reasons,
+        timeout_type=outcome.timeout_type,
+        phase=outcome.phase,
+    )
+
+
 def _probe_json(
-    path: Path, ffprobe: str, timeout: float | None
+    path: Path,
+    ffprobe: str,
+    timeout: float | None,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
 ) -> dict[str, Any]:
     argv = [
         str(ffprobe),
@@ -247,19 +395,29 @@ def _probe_json(
         "json",
         str(path),
     ]
-    try:
-        proc = _run(argv, timeout)
-    except subprocess.TimeoutExpired:
-        raise ProbeError(f"ffprobe timed out after {timeout}s") from None
-    except OSError as exc:
-        raise ProbeError(f"could not run ffprobe: {exc}") from None
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip()[-1000:]
-        raise ProbeError(f"ffprobe failed (rc={proc.returncode}): {detail}")
-    if not (proc.stdout or "").strip():
+    process = run_process(
+        argv,
+        policy=_step_policy(supervision_policy, timeout, progress=False),
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+        stdout_limit=16 * 1024 * 1024,
+    )
+    outcome = _OperationOutcome(
+        state=process.state,
+        reason=process.reason,
+        reasons=process.reasons,
+        timeout_type=process.timeout_type,
+        phase="probe",
+    )
+    _raise_terminal(outcome)
+    if process.state is not OperationState.SUCCEEDED:
+        detail = (process.stderr or "").strip()[-1000:]
+        raise ProbeError(f"ffprobe failed (rc={process.returncode}): {detail}")
+    if not (process.stdout or "").strip():
         raise ProbeError("ffprobe produced no JSON")
     try:
-        data = json.loads(proc.stdout)
+        data = json.loads(process.stdout)
     except json.JSONDecodeError as exc:
         raise ProbeError(f"ffprobe produced invalid JSON: {exc}") from None
     if not isinstance(data, dict):
@@ -267,12 +425,21 @@ def _probe_json(
     return data
 
 
-def _probe_video_packets(
+def _scan_video_packets(
     path: Path,
     ffprobe: str,
     timeout: float | None,
     selector: str = "v:0",
-) -> list[dict[str, Any]]:
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
+    progress_cb: ProgressCallback | None = None,
+    collect_packets: bool = False,
+) -> _OperationOutcome:
+    """Stream and aggregate one video packet scan without buffering it."""
+
     argv = [
         str(ffprobe),
         "-v",
@@ -284,28 +451,115 @@ def _probe_video_packets(
         "-show_entries",
         "packet=pts_time,duration_time,size",
         "-of",
-        "json",
+        "csv=p=0",
         str(path),
     ]
-    try:
-        proc = _run(argv, timeout)
-    except subprocess.TimeoutExpired:
-        raise ProbeError(f"ffprobe packet scan timed out after {timeout}s") from None
-    except OSError as exc:
-        raise ProbeError(f"could not run ffprobe: {exc}") from None
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip()[-1000:]
-        raise ProbeError(f"ffprobe packet scan failed (rc={proc.returncode}): {detail}")
-    if not (proc.stdout or "").strip():
-        raise ProbeError("ffprobe packet scan produced no JSON")
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise ProbeError(f"ffprobe packet scan produced invalid JSON: {exc}") from None
-    packets = data.get("packets") if isinstance(data, dict) else None
-    if not isinstance(packets, list):
-        raise ProbeError("ffprobe packet scan has no packets list")
-    return [p for p in packets if isinstance(p, dict)]
+    count = 0
+    total_bytes = 0
+    presentation_end: float | None = None
+    compatibility_packets: list[dict[str, Any]] = []
+
+    def parse(line: str, _state: dict[str, str]) -> Mapping[str, Any] | None:
+        nonlocal count, total_bytes, presentation_end
+        text = line.strip()
+        if not text:
+            return None
+        try:
+            row = next(csv.reader([text]))
+        except (csv.Error, StopIteration):
+            return None
+        if not row or not any(str(value).strip() for value in row):
+            return None
+        pts = _finite_float(row[0]) if len(row) > 0 else None
+        duration = _finite_float(row[1]) if len(row) > 1 else None
+        size = _int(row[2]) if len(row) > 2 else None
+        count += 1
+        if size is not None and size > 0:
+            total_bytes += size
+        if pts is not None:
+            end = pts + max(0.0, duration or 0.0)
+            presentation_end = end if presentation_end is None else max(presentation_end, end)
+        if collect_packets:
+            compatibility_packets.append(
+                {
+                    "pts_time": row[0] if len(row) > 0 else None,
+                    "duration_time": row[1] if len(row) > 1 else None,
+                    "size": row[2] if len(row) > 2 else None,
+                }
+            )
+        return {
+            "phase": "packet-scan",
+            "packets": count,
+            "packet_count": count,
+            "bytes": total_bytes,
+            "work_progress": count,
+            "work_dimension": "packet",
+        }
+
+    process = run_process(
+        argv,
+        policy=_step_policy(supervision_policy, timeout, progress=True),
+        progress_parser=parse,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+    outcome = _OperationOutcome(
+        state=process.state,
+        reason=process.reason,
+        reasons=process.reasons,
+        timeout_type=process.timeout_type,
+        phase="packet-scan",
+    )
+    if process.state is OperationState.SUCCEEDED:
+        outcome = _OperationOutcome(
+            state=OperationState.SUCCEEDED,
+            value=PacketScanSummary(
+                packet_count=count,
+                video_bytes=total_bytes,
+                presentation_end=presentation_end,
+                packets=tuple(compatibility_packets),
+            ),
+            phase="packet-scan",
+        )
+    elif process.state is OperationState.FAILED:
+        detail = (process.stderr or "").strip()[-1000:]
+        outcome = _OperationOutcome(
+            state=OperationState.FAILED,
+            reason=f"ffprobe packet scan failed (rc={process.returncode}): {detail}",
+            phase="packet-scan",
+        )
+    return outcome
+
+
+def _probe_video_packets(
+    path: Path,
+    ffprobe: str,
+    timeout: float | None,
+    selector: str = "v:0",
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning the historical packet-list shape.
+
+    Production verification uses :func:`_scan_video_packets`, whose memory
+    use is independent of the number of packets.  This wrapper is retained
+    for small callers that explicitly need individual packet records.
+    """
+
+    outcome = _scan_video_packets(
+        path,
+        ffprobe,
+        timeout,
+        selector,
+        collect_packets=True,
+    )
+    _raise_terminal(outcome)
+    if outcome.state is not OperationState.SUCCEEDED:
+        raise ProbeError(outcome.reason or "ffprobe packet scan failed")
+    summary = outcome.value
+    if not isinstance(summary, PacketScanSummary):
+        raise ProbeError("ffprobe packet scan produced no summary")
+    return [dict(packet) for packet in summary.packets]
 
 
 def video_packet_bytes(
@@ -324,20 +578,31 @@ def video_packet_bytes(
     index = int(stream_index)
     if index < 0:
         raise ValueError("stream_index must be non-negative")
-    packets = _probe_video_packets(Path(path), ffprobe, timeout, selector=str(index))
-    return sum(max(0, _int(packet.get("size")) or 0) for packet in packets)
+    outcome = _scan_video_packets(
+        Path(path), ffprobe, timeout, selector=str(index)
+    )
+    _raise_terminal(outcome)
+    if outcome.state is not OperationState.SUCCEEDED:
+        raise ProbeError(outcome.reason or "ffprobe packet scan failed")
+    summary = outcome.value
+    if not isinstance(summary, PacketScanSummary):
+        raise ProbeError("ffprobe packet scan produced no summary")
+    return summary.video_bytes
 
 
-def _count_decoded_frames(
+def _scan_decoded_frames(
     path: Path,
     ffprobe: str,
     timeout: float | None,
-) -> int | None:
-    """Decode the video stream and count the frames that are presented.
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
+    progress_cb: ProgressCallback | None = None,
+) -> _OperationOutcome:
+    """Decode and count video frames incrementally."""
 
-    This is the expensive fallback used when the container does not record
-    a frame count.  It returns ``None`` when ffprobe cannot answer.
-    """
     argv = [
         str(ffprobe),
         "-v",
@@ -346,32 +611,112 @@ def _count_decoded_frames(
         PROTOCOL_WHITELIST,
         "-select_streams",
         "v:0",
-        "-count_frames",
+        "-show_frames",
         "-show_entries",
-        "stream=nb_read_frames",
+        "frame=best_effort_timestamp_time,pkt_duration_time",
         "-of",
-        "json",
+        "csv=p=0",
         str(path),
     ]
-    try:
-        proc = _run(argv, timeout)
-    except subprocess.TimeoutExpired:
+    count = 0
+    presentation_end: float | None = None
+
+    def parse(line: str, _state: dict[str, str]) -> Mapping[str, Any] | None:
+        nonlocal count, presentation_end
+        text = line.strip()
+        if not text:
+            return None
+        try:
+            row = next(csv.reader([text]))
+        except (csv.Error, StopIteration):
+            return None
+        if not row or not any(str(value).strip() for value in row):
+            return None
+        pts = _finite_float(row[0]) if len(row) > 0 else None
+        duration = _finite_float(row[1]) if len(row) > 1 else None
+        count += 1
+        if pts is not None:
+            end = pts + max(0.0, duration or 0.0)
+            presentation_end = end if presentation_end is None else max(presentation_end, end)
+        return {
+            "phase": "frame-scan",
+            "frames": count,
+            "frame_count": count,
+            "work_progress": count,
+            "work_dimension": "frame",
+        }
+
+    process = run_process(
+        argv,
+        policy=_step_policy(supervision_policy, timeout, progress=True),
+        progress_parser=parse,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+    outcome = _OperationOutcome(
+        state=process.state,
+        reason=process.reason,
+        reasons=process.reasons,
+        timeout_type=process.timeout_type,
+        phase="frame-scan",
+    )
+    if process.state is OperationState.SUCCEEDED:
+        outcome = _OperationOutcome(
+            state=OperationState.SUCCEEDED,
+            value=FrameScanSummary(
+                frame_count=count,
+                presentation_end=presentation_end,
+            ),
+            phase="frame-scan",
+        )
+    elif process.state is OperationState.FAILED:
+        detail = (process.stderr or "").strip()[-1000:]
+        outcome = _OperationOutcome(
+            state=OperationState.FAILED,
+            reason=f"ffprobe frame scan failed (rc={process.returncode}): {detail}",
+            phase="frame-scan",
+        )
+    return outcome
+
+
+def _count_decoded_frames(
+    path: Path,
+    ffprobe: str,
+    timeout: float | None,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
+    progress_cb: ProgressCallback | None = None,
+) -> int | None:
+    """Decode the video stream and count the frames that are presented.
+
+    This is the expensive fallback used when the container does not record
+    a frame count.  It returns ``None`` when ffprobe cannot answer.  A
+    cancellation, protection interruption or timeout remains a typed
+    exception and is never flattened into an unknown frame count.
+    """
+
+    outcome = _scan_decoded_frames(
+        path,
+        ffprobe,
+        timeout,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+        supervision_policy=supervision_policy,
+        progress_cb=progress_cb,
+    )
+    _raise_terminal(outcome)
+    if outcome.state is not OperationState.SUCCEEDED:
         return None
-    except OSError:
+    summary = outcome.value
+    if not isinstance(summary, FrameScanSummary):
         return None
-    if proc.returncode != 0:
-        return None
-    try:
-        data = json.loads(proc.stdout or "")
-    except json.JSONDecodeError:
-        return None
-    streams = data.get("streams") if isinstance(data, dict) else None
-    if not isinstance(streams, list) or not streams:
-        return None
-    frames = _int(streams[0].get("nb_read_frames"))
-    if frames is None or frames <= 0:
-        return None
-    return frames
+    return summary.frame_count if summary.frame_count > 0 else None
 
 
 def _presented_frame_count(
@@ -380,6 +725,12 @@ def _presented_frame_count(
     timeout: float | None,
     video_stream: Mapping[str, Any],
     duration: float,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
+    progress_cb: ProgressCallback | None = None,
 ) -> tuple[int | None, str | None, str | None]:
     """Return ``(frames, basis, note)`` for the presented video frame count.
 
@@ -404,7 +755,16 @@ def _presented_frame_count(
     if frames is not None and frames > 0:
         return frames, "container", None
 
-    decoded = _count_decoded_frames(path, ffprobe, timeout)
+    decoded = _count_decoded_frames(
+        path,
+        ffprobe,
+        timeout,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+        supervision_policy=supervision_policy,
+        progress_cb=progress_cb,
+    )
     if decoded is not None and decoded > 0:
         return decoded, "decoded", None
 
@@ -562,38 +922,100 @@ def _check_subtitle_tracks(
 
 
 def _sha256_file(
-    path: Path, progress_cb: ProgressCallback | None
+    path: Path,
+    progress_cb: ProgressCallback | None,
+    *,
+    timeout: float | None = None,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
 ) -> tuple[str, str | None]:
-    digest = hashlib.sha256()
-    try:
+    """Hash a file through the shared callable supervision boundary."""
+
+    def operation(
+        report: Callable[[Mapping[str, Any]], None],
+        stop_event: threading.Event,
+    ) -> str:
+        digest = hashlib.sha256()
         total = path.stat().st_size
         done = 0
         with path.open("rb") as handle:
             while True:
+                if _event_is_set(cancel_event) or stop_event.is_set():
+                    raise OperationCancelled("verification hashing cancelled")
+                while _event_is_set(pause_event):
+                    if _event_is_set(cancel_event) or stop_event.is_set():
+                        raise OperationCancelled("verification hashing cancelled")
+                    time.sleep(0.05)
                 chunk = handle.read(HASH_CHUNK_SIZE)
                 if not chunk:
                     break
                 digest.update(chunk)
                 done += len(chunk)
                 percent = (done / total * 100.0) if total else 100.0
-                _notify(
-                    progress_cb,
-                    {"phase": "hashing", "percent": percent, "bytes": done},
+                report(
+                    {
+                        "phase": "hashing",
+                        "percent": percent,
+                        "bytes": done,
+                        "work_progress": done,
+                        "work_dimension": "bytes",
+                    }
                 )
-    except OSError as exc:
-        return "", f"could not hash output: {exc}"
-    if total == 0:
-        _notify(progress_cb, {"phase": "hashing", "percent": 100.0, "bytes": 0})
-    return digest.hexdigest(), None
+        if total == 0:
+            report(
+                {
+                    "phase": "hashing",
+                    "percent": 100.0,
+                    "bytes": 0,
+                    "work_progress": 0,
+                    "work_dimension": "bytes",
+                }
+            )
+        return digest.hexdigest()
+
+    supervised = supervise_callable(
+        operation,
+        policy=_step_policy(supervision_policy, timeout, progress=True),
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+        extractor=byte_work_value,
+    )
+    outcome = _OperationOutcome(
+        state=supervised.state,
+        value=supervised.value,
+        reason=supervised.reason,
+        reasons=supervised.reasons,
+        timeout_type=supervised.timeout_type,
+        phase="hashing",
+    )
+    _raise_terminal(outcome)
+    if outcome.state is not OperationState.SUCCEEDED:
+        return "", f"could not hash output: {outcome.reason or 'hash failed'}"
+    return str(outcome.value or ""), None
 
 
 def _decode_check(
-    path: Path, ffmpeg: str, timeout: float | None
+    path: Path,
+    ffmpeg: str,
+    timeout: float | None,
+    *,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
+    progress_cb: ProgressCallback | None = None,
 ) -> tuple[bool, str]:
+    """Decode all video and audio through the shared process supervisor."""
+
     argv = [
         str(ffmpeg),
         "-v",
         "error",
+        "-nostats",
         "-xerror",
         "-protocol_whitelist",
         PROTOCOL_WHITELIST,
@@ -611,17 +1033,71 @@ def _decode_check(
         "-f",
         "null",
         "-",
+        "-progress",
+        "pipe:1",
     ]
-    try:
-        proc = _run(argv, timeout)
-    except subprocess.TimeoutExpired:
-        return False, f"decode test timed out after {timeout}s"
-    except OSError as exc:
-        return False, f"could not run decode test: {exc}"
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip()[-2000:]
-        return False, f"decode test failed (rc={proc.returncode}): {detail}"
-    stderr = (proc.stderr or "").strip()
+    frame = 0
+    out_time_us = 0
+
+    def parse(line: str, _state: dict[str, str]) -> Mapping[str, Any] | None:
+        nonlocal frame, out_time_us
+        text = line.strip()
+        if not text or "=" not in text:
+            return None
+        key, raw = text.split("=", 1)
+        if key == "frame":
+            value = _finite_float(raw)
+            if value is None:
+                return None
+            frame = int(value)
+            return {
+                "phase": "decoding",
+                "frame": frame,
+                "frames": frame,
+                "work_progress": frame,
+                "work_dimension": "frame",
+            }
+        if key == "out_time_us":
+            value = _finite_float(raw)
+            if value is None:
+                return None
+            out_time_us = int(value)
+            return {
+                "phase": "decoding",
+                "out_time_seconds": out_time_us / 1_000_000.0,
+                "work_progress": out_time_us,
+                "work_dimension": "time",
+            }
+        if key == "progress" and raw == "end":
+            return {
+                "phase": "decoding",
+                "finalizing": True,
+                "work_progress": frame,
+                "work_dimension": "frame",
+            }
+        return None
+
+    process = run_process(
+        argv,
+        policy=_step_policy(supervision_policy, timeout, progress=True),
+        progress_parser=parse,
+        progress_cb=progress_cb,
+        cancel_event=cancel_event,
+        pause_event=pause_event,
+        monitor=monitor,
+    )
+    outcome = _OperationOutcome(
+        state=process.state,
+        reason=process.reason,
+        reasons=process.reasons,
+        timeout_type=process.timeout_type,
+        phase="decode",
+    )
+    _raise_terminal(outcome)
+    if outcome.state is not OperationState.SUCCEEDED:
+        detail = (process.stderr or "").strip()[-2000:]
+        return False, f"decode test failed (rc={process.returncode}): {detail}"
+    stderr = (process.stderr or "").strip()
     if stderr:
         return False, f"decode test wrote to stderr: {stderr[-2000:]}"
     return True, ""
@@ -810,6 +1286,10 @@ def verify_output(
     min_bpp: float = 0.01,
     ffmpeg_timeout: float = 3600,
     progress_cb: ProgressCallback | None = None,
+    cancel_event: Any = None,
+    pause_event: Any = None,
+    monitor: Any = None,
+    supervision_policy: SupervisionPolicy | None = None,
 ) -> VideoVerifyResult:
     """Run every SAF-2 output check without modifying the output file.
 
@@ -833,30 +1313,94 @@ def verify_output(
     path = Path(output).expanduser().absolute()
     failures: list[str] = []
     result = VideoVerifyResult()
+
+    # The caller's event is an external pause request.  Machine protection
+    # has its own event, so the two sources can compose without either one
+    # clearing the other.  The combined monitor is the sole owner of the
+    # machine-pause event; individual workers only observe it.
+    machine_pause = threading.Event()
+
+    def combined_monitor() -> ProtectionDecision:
+        if monitor is None:
+            decision = ProtectionDecision(ProtectionAction.CONTINUE)
+        else:
+            decision = monitor()
+        external_pause = _event_is_set(pause_event)
+        reasons = list(decision.reasons)
+        if external_pause and "user-paused" not in reasons:
+            reasons.append("user-paused")
+        if decision.action is ProtectionAction.TERMINATE or decision.action is ProtectionAction.DEFER:
+            machine_pause.clear()
+            return ProtectionDecision(
+                decision.action,
+                tuple(reasons),
+                detail=decision.detail,
+                kind=decision.kind,
+            )
+        if external_pause or decision.action is ProtectionAction.PAUSE:
+            machine_pause.set()
+            return ProtectionDecision(
+                ProtectionAction.PAUSE,
+                tuple(reasons),
+                detail=decision.detail,
+                kind=decision.kind,
+            )
+        machine_pause.clear()
+        return decision
+
+    def terminal_result(exc: VerificationOperationError) -> VideoVerifyResult:
+        result.state = exc.state
+        result.interrupted = exc.state is OperationState.INTERRUPTED
+        result.cancelled = exc.state is OperationState.CANCELLED
+        result.deferred = exc.state is OperationState.DEFERRED
+        result.stalled = exc.state is OperationState.STALLED
+        result.timeout_type = exc.timeout_type
+        result.timeout_phase = exc.phase or None
+        result.reasons = tuple(exc.reasons)
+        result.ok = False
+        result.failures = [*failures, str(exc)]
+        _notify(progress_cb, {"phase": "verifying", "percent": 100.0})
+        return result
+
     _notify(progress_cb, {"phase": "verifying", "percent": 0.0})
 
     # -- 1. output file guards ------------------------------------------
     if path.is_symlink():
         failures.append(f"output is a symlink, not a regular file: {path}")
+        result.state = OperationState.FAILED
         result.failures = failures
         return result
     try:
         stat_result = path.stat()
     except FileNotFoundError:
         failures.append(f"output does not exist: {path}")
+        result.state = OperationState.FAILED
         result.failures = failures
         return result
     except OSError as exc:
         failures.append(f"cannot stat output: {exc}")
+        result.state = OperationState.FAILED
         result.failures = failures
         return result
     if not stat.S_ISREG(stat_result.st_mode):
         failures.append(f"output is not a regular file: {path}")
+        result.state = OperationState.FAILED
         result.failures = failures
         return result
 
     result.output_size = stat_result.st_size
-    sha256, hash_error = _sha256_file(path, progress_cb)
+    try:
+        sha256, hash_error = _sha256_file(
+            path,
+            progress_cb,
+            timeout=timeout,
+            cancel_event=cancel_event,
+            pause_event=machine_pause,
+            monitor=combined_monitor,
+            supervision_policy=supervision_policy,
+        )
+    except VerificationOperationError as exc:
+        return terminal_result(exc)
     result.sha256 = sha256
     if hash_error:
         failures.append(hash_error)
@@ -864,15 +1408,27 @@ def verify_output(
 
     if result.output_size == 0:
         failures.append("output is empty (zero bytes)")
+        result.state = OperationState.FAILED
         result.failures = failures
         _notify(progress_cb, {"phase": "verifying", "percent": 100.0})
         return result
 
     # -- 2. ffprobe ------------------------------------------------------
     try:
-        probe = _probe_json(path, ffprobe, timeout)
+        probe = _probe_json(
+            path,
+            ffprobe,
+            timeout,
+            cancel_event=cancel_event,
+            pause_event=machine_pause,
+            monitor=combined_monitor,
+            supervision_policy=supervision_policy,
+        )
+    except VerificationOperationError as exc:
+        return terminal_result(exc)
     except ProbeError as exc:
         failures.append(str(exc))
+        result.state = OperationState.FAILED
         result.failures = failures
         _notify(progress_cb, {"phase": "verifying", "percent": 100.0})
         return result
@@ -931,36 +1487,41 @@ def verify_output(
             f"{source_duration:.3f}s by more than {tolerance:.3f}s"
         )
 
-    # -- video packets: sizes and last frame -----------------------------
+    # -- video packets: sizes and presentation tail ----------------------
+    packet_outcome = _scan_video_packets(
+        path,
+        ffprobe,
+        timeout,
+        cancel_event=cancel_event,
+        pause_event=machine_pause,
+        monitor=combined_monitor,
+        supervision_policy=supervision_policy,
+        progress_cb=progress_cb,
+    )
     try:
-        packets = _probe_video_packets(path, ffprobe, timeout)
-    except ProbeError as exc:
-        failures.append(str(exc))
-        packets = []
-    if not packets:
+        _raise_terminal(packet_outcome)
+    except VerificationOperationError as exc:
+        return terminal_result(exc)
+    packet_summary: PacketScanSummary | None = None
+    if packet_outcome.state is OperationState.SUCCEEDED:
+        candidate = packet_outcome.value
+        if isinstance(candidate, PacketScanSummary):
+            packet_summary = candidate
+    else:
+        failures.append(packet_outcome.reason or "ffprobe packet scan failed")
+    if packet_summary is None or packet_summary.packet_count <= 0:
         if videos:
             failures.append("no video packets found in output")
     else:
-        result.output_video_bytes = sum(
-            max(0, _int(packet.get("size")) or 0) for packet in packets
-        )
-        last_pts: float | None = None
-        last_duration = 0.0
-        for packet in reversed(packets):
-            pts = _float(packet.get("pts_time"))
-            if pts is None:
-                continue
-            last_pts = pts
-            last_duration = _float(packet.get("duration_time")) or 0.0
-            break
-        if last_pts is None:
-            failures.append("could not determine the last video packet timestamp")
+        result.output_video_bytes = packet_summary.video_bytes
+        presentation_end = packet_summary.presentation_end
+        if presentation_end is None:
+            failures.append("could not determine the video presentation tail")
         elif output_duration is not None and output_duration > 0:
-            last_end = last_pts + last_duration
-            if abs(last_end - output_duration) > tolerance:
+            if abs(presentation_end - output_duration) > tolerance:
                 failures.append(
-                    f"last video packet ends at {last_end:.3f}s but container "
-                    f"duration is {output_duration:.3f}s "
+                    f"video presentation tail ends at {presentation_end:.3f}s but "
+                    f"container duration is {output_duration:.3f}s "
                     f"(tolerance {tolerance:.3f}s)"
                 )
 
@@ -1121,9 +1682,21 @@ def verify_output(
     # such.  A metric that cannot be evaluated is surfaced as a warning and
     # never silently passes.
     if action == "encode":
-        frames, basis, note = _presented_frame_count(
-            path, ffprobe, timeout, video_stream, result.output_duration
-        )
+        try:
+            frames, basis, note = _presented_frame_count(
+                path,
+                ffprobe,
+                timeout,
+                video_stream,
+                result.output_duration,
+                cancel_event=cancel_event,
+                pause_event=machine_pause,
+                monitor=combined_monitor,
+                supervision_policy=supervision_policy,
+                progress_cb=progress_cb,
+            )
+        except VerificationOperationError as exc:
+            return terminal_result(exc)
         if note:
             result.bpp_note = note
             result.warnings.append(note)
@@ -1170,11 +1743,24 @@ def verify_output(
 
     # -- 9. full decode (mandatory) ---------------------------------------
     _notify(progress_cb, {"phase": "verifying", "percent": 60.0})
-    decode_ok, decode_message = _decode_check(path, ffmpeg, timeout)
+    try:
+        decode_ok, decode_message = _decode_check(
+            path,
+            ffmpeg,
+            timeout,
+            cancel_event=cancel_event,
+            pause_event=machine_pause,
+            monitor=combined_monitor,
+            supervision_policy=supervision_policy,
+            progress_cb=progress_cb,
+        )
+    except VerificationOperationError as exc:
+        return terminal_result(exc)
     if not decode_ok:
         failures.append(decode_message)
 
     result.failures = failures
-    result.ok = not failures
+    result.state = OperationState.SUCCEEDED if not failures else OperationState.FAILED
+    result.ok = not failures and result.state is OperationState.SUCCEEDED
     _notify(progress_cb, {"phase": "verifying", "percent": 100.0})
     return result
