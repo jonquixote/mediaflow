@@ -31,6 +31,8 @@ from typing import Any, Callable, Iterable, Mapping
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener
 
+from .state import NOTIFICATION_EVENTS, is_review
+
 log = logging.getLogger(__name__)
 
 DEFAULT_COOLDOWN_HOURS = 6.0
@@ -64,6 +66,7 @@ _EVENT_TITLES = {
     "trash-purge": "mediaflow: trash purged",
     "success": "mediaflow: job done",
 }
+assert set(_EVENT_TITLES) == NOTIFICATION_EVENTS
 
 
 class NotificationError(RuntimeError):
@@ -399,7 +402,7 @@ class Notifier:
         for job in jobs or []:
             if not isinstance(job, Mapping):
                 continue
-            if str(job.get("state") or "REVIEW").upper() != "REVIEW":
+            if not is_review(str(job.get("state") or "REVIEW").upper()):
                 continue
             job_id = job.get("id") or job.get("job_id")
             if not job_id:

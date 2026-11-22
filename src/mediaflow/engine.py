@@ -20,6 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from .state import (
+    ACTIVE_STATES,
+    COMMAND_NAMES,
+    JobState,
+    REVIEW_MOVABLE,
+    REVIEW_RESUME,
+    TERMINAL_STATES,
+    is_review,
+    is_terminal,
+    values as state_values,
+)
 from .safety import (
     CrossDeviceError, FileSafety, PathDenied, SafetyError,
     atomic_write_json, check_one_filesystem, fsync_dir, fsync_file,
@@ -41,28 +52,11 @@ from .util import gzip_text, has_temp_marker, human_bytes, is_real_dir, is_regul
 
 log = logging.getLogger(__name__)
 
-ACTIVE_STATES = (
-    "DETECTED", "STABLE", "PROBED", "PLANNED", "ENCODING", "ENCODED", "VERIFIED",
-    "NAMED", "PUBLISHED", "RETIRED",
-)
-TERMINAL = ("DONE", "FAILED", "RESTORED")
-REVIEW_RESUME: dict[str, str | None] = {
-    "multiple-videos": "PROBED",
-    "unsupported-format": None,
-    "hdr": "PLANNED",
-    "10bit": "PLANNED",
-    "10bit-no-hw": "PLANNED",
-    "interlaced": "PLANNED",
-    "remux-incompatible-video": "PLANNED",
-    "quality-floor": "NAMED",
-    "identity-low-confidence": "NAMED",
-    "identity-tie": "NAMED",
-    "duplicate": "PUBLISHED",
-    "multi-disc": None,
-}
-REVIEW_MOVABLE = {
-    "hdr", "10bit", "10bit-no-hw", "interlaced", "remux-incompatible-video", "quality-floor",
-}
+# Shared state vocabulary: no duplicated tuples here (STATE-1).
+ACTIVE_STATES = state_values(ACTIVE_STATES)
+TERMINAL = state_values(TERMINAL_STATES)
+# REVIEW_RESUME, REVIEW_MOVABLE and REVIEW_HINTS are imported from the shared
+# state model; no duplicated review vocabulary here (STATE-1).
 VIDEO_EXTENSIONS = {
     ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".ts", ".m2ts", ".mts", ".mpg", ".mpeg",
     ".wmv", ".webm", ".vob", ".flv", ".ogv", ".3gp",
@@ -576,7 +570,7 @@ class Engine:
         for job in jobs:
             if job["id"] in exclude:
                 continue
-            if job["state"] == "REVIEW":
+            if is_review(job["state"]):
                 continue
             if job["state"] == "PLANNED" and job["dry_run"] and self.dry_run:
                 continue
@@ -589,7 +583,7 @@ class Engine:
     def advance(self, job_id: str) -> None:
         for _ in range(40):
             job = self.store.get_job(job_id)
-            if not job or job["state"] in TERMINAL or job["state"] == "REVIEW":
+            if not job or is_terminal(job["state"]) or is_review(job["state"]):
                 return
             if self._shutdown_requested:
                 # A completed operation may have committed its next state, but
@@ -2359,7 +2353,7 @@ class Engine:
         out = Path((job.get("plan") or {}).get("working_output") or "")
         if out:
             self._remove_partial(job_id, out, worker_done)
-        if job["state"] != "REVIEW" and not job.get("parked_path"):
+        if not is_review(job["state"]) and not job.get("parked_path"):
             try:
                 src = Path(job.get("source_path") or "")
                 if src.exists() and _under(src, self.convert_movies):
@@ -2373,7 +2367,7 @@ class Engine:
                 log.exception("failed to park failed job=%s", job_id)
         self.store.update_job(job_id, error=reason if not detail else f"{reason}: {detail}",
                               finished_at=self.clock(), phase="failed")
-        self.store.transition(job_id, "FAILED", message=reason)
+        self.store.transition(job_id, "FAILED", expect_from=job["state"], message=reason)
         self._cleanup_after_worker(job_id, worker_done)
         self._write_snapshot(job_id)
         self._notify_failure(job, reason)
@@ -2575,7 +2569,7 @@ class Engine:
                         self._write_snapshot(job["id"])
                     else:
                         self._fail_job(job["id"], "retired-without-trash")
-                elif state == "REVIEW":
+                elif is_review(state):
                     self._write_snapshot(job["id"])
                 elif state == "FAILED":
                     self._clean_work(job["id"])
@@ -2595,7 +2589,7 @@ class Engine:
                             self._write_snapshot(fresh["id"])
             except Exception:
                 log.exception("recovery failed job=%s", job["id"])
-        for job in self.store.list_jobs(("DONE", "FAILED")):
+        for job in self.store.list_jobs(state_values(TERMINAL_STATES)):
             self._clean_work(job["id"])
         known = {j["id"] for j in self.store.list_jobs(include_done=True)}
         if self.work.exists():
@@ -2613,7 +2607,7 @@ class Engine:
             try:
                 self._execute_replace_intent(intent)
                 job = self.store.get_job(intent["job_id"])
-                if job and job["state"] == "REVIEW" and job.get("review_reason") == "duplicate":
+                if job and is_review(job["state"]) and job.get("review_reason") == "duplicate":
                     self.store.clear_review(job["id"])
                     self.store.transition(job["id"], "PUBLISHED", expect_from="REVIEW",
                                           message="replace completed")
@@ -2768,6 +2762,8 @@ class Engine:
                 self.store.command_done(cmd["id"], error=str(exc))
 
     def execute_command(self, command: str, payload: Mapping) -> Any:
+        if command not in COMMAND_NAMES:
+            raise CommandError(f"unknown command: {command}")
         if command == "review_accept":
             return self.review_accept(payload["job_id"], candidate=payload.get("candidate"),
                                       title=payload.get("title"), year=payload.get("year"),
@@ -2888,7 +2884,7 @@ class Engine:
         payload = intent["payload"]
         trash_path = Path(payload["trash_path"])
         output = Path(payload["output_path"])
-        if not job or job["state"] not in {"DONE", "RESTORED"}:
+        if not job or job["state"] not in {JobState.DONE.value, JobState.RESTORED.value}:
             raise CommandError("restore intent refers to a non-DONE job")
         if output.exists():
             day = time.strftime("%Y-%m-%d")
@@ -2931,8 +2927,16 @@ class Engine:
                     self.safety.rename(child, dest, what="restore")
             # Keep the manifest (and thus the audit trail) in trash until
             # retention removes it; the original media is now in inbox.
+        # Commit the state before completing the intent.  A crash between the
+        # two leaves the intent pending; recovery can safely re-run these
+        # idempotent moves.  The reverse order could leave a DONE job with a
+        # dangling output path and no pending intent.
+        if not self.store.transition(
+            job_id, "RESTORED", expect_from=job["state"],
+            output_path=None, finished_at=self.clock(),
+        ):
+            raise CommandError("restore state changed concurrently; retry after recovery")
         self.store.complete_intent(intent["id"])
-        self.store.update_job(job_id, state="RESTORED", output_path=None, finished_at=self.clock())
         self.store.event(job_id, "restore", "published copy moved to trash; original restored to inbox")
         self._write_snapshot(job_id)
 
@@ -2967,7 +2971,7 @@ class Engine:
             return 0
         cutoff = self.clock() - days * 86400
         moved = 0
-        for job in self.store.list_jobs(("FAILED",)):
+        for job in self.store.list_jobs((JobState.FAILED,)):
             finished = float(job.get("finished_at") or job.get("updated_at") or 0)
             if finished > cutoff:
                 continue
@@ -3382,9 +3386,13 @@ class Engine:
         jobs = self.store.list_jobs(include_done=False)
         counts: dict[str, int] = {}
         oldest_review = None
+        history: dict[str, int] = {}
+        for job in self.store.list_jobs(include_done=True):
+            if is_terminal(job["state"]):
+                history[job["state"]] = history.get(job["state"], 0) + 1
         for job in jobs:
             counts[job["state"]] = counts.get(job["state"], 0) + 1
-            if job["state"] == "REVIEW":
+            if is_review(job["state"]):
                 age = self.clock() - float(job.get("updated_at") or self.clock())
                 oldest_review = max(oldest_review or 0, age)
         free = None
@@ -3409,8 +3417,11 @@ class Engine:
         except Exception:
             pass
         payload = {
-            "counts": counts, "queue": sum(v for k, v in counts.items() if k not in {"REVIEW"}),
-            "reviews": counts.get("REVIEW", 0), "oldest_review_seconds": oldest_review,
+            "counts": counts,
+            "history": history,
+            "queue": sum(v for k, v in counts.items() if not is_review(k)),
+            "reviews": counts.get(JobState.REVIEW.value, 0),
+            "oldest_review_seconds": oldest_review,
             "paused_reasons": sorted(
                 set(self._pause_reasons)
                 | set(self._global_pause_reasons)
@@ -3426,12 +3437,12 @@ class Engine:
 
     def _write_snapshot(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
-        if not job:
+        if not job or is_terminal(job["state"]):
+            # Terminal history is visible in status/queue, but it must not
+            # recreate a work directory after cleanup.
             return
         work = self.work / job_id
         if not work.exists():
-            if job["state"] in {"DONE", "FAILED"}:
-                return
             work.mkdir(parents=True, exist_ok=True)
         snapshot = dict(job)
         snapshot.pop("source_path_private", None)
@@ -3439,7 +3450,7 @@ class Engine:
 
     def _write_all_snapshots(self) -> None:
         for job in self.store.list_jobs(include_done=False):
-            if job["state"] not in {"DONE", "FAILED"}:
+            if not is_terminal(job["state"]):
                 self._write_snapshot(job["id"])
 
     def _transition(self, job: dict, to_state: str, **fields: Any) -> bool:

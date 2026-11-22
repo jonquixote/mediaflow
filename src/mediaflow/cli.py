@@ -17,6 +17,7 @@ from .daemon import AlreadyRunning, Daemon, daemon_lock
 from .db import DatabaseError, Store
 from .doctor import format_doctor, run_doctor
 from .engine import CommandError, Engine, EngineError, RestorePurged, ReviewError
+from .state import REVIEW_HINTS, is_review, is_terminal
 from .util import human_bytes, short_age
 
 DEFAULT_CONFIG = Path("/etc/mediaflow/config.toml")
@@ -93,18 +94,25 @@ def _status_payload(cfg: Config, store: Store | None = None) -> dict:
         except Exception:
             pass
     counts: dict[str, int] = {}
+    history: dict[str, int] = {}
     oldest = None
-    jobs = store.list_jobs(include_done=False) if store else []
+    all_jobs = store.list_jobs(include_done=True) if store else []
+    jobs = [job for job in all_jobs if not is_terminal(job["state"])]
+    for job in all_jobs:
+        if is_terminal(job["state"]):
+            history[job["state"]] = history.get(job["state"], 0) + 1
     for job in jobs:
         counts[job["state"]] = counts.get(job["state"], 0) + 1
-        if job["state"] == "REVIEW":
+        if is_review(job["state"]):
             oldest = max(oldest or 0, time.time() - float(job.get("updated_at") or 0))
     free = None
     try:
         free = shutil.disk_usage(cfg.root).free
     except OSError:
         pass
-    return {"counts": counts, "queue": sum(counts.values()), "reviews": counts.get("REVIEW", 0),
+    return {"counts": counts, "history": history,
+            "queue": sum(v for k, v in counts.items() if not is_review(k)),
+            "reviews": counts.get("REVIEW", 0),
             "oldest_review_seconds": oldest, "paused_reasons": [], "free_bytes": free,
             "trash_bytes": 0, "last_success": None, "dry_run": cfg.dry_run,
             "updated_at": time.time()}
@@ -309,20 +317,9 @@ def cmd_review(args) -> int:
 
 
 def _review_hint(reason: str) -> str:
-    return {
-        "multiple-videos": "review accept --main FILE",
-        "unsupported-format": "review reject",
-        "hdr": "review move --preset",
-        "10bit": "review move --preset",
-        "10bit-no-hw": "review move --preset",
-        "interlaced": "review move --preset",
-        "remux-incompatible-video": "review move --preset",
-        "quality-floor": "review accept --publish-anyway",
-        "identity-low-confidence": "review accept --candidate N",
-        "identity-tie": "review accept --candidate N",
-        "duplicate": "review accept --replace",
-        "multi-disc": "review reject",
-    }.get(reason, "review list")
+    """Operator hint from the one shared review vocabulary."""
+
+    return REVIEW_HINTS.get(reason, "review list")
 
 
 def cmd_mutate_simple(args, command: str) -> int:

@@ -593,7 +593,7 @@ def test_recovery_adopts_retire_window(env):
     eng.tick()
     job = store.list_jobs()[0]
     # simulate DB still PUBLISHED while trash already contains the job
-    store.transition(job["id"], "PUBLISHED", expect_from="DONE")
+    store.update_job(job["id"], state="PUBLISHED")
     store.update_job(job["id"], manifest_path=None)
     # DONE work was cleaned; create a fake working output for recovery inspection
     work = cfg.work / job["id"]
@@ -1599,3 +1599,89 @@ def test_post_encode_speed_update_uses_the_planned_backend_and_target_height(env
 
     assert store.speed_get("test-preset", "qsv", 1080) == pytest.approx(1.3)
     assert store.speed_get("test-preset", "vaapi", 1080) == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Pass C: one job-state model
+# ---------------------------------------------------------------------------
+
+
+def test_restored_job_does_not_block_a_fresh_drop(env):
+    """RESTORED is terminal for scanning even though its history remains."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    first = store.list_jobs()[0]
+    assert first["state"] == "DONE"
+
+    eng.restore(first["id"])
+    assert store.get_job(first["id"])["state"] == "RESTORED"
+
+    _source(cfg)
+    eng.tick()
+
+    jobs = store.list_jobs(include_done=True)
+    fresh = [job for job in jobs if job["id"] != first["id"]]
+    assert len(fresh) == 1
+    assert fresh[0]["id"] != first["id"]
+    assert store.get_job(first["id"])["state"] == "RESTORED"
+    restored = store.get_job(first["id"])
+    assert restored["manifest_path"] and Path(restored["trash_path"]).exists()
+
+
+def test_an_active_job_still_blocks_a_fresh_drop(env):
+    """Only terminal history stops blocking; real active work still does."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    store.create_job(
+        preset="test-preset",
+        source_rel=entry.name,
+        source_path=str(entry),
+        original_path=str(entry),
+        entry_kind="dir",
+        state="REVIEW",
+    )
+    eng.scan()
+    assert len(store.list_jobs()) == 1
+
+
+def test_status_and_queue_agree_about_restored_history(env):
+    """Terminal history is visible in `history`, not in the active queue."""
+
+    from mediaflow.cli import _status_payload
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    job = store.list_jobs()[0]
+    eng.restore(job["id"])
+
+    status = eng.write_status()
+    fallback = _status_payload(cfg, store)
+    assert status["history"] == fallback["history"] == {"RESTORED": 1}
+    assert status["queue"] == fallback["queue"] == 0
+    assert status["reviews"] == fallback["reviews"] == 0
+
+
+def test_recovery_does_not_recreate_terminal_work_directories(env):
+    """RESTORED history stays visible without resurrecting job scratch."""
+
+    cfg, store, eng, _ = env
+    _source(cfg)
+    _prepare(eng)
+    eng.tick()
+    job = store.list_jobs()[0]
+    eng.restore(job["id"])
+    work = cfg.work / job["id"]
+    assert not work.exists()
+
+    eng.recover()
+    eng.recover()
+
+    assert not work.exists()
+    assert store.get_job(job["id"])["state"] == "RESTORED"
+

@@ -13,6 +13,17 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .safety import fsync_dir
+from .state import (
+    INTENT_KINDS,
+    JobState,
+    REVIEW_REASONS,
+    command_status,
+    INTENT_KINDS,
+    TERMINAL_STATES as _TERMINAL_STATES,
+    in_clause,
+    is_valid_transition,
+    values,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,7 +71,9 @@ JOB_COLUMNS = {
     "adopted": "INTEGER NOT NULL DEFAULT 0",
 }
 
-TERMINAL_STATES = ("DONE", "FAILED")
+# Compatibility alias: still a tuple of strings, but derived from the one
+# shared state model rather than hand-maintained here.
+TERMINAL_STATES: tuple[str, ...] = values(_TERMINAL_STATES)
 
 
 class DatabaseError(RuntimeError):
@@ -250,17 +263,22 @@ class Store:
             sql += " WHERE state IN (" + ",".join("?" for _ in states) + ")"
             args.extend(states)
         elif not include_done:
-            sql += " WHERE state NOT IN ('DONE','FAILED')"
+            clause, excluded = in_clause(_TERMINAL_STATES)
+            sql += f" WHERE state NOT IN ({clause})"
+            args.extend(excluded)
         sql += " ORDER BY created_at, id"
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
         return [_decode_job(dict(r)) for r in rows]
 
     def active_job_for(self, preset: str, source_rel: str) -> dict | None:
+        clause, excluded = in_clause(_TERMINAL_STATES)
+        sql = (
+            "SELECT * FROM jobs WHERE preset=? AND source_rel=? "
+            f"AND state NOT IN ({clause}) ORDER BY created_at DESC LIMIT 1"
+        )
         with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state NOT IN ('DONE','FAILED') "
-                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel)).fetchone()
+            row = self._conn.execute(sql, (preset, source_rel, *excluded)).fetchone()
         return _decode_job(dict(row)) if row else None
 
     def latest_job_for(self, preset: str, source_rel: str) -> dict | None:
@@ -271,10 +289,11 @@ class Store:
         return _decode_job(dict(row)) if row else None
 
     def get_review_by_source(self, preset: str, source_rel: str) -> dict | None:
+        review = values({JobState.REVIEW})[0]  # shared vocabulary
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state='REVIEW' "
-                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel)).fetchone()
+                "SELECT * FROM jobs WHERE preset=? AND source_rel=? AND state=? "
+                "ORDER BY created_at DESC LIMIT 1", (preset, source_rel, review)).fetchone()
         return _decode_job(dict(row)) if row else None
 
     def update_job(self, job_id: str, **fields: Any) -> dict:
@@ -292,7 +311,12 @@ class Store:
 
     def transition(self, job_id: str, to_state: str, *, expect_from: str | Iterable[str] | None = None,
                    message: str | None = None, **fields: Any) -> bool:
-        """Compare-and-set state transition. Returns False if expect_from did not match."""
+        """Compare-and-set state transition using the shared state model.
+
+        Returns ``False`` when ``expect_from`` does not match.  Structurally
+        impossible transitions raise :class:`DatabaseError`; recovery paths use
+        only legal transitions, so this cannot weaken crash handling.
+        """
         allowed = {k: self._encode_field(k, v) for k, v in fields.items()
                    if k in JOB_COLUMNS and k not in {"id", "created_at"}}
         allowed["state"] = to_state
@@ -301,11 +325,25 @@ class Store:
         args = list(allowed.values())
         sql = f"UPDATE jobs SET {sets} WHERE id=?"
         args.append(job_id)
+        expected: tuple[str, ...] | None = None
         if expect_from:
-            expected = [expect_from] if isinstance(expect_from, str) else list(expect_from)
-            sql += " AND state IN (" + ",".join("?" for _ in expected) + ")"
-            args.extend(expected)
+            expected = values(
+                [expect_from] if isinstance(expect_from, str) else list(expect_from)
+            )
+            clause, clause_values = in_clause(expected)
+            sql += f" AND state IN ({clause})"
+            args.extend(clause_values)
         with self._tx() as c:
+            row = c.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                return False
+            source = str(row[0])
+            if expected is not None and source not in expected:
+                return False
+            if not is_valid_transition(source, to_state):
+                raise DatabaseError(
+                    f"invalid job transition {source} -> {to_state} for {job_id}"
+                )
             cur = c.execute(sql, args)
             if cur.rowcount != 1:
                 return False
@@ -324,13 +362,19 @@ class Store:
         return [dict(r) for r in rows]
 
     def set_review(self, job_id: str, reason: str, from_state: str, context: Mapping | None = None) -> None:
+        if reason not in REVIEW_REASONS:
+            raise ValueError(f"unknown review reason: {reason!r}")
+        if not is_valid_transition(from_state, JobState.REVIEW):
+            raise DatabaseError(f"invalid review transition from {from_state}")
+        review = values({JobState.REVIEW})[0]
         with self._tx() as c:
             c.execute(
-                "UPDATE jobs SET state='REVIEW', review_reason=?, review_from_state=?, review_context=?,"
+                "UPDATE jobs SET state=?, review_reason=?, review_from_state=?, review_context=?,"
                 " updated_at=? WHERE id=?",
-                (reason, from_state, json.dumps(context or {}, ensure_ascii=False, sort_keys=True), time.time(), job_id))
+                (review, reason, from_state,
+                 json.dumps(context or {}, ensure_ascii=False, sort_keys=True), time.time(), job_id))
             c.execute("INSERT INTO events(job_id,ts,state,kind,message) VALUES(?,?,?,?,?)",
-                      (job_id, time.time(), "REVIEW", "review", reason))
+                      (job_id, time.time(), review, "review", reason))
 
     def clear_review(self, job_id: str) -> None:
         self.update_job(job_id, review_reason=None, review_from_state=None, review_context=None)
@@ -422,21 +466,26 @@ class Store:
     def pending_commands(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM commands WHERE status IN ('pending','running') ORDER BY created_at").fetchall()
+                "SELECT * FROM commands WHERE status IN (?,?) ORDER BY created_at",
+                (command_status("pending"), command_status("running"))).fetchall()
         return [_decode_command(dict(r)) for r in rows]
 
     def command_done(self, cmd_id: str, *, error: str | None = None) -> None:
         with self._tx() as c:
             c.execute("UPDATE commands SET status=?, finished_at=?, error=? WHERE id=?",
-                      ("failed" if error else "done", time.time(), error, cmd_id))
+                      (command_status("failed" if error else "done"), time.time(), error, cmd_id))
 
     def command_start(self, cmd_id: str) -> None:
         with self._tx() as c:
-            c.execute("UPDATE commands SET status='running', started_at=? WHERE id=? AND status='pending'",
-                      (time.time(), cmd_id))
+            c.execute(
+                "UPDATE commands SET status=?, started_at=? WHERE id=? AND status=?",
+                (command_status("running"), time.time(), cmd_id, command_status("pending")),
+            )
 
     # -- intents --------------------------------------------------------
     def create_intent(self, kind: str, job_id: str, payload: Mapping) -> str:
+        if kind not in INTENT_KINDS:
+            raise ValueError(f"unknown intent kind: {kind!r}")
         intent_id = "int_" + uuid.uuid4().hex
         now = time.time()
         with self._tx() as c:
@@ -445,9 +494,11 @@ class Store:
         return intent_id
 
     def pending_intents(self, kind: str | None = None) -> list[dict]:
-        sql = "SELECT * FROM intents WHERE status='pending'"
-        args: list[Any] = []
+        sql = "SELECT * FROM intents WHERE status=?"
+        args: list[Any] = [command_status("pending")]
         if kind:
+            if kind not in INTENT_KINDS:
+                raise ValueError(f"unknown intent kind: {kind!r}")
             sql += " AND kind=?"
             args.append(kind)
         with self._lock:
@@ -456,7 +507,10 @@ class Store:
 
     def complete_intent(self, intent_id: str) -> None:
         with self._tx() as c:
-            c.execute("UPDATE intents SET status='done',updated_at=? WHERE id=?", (time.time(), intent_id))
+            c.execute(
+                "UPDATE intents SET status=?,updated_at=? WHERE id=?",
+                (command_status("done"), time.time(), intent_id),
+            )
 
     # -- library / settings --------------------------------------------
     def get_library_cache(self, path: str, size: int, mtime: float) -> dict | None:
