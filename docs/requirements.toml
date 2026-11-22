@@ -142,6 +142,30 @@ text = "Success, failure, cancellation, stall, overall timeout, protection inter
 test = "tests/test_verify.py"
 
 [[requirements]]
+id = "STATE-1"
+title = "One authoritative state model"
+safety = true
+section = "3"
+text = "Every job state, review reason, intent kind, command status and transition belongs to one shared vocabulary. Active, terminal, resumable, review and user-visible classifications are derived from it. Database queries generate SQL placeholders from the shared sets; no module maintains its own state tuple. Adding an unclassified state fails tests and import validation. RESTORED is terminal for scanning and queueing but remains visible in status history, listings and retention."
+test = "tests/test_state.py"
+
+[[requirements]]
+id = "CONFIG-1"
+title = "Configuration generations and plan binding"
+safety = true
+section = "10"
+text = "Every configuration key has one reload classification: live, future-jobs, restart-required or rejected. Reload validates the complete config, presets and secrets before atomically publishing one generation. Restart-required keys retain their old effective values and remain visibly pending until restart; invalid reloads keep the previous generation and clear only the invalid-config hold. An active operation keeps its effective policy until the next safe boundary. Plans record the configuration generation and preset fingerprint; stale plans re-plan deliberately without consuming a restart."
+test = "tests/test_config_lifecycle.py"
+
+[[requirements]]
+id = "COMPAT-1"
+title = "Versioned persisted data and recoverable migrations"
+safety = true
+section = "3"
+text = "The database schema version is enforced. Older databases are backed up, then migrated by ordered, idempotent, transactional steps; newer databases are refused without modification. Semantic generations are explicit in plans, speed rows and capability files: pre-state-colour plans re-plan, legacy speed rows are retained but not reused, and unversioned capability files are unknown. Job history is never discarded, and restore preserves the previous database."
+test = "tests/test_migrations.py"
+
+[[requirements]]
 id = "SCHED-1"
 title = "Schedule window is a start gate"
 safety = true
