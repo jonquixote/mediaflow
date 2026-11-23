@@ -1,226 +1,197 @@
-# Deployment safety handoff
+# Deployment safety handoff — reviewer round 2
 
-Reviewed baseline: `f058bb34f9e73f1c292ab3104f56b414ad20eb99` on
-`main`/`origin/main`. The reviewed base and the current remote default were
-identical when this branch was created; no integration drift existed.
+Reviewed baseline: `947c8f9f19fc090371d9fcf9a508cc342113aa41`
+(branch `pass-d-safety-fixes` at review time). Current remote state recorded
+separately: `origin/main` was `f058bb34f9e73f1c292ab3104f56b414ad20eb99`;
+`origin/pass-d-safety-fixes` was the reviewed `947c8f9`. There was no hidden
+main advancement to substitute.
 
-Implementation branch: `pass-d-safety-fixes`.
-Tested implementation revision: `4d8a12d`.
-Scope: repository investigation, implementation and sandbox tests only. No
-command in this document was executed against john-server or any production
-root. This handoff is not deployment authorization.
+Tested implementation revision: `fad57ef`.
+Current branch: `pass-d-safety-round2`. No merge or deployment is authorized.
 
 ## 1. Disposition of the advisor findings
 
-| # | Class | Disposition and references |
+| Area | Class | Disposition |
 |---|---|---|
-| 1 | Confirmed safety-contract conflict | `install.sh` created/chowned media paths and enabled the service. Added `MEDIAFLOW_INSTALL_HOST_ONLY=1`: media dirs and convert folders are skipped, systemctl enable/daemon-reload is skipped, service stays stopped/disabled. Test: `tests/test_deployment_safety.py::test_host_only_install_does_not_touch_media_or_service_state`. |
-| 2 | Confirmed implementation bug | `Engine._ensure_dirs()` previously mkdir+chmod every media path on start/scan. It now ensures only state/log paths by default; media creation requires explicit `manage_media_dirs=True` for scratch installs. `Config.ensure_directories(normalize_existing=False)` preserves existing modes. Tests: `test_engine_start_and_scan_do_not_initialize_media_paths`, `test_config_ensure_directories_can_preserve_existing_library_metadata`. |
-| 3 | Confirmed diagnostic-policy conflict | `doctor` defaulted to capability probes including software/libx265; daemon automatic ffmpeg-change retest called it without backend selection. `run_doctor()` now defaults `run_capabilities=False`; CLI default is non-encoding, `--capabilities --backends qsv,vaapi` is required for probes, software is rejected, and automatic retests pass hardware-only backends with `allow_software=False`. Skipped/deferred probes remain unknown. Tests: `test_capability_probes_default_to_hardware_only`, `test_cli_doctor_default_is_non_encoding_and_rejects_software`, `test_automatic_ffmpeg_retest_never_enables_software_probing`. |
-| 4 | Confirmed observational side effect | `status`, `queue`, `plan`, `estimate`, `library report` and `review list` used `_open_store()` which called `Store.initialize()`, creating/migrating state. Added `Store(read_only=True)` using immutable SQLite, `_open_store(..., observation=True)`, and missing-DB paths print an empty result without creating state. Tests: `test_observational_commands_do_not_create_state` and existing CLI tests. |
-| 5 | Safety-contract constraint / unverified on server | No access changes were made. The proposed least-privilege model below preserves `john:agentwork` on movies and leaves music untouched. This is a proposal only until John verifies ACLs, symlinks and service-user access. |
-| 6 | Documentation defects | Corrected `FIRST_RUN.md` staged publish to `HW-042` and restore/re-drop to `HW-041`; corrected QUESTIONS `poll_seconds` (live) to a restart-required example `temp_sensor`; documented doctor exit codes 0/2/3/4. Registry remains authoritative. |
-| 7 | Confirmed rehearsal-isolation concern | `MEDIAFLOW_INSTALL_*` seams existed but media paths were still created and systemctl enable ran in the ordinary path. Host-only mode now isolates host-file installation; rehearsal uses fake roots under `/tmp`, skips privileged subprocesses and refuses `/srv/media`. Tests cover fresh/repeat, config/state/secrets preservation, refusal on production root. |
-| 8 | Confirmed evidence-helper ambiguity | `scripts/verify_hardware_item.sh` calls `update-registry`, a write. `tools/evidence.py validate` is read-only and separate. Evidence capture redacts token assignments, bearer values, credential URLs, likely `Title (Year)` strings and `/srv/media` paths; validator rejects unredacted output. Tests: `test_evidence_validator_rejects_incomplete_and_tampered_bundles`, `test_redaction_removes_tokens_urls_and_titles`. |
-| Still unverified | On-hardware questions | Backend behavior, thermal/AC, systemd protections, direct play, real migration and access checks remain unverified. Sandbox tests never set a hardware registry item to verified. |
+| 1. Installer preflight / service / artifacts | Confirmed defects | `install.sh` now refuses a dirty tracked checkout, active/enabled service state, symlink destinations and unexpected media ownership **before any writes**. It prints full revision and absolute checkout, writes `$STATE_DIR/install-manifest.json`, and host-only mode still creates no media paths and changes no service state. `tools/install_rollback.py` removes only positively identified empty new directories and never files/shared roots. Tests: `test_installer_refuses_dirty_checkout_before_writes`, `test_installer_refuses_existing_active_or_enabled_service`, `test_installer_refuses_symlink_destination_and_preserves_target`, `test_installer_writes_artifact_manifest_and_rollback_is_scoped`. |
+| 2. Doctor acceptance policy | Confirmed defects | `apply_backend_acceptance()` implements `none`, `qsv-required`, `vaapi-required`, `either`; CLI flag `--accept-backends` is separate from `--capabilities/--backends`. `DoctorReport.ok` is false when exit is 4. `_classify_checks` now uses enabled backends and the explicit policy. Default doctor is **non-encoding but not subprocess-free**: it runs a bounded, supervised `ffmpeg -version`; this is documented in check `subprocess-audit` and below. Tests: `test_ok_is_false_when_exit_code_is_four`, `test_acceptance_policies_and_disabled_backend`, `test_default_doctor_documents_its_subprocesses`. |
+| 3. Observational DB / CLI truthfulness | Confirmed defects | `Store.check_schema()` validates compatibility without migration. Missing, corrupt, older and newer databases are distinguished. CLI `DatabaseError` exits 3. Read-only stores use WAL-aware `mode=ro` (not `immutable`), so live reads see uncheckpointed commits; SQLite may create `-shm` auxiliary files, documented here. `plan`/`estimate`/`library report` now fail with exit 3 when no state exists instead of claiming success. Status fallback says `unknown`, not running. `plan --refresh` is a mutation and is marked as such in the matrix. Tests: `test_read_only_store_rejects_newer_schema`, `test_read_only_store_sees_active_wal_writer`, `test_plan_and_estimate_fail_truthfully_without_state`, `test_status_fallback_does_not_claim_running`, `test_corrupt_state_is_not_treated_as_absence`. |
+| 4. Fully isolated rehearsal | Confirmed gap | `scripts/rehearse_install.sh` clears inherited `MEDIAFLOW_*` and `PYTHONPATH`, writes scratch config with scratch paths, uses scratch docs/secrets/presets/state/runtime, checks a sentinel outside the scratch root, and cleans through identity-checked `tools/scratch.py`. Test mode skips venv/pip, so this rehearses **file layout only**, not dependency installation. Test: `test_rehearsal_isolates_hostile_inherited_configuration`. |
+| 5. Initialization vs installation | Confirmed gap | `Engine.start()` now refuses missing required media paths with an actionable error and does not create them. `tools/media_init.py` creates only approved pipeline paths, preserves existing ownership/modes, never touches music, and requires explicit approval for production root. Scratch initialization and production access validation remain separate. Tests: `test_engine_start_refuses_missing_media_paths`, `test_media_init_creates_only_approved_paths_and_preserves_modes`. |
+| 6. Evidence helper | Confirmed defects | CLI dispatch conflict fixed (`action` vs `cmd`), `sys.argv[1:]` used, outputs resolved relative to bundle with traversal/symlink rejection, redacted `token=***` accepted, full 40-hex revision required, and registry mutation requires explicit `accept` plus `--expected-revision`. Bundle integrity, claim attestation, John's acceptance and registry mutation are separate. Tests: end-to-end CLI capture/validate from another cwd, wrapper/failure, tampering/traversal, revision/acceptance. |
+| 7. Documentation / command matrix | Documentation defects | This document, DEPLOYMENT.md, FIRST_RUN.md, QUESTIONS.md, generated registry views, requirements and invariants are reconciled. `ffmpeg -version` is described accurately. No blanket “always safe” claim remains. |
+| Still unverified | On-hardware questions | All 44 registry items remain `unverified`. Sandbox software-encoder fixtures/tests remain test-only and are never hardware evidence. |
 
-## 2. CLI side-effect matrix
+## 2. Complete command matrix
 
-| Command | Reads | Writes / destinations | External calls | Encoding/probing | Privilege | Safe phase |
-|---|---|---|---|---|---|---|
-| `doctor` (default) | config, presets, secrets file metadata, state DB immutable, capability file, systemd unit text, filesystem stats | none; no capability file writes | none; no network | none | service user | host-only preflight |
-| `doctor --capabilities --backends qsv,vaapi` | same as default | temporary ffmpeg probe output in system temp; processing slot; no capability file write by doctor | supervised ffmpeg qsv/vaapi probes | hardware-only encode probes; never software/x265 | service user with render access | explicitly approved capability phase |
-| `status` / `queue` | status.json, progress.json if present, immutable state DB | none | none | none | any user with config read | any phase |
-| `plan` / `estimate` | source path, immutable state DB when present, speed table | none | ffprobe supervised read of source | no encoding | any user with source read | dry-run phase |
-| `library report` | movies tree, immutable state DB, ffprobe on library files | none | supervised ffprobe metadata reads | no encoding | service user/library read | dry-run or approved access-validation phase |
-| `review list` | immutable state DB | none | none | none | any user with config read | any phase |
-| `run` / `maintenance` / mutation commands | config, state, source/output paths | state DB, job snapshots, status/progress, work/trash/backup, library on publish | ffmpeg/ffprobe/TMDb/notify as configured | production encode/remux when jobs advance | service user, single writer | only after approved media initialization |
-| `calibrate` | source, config, state | work scratch, speed seed in DB, calibration report | supervised ffmpeg/ffprobe | explicit encode trials | service user | only after approved capability phase |
-| `capture_evidence` | command output | new bundle under chosen bundle dir | runs given command | depends on command | John | any approved drill |
-| `verify_hardware_item` | evidence bundle | writes `docs/hardware_checks.toml` | none | none | repository maintainer | only after valid on-box evidence |
+| Command | Reads | Writes / destinations | External calls / encoding | Privileges | Safe phase |
+|---|---|---|---|---|---|
+| `mediaflow doctor` | config, presets, secret metadata, immutable state, capability file, systemd text, filesystem stats | none; no capability file | bounded supervised `ffmpeg -version`; no encode | service user | host-only preflight |
+| `mediaflow doctor --capabilities --backends qsv,vaapi --accept-backends either` | same as default | scratch temp probe output; processing slot | supervised qsv/vaapi encode probes; no software/x265 | service user with render access | explicitly approved capability phase |
+| `mediaflow status` / `queue` / `review list` | status/progress files if present, WAL-aware read-only DB | none | none | config read | any phase; liveness unknown without status file |
+| `mediaflow plan` / `estimate` | source, read-only DB (required), speed table | none | supervised ffprobe metadata read | source read | dry-run phase after DB exists |
+| `mediaflow library report` | movies tree, read-only DB (required) | none | supervised ffprobe metadata reads | library read | approved access-validation phase |
+| `mediaflow plan --refresh` | source and DB | mutates persisted plan | supervised probe | daemon/CLI single-writer | mutation phase, not observational |
+| `mediaflow run` / `maintenance` | config, state, media paths | DB, job snapshots, status/progress, work/trash/backup, library | ffmpeg/ffprobe/TMDb/notify as configured | service user | only after approved media initialization |
+| `bash scripts/rehearse_install.sh` | repo checkout | new scratch root under `/tmp` only | supervised doctor subprocess; no sudo/services | builder user | sandbox rehearsal |
+| `python tools/evidence.py validate BUNDLE` | bundle | none | none | John | integrity check only |
+| `python tools/evidence.py accept BUNDLE ...` | validated bundle | writes `acceptance.json` in bundle | none | John | explicit claim review |
+| `python tools/evidence.py update-registry BUNDLE --expected-revision ...` | bundle + acceptance | writes `docs/hardware_checks.toml` | none | maintainer | after John's acceptance only |
 
-## 3. Supported host-only install sequence
+## 3. Supported host-only install (each block needs John's approval)
 
-Every block contains exactly one command. Each command is a write unless
-stated otherwise and needs John's approval.
-
-Record the reviewed revision (read):
+Record revision (read):
 
 ```sh
 git -C /srv/agent-work/mediaflow rev-parse HEAD
 ```
 
-Install host files only; effects: `/opt/mediaflow`, `/etc/mediaflow`,
-`/var/lib/mediaflow`, docs and systemd unit files; no `/srv/media` paths,
-no systemctl enable/start/timer changes:
+Host-file install (write; no media roots, no service/timer state changes):
 
 ```sh
 sudo MEDIAFLOW_INSTALL_HOST_ONLY=1 ./install.sh
 ```
 
-Expected exit: `0`. Verify with one read-only command per check:
-
-```sh
-sudo systemctl is-enabled mediaflow.service
-```
-
-Expected: `disabled` or `masked`; never `enabled` after this phase.
+Expected exit: `0`. Refusal exit: `3`. Verify service remains inactive (read):
 
 ```sh
 sudo systemctl is-active mediaflow.service
 ```
 
-Expected: `inactive`.
+Verify not enabled (read):
+
+```sh
+sudo systemctl is-enabled mediaflow.service
+```
+
+Verify media ownership unchanged (read):
 
 ```sh
 stat -c '%U:%G %a %n' /srv/media/movies /srv/media/music
 ```
 
-Expected: unchanged `john:agentwork 2775` for both; agent must compare with
-John's survey, not assume.
+Rollback: remove only host files this command created under `/opt/mediaflow`,
+`/etc/mediaflow`, `/var/lib/mediaflow` and `/usr/share/doc/mediaflow`; never
+delete existing config/secrets/state/evidence or anything under `/srv/media`.
+Use `python tools/install_rollback.py MANIFEST` to list safe empty new
+directories; `--apply` removes only those.
 
-Rollback: remove only host files created by that install under
-`/opt/mediaflow`, `/etc/mediaflow`, `/var/lib/mediaflow` and
-`/usr/share/doc/mediaflow`; never delete existing config, secrets, state or
-anything under `/srv/media`.
+**Stop before media initialization, ACL/unit changes, service enablement,
+real media, Jellyfin changes or hardware verification.**
 
-**Stop point:** do not create pipeline directories, chmod/chown media paths,
-enable services/timers, or run real jobs without John's separate explicit
-approval.
+## 4. Isolated rehearsal (write to scratch only)
 
-## 4. Builder-tested isolated rehearsal
-
-This sequence creates files in a scratch root only. Running it on john-server
-still needs approval because it is a write.
-
-Create scratch root (write; cleanup confined to this directory):
+Create scratch (write):
 
 ```sh
 SCRATCH=$(mktemp -d /tmp/mediaflow-rehearsal.XXXXXX)
 ```
 
-Run rehearsal with fake roots and privileged subprocesses skipped:
+Run rehearsal (write in scratch; layout-only):
 
 ```sh
-MEDIAFLOW_INSTALL_TEST=1 MEDIAFLOW_INSTALL_HOST_ONLY=1 MEDIAFLOW_INSTALL_PREFIX="$SCRATCH/opt/mediaflow" MEDIAFLOW_INSTALL_CONFIG_DIR="$SCRATCH/etc/mediaflow" MEDIAFLOW_INSTALL_ROOT="$SCRATCH/media" MEDIAFLOW_INSTALL_STATE_DIR="$SCRATCH/var/lib/mediaflow" MEDIAFLOW_INSTALL_SYSTEMD_DIR="$SCRATCH/systemd" MEDIAFLOW_INSTALL_DOC_DIR="$SCRATCH/doc/mediaflow" bash ./install.sh
+bash scripts/rehearse_install.sh
 ```
 
-Expected: exit `0`; no `$SCRATCH/media`; config/state/systemd/doc files exist;
-output says host-only and service disabled. Verify:
+Expected exit: `0`; output contains `layout-only`; hostile inherited paths are
+cleared; outside sentinel is unchanged. Cleanup validates identity and
+containment before removing the scratch root:
 
 ```sh
-test ! -e "$SCRATCH/media"
+python3 tools/scratch.py cleanup "$SCRATCH"
 ```
 
-Run non-encoding diagnostics against a scratch config (write to scratch only):
+The rehearsal skips venv/pip execution; it does not prove dependency install.
 
-```sh
-MEDIAFLOW_CONFIG="$SCRATCH/etc/mediaflow/config.toml" .venv/bin/mediaflow doctor --json
-```
+## 5. Non-encoding vs hardware capability sequences
 
-Clean up only the newly created scratch root:
-
-```sh
-rm -rf "$SCRATCH"
-```
-
-No sudo, service action, `/srv/media` write or network access occurs in this
-sequence. The rehearsal copies repository docs/tools/src into the scratch
-prefix and writes fake config, secrets, presets, state and unit files there.
-
-## 5. Non-encoding and hardware-only sequences
-
-Non-encoding diagnostics are always safe first:
+Default preflight (non-encoding, supervised `ffmpeg -version`):
 
 ```sh
 sudo -u mediaflow -g media /opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor --json
 ```
 
-This does not encode, probe backends, write capabilities or contact TMDb.
-Only after separate approval and verified render access:
+Explicit hardware capability check (requires separate approval):
 
 ```sh
-sudo -u mediaflow -g media /opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor --capabilities --backends qsv,vaapi --json
+sudo -u mediaflow -g media /opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor --capabilities --backends qsv,vaapi --accept-backends either --json
 ```
 
-Software/x265 is not available through this CLI. A deferred/incomplete result
-is unknown; never record it as accepted capability evidence.
+Probing two backends does not require both. `none` makes backend results
+informational; `qsv-required`/`vaapi-required` make only that backend decisive;
+`either` fails only when no backend works. Exit 0 never implies full
+hardware-registry acceptance.
 
-## 6. Proposed least-privilege access model (not yet verified)
+## 6. Initialization and access model
 
-Facts from John's survey, not test passes:
+Run media initialization only with explicit approval:
 
-- `/srv/media/movies` and `/srv/media/music` are `john:agentwork 2775`.
-- Jellyfin runs as `jellyfin:jellyfin` with supplementary `video` and `render`.
-- `/dev/dri/renderD128` is `root:render 0660`.
+```sh
+sudo MEDIAFLOW_MEDIA_INIT_APPROVED=1 python3 /opt/mediaflow/tools/media_init.py --root /srv/media --apply
+```
 
-Proposals requiring separate approval and on-box verification:
+It creates only approved `_pipeline` directories, preserves existing modes,
+leaves music untouched, and never falls back to the full installer.
+The least-privilege access proposal remains: preserve `john:agentwork` on
+movies/music, no broad agentwork membership, no ACL/unit changes without John's
+verification and approval. These are proposals, not verified server facts.
 
-- Keep `john:agentwork` ownership and mode `2775` on movies; do not chmod or
-  chown it during installation or startup.
-- Leave music untouched; no mediaflow supplementary group grant for music.
-- If service-user write access to movies is required for publish/restore,
-  prefer a narrowly scoped ACL on the specific pipeline/library roots after
-  John reviews inherited permissions; do not rely solely on a supplementary
-  group.
-- Verify effective access with John's own read-only checks before changing
-  any unit, config, ACL or ownership. No production unit/config change was
-  made by the agent.
+## 7. Evidence helper lifecycle
 
-## 7. Evidence helper and registry semantics
+Capture (write to bundle):
 
-- `tools/evidence.py capture` runs a command and writes a redacted bundle.
-- `tools/evidence.py validate BUNDLE` is read-only and checks completeness,
-  exit status, revision and unredacted content.
-- `tools/evidence.py update-registry BUNDLE` is a separate write to
-  `docs/hardware_checks.toml`; it refuses incomplete or inconsistent bundles.
-- `scripts/verify_hardware_item.sh` calls `update-registry` and must not be
-  described as validation-only.
-- Redaction is best-effort pattern removal, not a proof of absence. Manual
-  review of the bundle by John is still required before registry mutation.
-- The agent never marks an on-hardware item verified.
+```sh
+bash scripts/capture_evidence.sh "$EVIDENCE" HW-001 -- <approved command>
+```
 
-## 8. Doctor exit and feature semantics
+Validate integrity only (no writes):
 
-- `0`: no required or enabled-feature failures. Unknowns may remain.
-- `2`: required failure; blocks progression.
-- `3`: failure in a feature-conditional check.
-- `4`: a required check is unknown; investigation needed before acceptance.
-- Informational items never change the exit code.
-- Default doctor has no backend/encode checks, so feature-conditional failures
-  can only arise when capability checks are explicitly requested. This matches
-  the documented semantics.
+```sh
+python3 tools/evidence.py validate "$EVIDENCE/HW-001"
+```
 
-## 9. Registry ids and documentation authority
+John's explicit attestation (writes acceptance.json):
 
-`docs/hardware_checks.toml` is authoritative for on-box status; generated
-views are `docs/HARDWARE_CHECKS.md` and `docs/FIRST_RUN_CHECKLIST.md`.
-Known corrected references: staged publish is `HW-042`; restore/re-drop is
-`HW-041`; `poll_seconds` is live, `temp_sensor` is restart-required.
-Requirements and generated invariants were regenerated with the tools.
+```sh
+bash scripts/accept_hardware_item.sh "$EVIDENCE/HW-001" John "reviewed on-box output" <full-revision>
+```
 
-## 10. Actual sandbox results and stop point
+Registry mutation (separate, requires acceptance and full revision):
 
-Commands actually run from the repository:
+```sh
+python3 tools/evidence.py update-registry "$EVIDENCE/HW-001" --expected-revision <full-revision>
+```
+
+The agent never performs the acceptance or update steps. A bundle proves
+integrity only, not cryptographic authenticity or a hardware claim.
+
+## 8. Actual sandbox results
+
+Commands run at `fad57ef` implementation tree:
 
 ```sh
 .venv/bin/python tools/gen_invariants.py
 .venv/bin/python tools/gen_hardware_checks.py
-.venv/bin/python -m pytest -q tests/test_deployment_safety.py
+.venv/bin/python -m pytest -q tests/test_deployment_safety_round2.py
 scripts/check.sh
 ```
 
-Results at implementation revision `4d8a12d`:
+Results are recorded in `docs/VERIFIED.md`; no skips were reported. The
+reviewed baseline suite was `863 passed`; the added end-to-end regressions
+increase the count. `/dev/dri/renderD128` was inaccessible and no hardware
+check ran.
 
-- traceability: `6 passed in 0.24s`
-- unit/integration: `863 passed in 46.90s`
-- full suite: `863 passed in 46.08s`
-- focused deployment-safety tests: `11 passed`
+## 9. Unresolved questions
 
-No skips were reported. `/dev/dri/renderD128` was inaccessible; no hardware
-encode, systemd action, production config/state access, real-media operation
-or Jellyfin change occurred.
+- Effective systemd protections, ACLs, symlinks and service-user access are
+  still unverified on the server.
+- All 44 hardware registry items remain unverified.
+- John/advisor must approve the staged access and media initialization plan
+  before any production-media step.
 
-**Stop before production-media initialization, ownership/mode changes, service
-enablement, timers, real media, Jellyfin configuration or hardware verification.
-All require John's separate explicit approval.**
+## 10. Stop point
+
+Stop before production-media initialization, ownership/mode changes, ACL or
+unit changes, service/timer enablement, real media processing, Jellyfin
+changes or hardware verification. A green sandbox suite is not production or
+hardware readiness.

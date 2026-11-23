@@ -39,6 +39,13 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
+### Deployment advisor round 2
+
+- Installer preflight refuses dirty checkouts, active/enabled services, symlink destinations and unexpected media ownership before writes; artifact manifest and scoped rollback added.
+- Doctor acceptance policy is explicit and separate from probing; report.ok now matches exit-code 4.
+- Read-only state validation distinguishes missing/corrupt/older/newer databases; observational commands fail truthfully instead of faking success.
+- Rehearsal, media initialization, cleanup identity checks and evidence acceptance are isolated and end-to-end tested.
+
 ### Deployment safety corrections
 
 - Added host-only install mode that leaves media roots and service state untouched.
