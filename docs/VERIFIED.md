@@ -5,6 +5,55 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Review record and sandbox verification - 2026-11-22 (Pass D: deployment readiness)
+
+Verified starting state: `main`/`origin/main` at
+`8aa51388bd25a844c3ce556d1dd8bd157ee88f4d`, `pass-c-followup` at
+`ee6453e24b0c98779f5883824818006d687c29de`, and `scripts/check.sh` reporting
+`6 passed`, `834 passed` and `834 passed`. No skips were reported. Python
+3.14.4, pytest 9.2.0 and Jellyfin ffmpeg 8.1.3-Jellyfin were used;
+`/dev/dri/renderD128` was not accessible and no hardware test ran.
+
+### Review record (in place of a pull request)
+
+Branch: `pass-d-deployment`. Commits: `2aa1042` (registry and generated views),
+`bd1c97c` (doctor preflight), `11ddcdc` (installer rehearsal and evidence kit),
+and this documentation commit. The branch was pushed; `gh auth status` reported
+no authenticated GitHub host, so **no PR was opened**. The merge into `main`
+was local with `--no-ff` and pushed.
+
+**No on-box item was marked verified by the agent.** All 44 registry items
+remain `unverified`. The sandbox tests exercise tooling, not hardware.
+
+### Commands actually run
+
+```sh
+cd /srv/agent-work/mediaflow
+.venv/bin/python tools/gen_invariants.py
+.venv/bin/python tools/gen_hardware_checks.py
+scripts/check.sh
+```
+
+Exact results:
+
+- generator: `wrote docs/INVARIANTS.md`
+- hardware generator: wrote `docs/HARDWARE_CHECKS.md` and `docs/FIRST_RUN_CHECKLIST.md`
+- `scripts/check.sh` traceability: `6 passed in 0.21s`
+- `scripts/check.sh` unit/integration: `852 passed in 46.08s`
+- `scripts/check.sh` full suite: `852 passed in 45.91s`
+
+The count differs from the verified 834-test baseline by +18 tests. No skips
+were reported.
+
+Sandbox coverage includes registry integrity and generated-view freshness,
+doctor pass/fail/unknown outcomes and read-only behaviour, installer freshness,
+repeat, preservation and refusal paths, evidence validation/redaction, synthetic
+clip generation, and three robustness leads (monotonic clock, missing hardware
+backend refusal, full-disk fail-closed).
+
+Not verified here: every item in `docs/hardware_checks.toml`. John must supply
+on-box evidence with the first-run kit before any status changes.
+
 ## Review record and sandbox verification - 2026-11-22 (Pass C follow-up)
 
 Verified starting state: `main`/`origin/main` at

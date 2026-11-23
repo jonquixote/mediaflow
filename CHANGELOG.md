@@ -39,6 +39,17 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
+### Pass D (deployment readiness)
+
+- Added the authoritative hardware-check registry with generated markdown and
+  checklist views; the agent cannot mark on-box items verified.
+- Doctor is now a read-only preflight with pass/fail/unknown outcomes,
+  class-aware exit codes and no capability writes or network calls.
+- Install.sh gained sandbox rehearsal seams; install, repeat, preservation and
+  refusal paths are tested against a fake root.
+- Added synthetic clip generation, redacted evidence bundles and a validating
+  registry updater for John's first-run drills.
+
 ### Pass C follow-up
 
 - Publish stages the final folder in `work/` and moves the verified output

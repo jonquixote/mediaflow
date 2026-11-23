@@ -2,6 +2,10 @@
 
 This is the human operator's guide. The normative requirements are in
 `docs/SPEC.md`; the safety subset is generated into `docs/INVARIANTS.md`.
+For install, upgrade and rollback use `docs/DEPLOYMENT.md`. For the ordered
+first controlled run use `docs/FIRST_RUN.md` and its generated
+`docs/FIRST_RUN_CHECKLIST.md`; on-box status lives in
+`docs/hardware_checks.toml`.
 
 ## 1. What mediaflow does
 
