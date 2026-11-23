@@ -39,7 +39,20 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
-## [Unreleased]
+### Pass C follow-up
+
+- Publish stages the final folder in `work/` and moves the verified output
+  into it; the only published transition is one no-replace rename. Output hard
+  links and byte-copy fallbacks were removed.
+- Publish disk accounting keeps the source-size envelope and adds only staged
+  sidecar bytes.
+- SIZE-2 fallback builds a real remux plan from the source codec and geometry
+  and drops encode-only fields.
+- Post-encode speed updates are marked atomically so a crash replay cannot
+  double-count one encode; remaining-work estimates are bounded and documented.
+- Planner-created remuxes ignore encode speed factors.
+- `temp_sensor` is restart-required; `poll_seconds`, `review_reminder_days` and
+  `notify_cooldown_hours` are live and rebind at a reload boundary.
 
 ### Added
 
@@ -54,8 +67,8 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 
 ### Changed
 
-- Publish space checks now keep the SAF-8 source-size envelope and add the
-  publish copy bytes separately instead of replacing the source reservation.
+- Publish space checks keep the SAF-8 source-size envelope and add staged
+  sidecar bytes instead of replacing the source reservation.
 - Legacy plans are deliberately re-planned; legacy speed rows are retained but
   ignored until re-seeded; unversioned capability files are unknown.
 - `status --json` reports config generation, pending generation and restart

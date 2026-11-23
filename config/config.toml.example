@@ -3,10 +3,12 @@
 # /etc/mediaflow/notify.env (root:mediaflow, 0640).
 #
 # Reload behaviour is defined once in mediaflow.config.KEY_CLASS:
-#   restart-required: root, state_dir, runtime_dir, ffmpeg, poll_seconds,
-#                     review_reminder_days, notify_cooldown_hours
-#   future-jobs:      append_tmdbid, stall_minutes, temp_sensor
-#   live:             all other keys
+#   restart-required: root, state_dir, runtime_dir, ffmpeg, temp_sensor
+#                     (changing the thermal input under a live operation could
+#                      make protection blind)
+#   future-jobs:      append_tmdbid, stall_minutes
+#   live:             all other keys, including poll_seconds and notifier
+#                     cooldown/reminder values, which rebind at a boundary
 # Restart-required keys keep their old effective value until the daemon is
 # restarted; status reports the pending hold. Secret files reload only on
 # restart. See docs/SPEC.md section 10.1.

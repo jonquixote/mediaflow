@@ -254,14 +254,22 @@ re-calibrated, and unversioned capability files are treated as unknown. See
 
 ### Publish and disk accounting
 
-Publish stages in `_pipeline/work/<job>/pub`. On the normal same-filesystem
-path the final step is a hard link followed by one `rename()` into `movies/`,
-so no additional copy space is needed. If hard links are unavailable, the
-output is copied; those bytes are reserved **in addition** to the normative
-`max(1.2 * source_size, min_free_gb)` admission envelope. A crash before the
-rename leaves the library untouched and recovery re-stages the publish; a
-crash after the rename is adopted only when the hidden marker and output hash
-match.
+The final folder is built under `_pipeline/work/<job>/pub`. The verified
+output is **moved** into that folder with `os.rename`; text sidecars are copied
+(or converted) there, and the hidden marker is written last. The only
+filesystem transition visible to Jellyfin is one atomic `renameat2` no-replace
+rename of the completed folder into `movies/`. There is no output hard link and
+no output byte-copy fallback: pipeline and library already share one
+filesystem, and a hard link would leave the output reachable from two places
+and complicate retire/restore semantics.
+
+The publish gate keeps the SAF-8 `max(1.2 * source_size, min_free_gb)` envelope
+and adds only the bytes of text sidecars that will be staged. It does not add
+the output size. A crash before the final rename leaves only work-local state
+and is re-staged or adopted by recovery; a crash after the rename is adopted
+only when the hidden marker and output hash match. A partially staged folder
+without a valid marker is unwound so the verified output is moved back to its
+working path before re-staging.
 
 ## 8. Heat, power and schedules
 

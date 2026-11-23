@@ -91,20 +91,28 @@ class Daemon:
         self._generation_lock = threading.RLock()
         self._config_mtime = self._fingerprint()
 
+    def clear_startup_holds(self) -> None:
+        """Resolve holds that describe a previous configuration generation.
+
+        A restart makes the loaded config effective, so invalid-config and
+        restart-required holds must not survive it.  Machine holds such as
+        ffmpeg-changed or capability-unknown are deliberately untouched.
+        """
+
+        self.store.set_setting("config_invalid", "")
+        self.store.set_setting("restart_required", "")
+        self.engine.clear_global_pause_reasons("config-invalid:")
+        self.engine.clear_global_pause_reasons("restart-required:")
+        self.engine._pause_reasons = [
+            value for value in self.engine._pause_reasons
+            if not value.startswith(("config-invalid:", "restart-required:"))
+        ]
+        self.engine.set_restart_required(())
+
     def run(self, *, once: bool = False, force_job: str | None = None) -> int:
         with daemon_lock(self.config, blocking=False):
             self._install_signals()
-            # Holds about a previous configuration generation are resolved by
-            # a restart: the loaded config is now the effective generation.
-            self.store.set_setting("config_invalid", "")
-            self.store.set_setting("restart_required", "")
-            self.engine.clear_global_pause_reasons("config-invalid:")
-            self.engine.clear_global_pause_reasons("restart-required:")
-            self.engine._pause_reasons = [
-                value for value in self.engine._pause_reasons
-                if not value.startswith(("config-invalid:", "restart-required:"))
-            ]
-            self.engine.set_restart_required(())
+            self.clear_startup_holds()
             self.engine.start()
             self._check_ffmpeg()
             if once:
@@ -242,6 +250,12 @@ class Daemon:
             self.engine.pending_presets = new_presets
             self.engine.pending_secrets = self.secrets
             applied = self.engine.apply_pending_config()
+            if applied:
+                # Live consumers pick up the new generation at this boundary.
+                self.tick_seconds = float(getattr(effective, "poll_seconds", 30))
+                notifier = getattr(self.engine, "notifier", None)
+                if notifier is not None and hasattr(notifier, "rebind"):
+                    notifier.rebind(effective, self.secrets)
 
             self.store.event(
                 None, "config-reload",

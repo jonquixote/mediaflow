@@ -5,6 +5,69 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Review record and sandbox verification - 2026-11-22 (Pass C follow-up)
+
+Verified starting state: `main`/`origin/main` at
+`7bdbc79f0e99b20851acda6b880294a65fd0e51f`, `pass-c-integration` at
+`8b5d067057ac830741cc435aaa91054a46a0a5c5`, and `scripts/check.sh` reporting
+`6 passed`, `818 passed` and `818 passed`. No skips were reported. Python
+3.14.4, pytest 9.2.0 and Jellyfin ffmpeg 8.1.3-Jellyfin were used;
+`/dev/dri/renderD128` was not accessible and no hardware test ran.
+
+### Review record (in place of a pull request)
+
+Branch: `pass-c-followup`. Commits: `d0d2336` (publish path and remaining
+findings), `3ad94c9` (configuration classification) and this documentation
+commit. The branch was pushed; `gh auth status` reported no authenticated
+GitHub host, so **no PR was opened**. The merge into `main` was performed
+locally with `--no-ff` and pushed.
+
+Behavioural changes:
+
+- Publish now stages the final folder in `work/`, moves the verified output
+  into it, writes the marker last and performs one no-replace rename. Output
+  hard links and byte-copy fallbacks were removed.
+- Publish disk accounting reserves the SAF-8 source envelope plus staged
+  sidecar bytes only.
+- SIZE-2 fallback builds a genuine remux plan from source codec/geometry.
+- Speed EMA updates are marked per job and cannot replay after a crash.
+- Remaining-work estimates are bounded and documented.
+- `build_plan` ignores encode speed factors for remuxes.
+- `temp_sensor` became restart-required; `poll_seconds` and notifier
+  cooldown/reminder keys became live and rebind at a reload boundary.
+
+Tests covering these changes: `tests/test_engine.py` (publish rename-only,
+staged recovery, empty destination no-overwrite, speed replay, remaining-work
+boundaries, SIZE-2 fallback), `tests/test_plan.py` (planner remux factor),
+`tests/test_config_lifecycle.py` (classification and live rebinding), and four
+new real-SIGKILL points in `tests/crash_worker.py`/`tests/test_crash.py`
+(publish/speed before and after their irreversible step).
+
+Open risks: none of this was exercised on installed hardware or with a real
+ffmpeg-side process; the publish kill points are in the engine's staged-folder
+path using the test harness. No PR review occurred because the CLI was not
+authenticated.
+
+### Commands actually run
+
+```sh
+cd /srv/agent-work/mediaflow
+.venv/bin/python tools/gen_invariants.py
+.venv/bin/python -m pytest -q
+scripts/check.sh
+```
+
+Exact results:
+
+- generator: `wrote docs/INVARIANTS.md`
+- direct full suite: `834 passed in 46.28s`
+- `scripts/check.sh` traceability: `6 passed in 0.21s`
+- `scripts/check.sh` unit/integration: `834 passed in 45.19s`
+- `scripts/check.sh` full suite: `834 passed in 45.09s`
+
+The count differs from the 818-test baseline by +16 follow-up regression
+tests. No skips were reported.
+
 ## Sandbox verification - 2026-11-22 (Pass C: state and configuration coherence)
 
 Baseline verified before changes: `main`/`origin/main` at

@@ -53,6 +53,8 @@ def _daemon(tmp_path: Path, body: str = ""):
     path = _config(tmp_path, body)
     presets_dir = REPO / "presets"
     cfg = load_config(path, environ={})
+    (path.parent / "tmdb.env").write_text("TMDB_READ_TOKEN=start-token\n", encoding="utf-8")
+    (path.parent / "notify.env").write_text("NOTIFY_URL=http://127.0.0.1/start\n", encoding="utf-8")
     presets = load_presets(presets_dir)
     store = Store(cfg.db_path)
     store.initialize()
@@ -73,15 +75,15 @@ def test_every_config_key_has_exactly_one_reload_classification():
 
 
 def test_restart_required_changes_are_reported_and_not_applied():
-    old = Config(dry_run=True, poll_seconds=30, generation=4)
-    new = Config(dry_run=False, poll_seconds=5, generation=5)
+    old = Config(dry_run=True, ffmpeg="/old/ffmpeg", generation=4)
+    new = Config(dry_run=False, ffmpeg="/new/ffmpeg", generation=5)
     plan = classify_config_change(old, new)
 
-    assert "poll_seconds" in plan.restart_required
+    assert "ffmpeg" in plan.restart_required
     assert "dry_run" in plan.live_changed
-    assert plan.effective_config.poll_seconds == 30
+    assert plan.effective_config.ffmpeg == "/old/ffmpeg"
     assert plan.effective_config.generation == 6
-    assert "restart-required:poll_seconds" in plan.notes
+    assert "restart-required:ffmpeg" in plan.notes
 
 
 def test_live_reload_updates_the_component_that_consumes_it(tmp_path):
@@ -150,6 +152,69 @@ def test_fingerprint_detects_a_same_second_mtime_change(tmp_path):
     path.write_text(path.read_text() + "\n", encoding="utf-8")
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
     assert config_mtime_fingerprint(path, presets_dir) != before
+
+
+def test_temp_sensor_change_is_restart_required(tmp_path):
+    """Thermal input must not change underneath a running operation."""
+
+    daemon, path, store = _daemon(tmp_path)
+    try:
+        path.write_text(_config_text(tmp_path, 'temp_sensor = "none"\n'), encoding="utf-8")
+        daemon._reload_if_changed()
+
+        assert daemon.engine.cfg.temp_sensor == "auto"
+        assert "restart-required:temp_sensor" in daemon.engine.pause_reasons
+        assert daemon.engine.cfg.generation > 1
+    finally:
+        store.close()
+
+
+def test_poll_seconds_and_notifier_keys_are_live(tmp_path, monkeypatch):
+    """Consumers that can rebind at a boundary are not restart-required."""
+
+    from mediaflow.notify import Notifier
+
+    monkeypatch.delenv("MEDIAFLOW_ROOT", raising=False)
+    daemon, path, store = _daemon(tmp_path)
+    notifier = Notifier(daemon.config, daemon.secrets, store)
+    daemon.engine.notifier = notifier
+    try:
+        path.write_text(
+            _config_text(tmp_path, "poll_seconds = 5\nnotify_cooldown_hours = 2\n"
+                                   "review_reminder_days = 1\n"),
+            encoding="utf-8",
+        )
+        daemon._reload_if_changed()
+
+        assert daemon.tick_seconds == 5
+        assert notifier._cooldown_hours == 2
+        assert notifier._config.review_reminder_days == 1
+        assert not any(r.startswith("restart-required:") for r in daemon.engine.pause_reasons)
+    finally:
+        store.close()
+
+
+def test_restart_hold_clears_only_at_startup(tmp_path, monkeypatch):
+    """A pending restart is resolved by an actual restart, not by another reload."""
+
+    monkeypatch.delenv("MEDIAFLOW_ROOT", raising=False)
+    daemon, path, store = _daemon(tmp_path)
+    try:
+        path.write_text(
+            _config_text(tmp_path, 'ffmpeg = "/new/ffmpeg"\n'), encoding="utf-8"
+        )
+        daemon._reload_if_changed()
+        assert "restart-required:ffmpeg" in daemon.engine.pause_reasons
+        assert store.get_setting("restart_required", "") == "ffmpeg"
+
+        daemon._reload_if_changed()  # no file change: hold stays
+        assert "restart-required:ffmpeg" in daemon.engine.pause_reasons
+
+        daemon.clear_startup_holds()
+        assert not any(r.startswith("restart-required:") for r in daemon.engine.pause_reasons)
+        assert store.get_setting("restart_required", "") == ""
+    finally:
+        store.close()
 
 
 def test_secret_changes_require_restart_and_are_never_serialised(tmp_path):

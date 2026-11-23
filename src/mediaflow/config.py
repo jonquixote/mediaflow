@@ -434,13 +434,18 @@ KEY_CLASS: dict[str, ReloadClass] = {
     "state_dir": ReloadClass.RESTART_REQUIRED,
     "runtime_dir": ReloadClass.RESTART_REQUIRED,
     "ffmpeg": ReloadClass.RESTART_REQUIRED,
-    "poll_seconds": ReloadClass.RESTART_REQUIRED,
-    "review_reminder_days": ReloadClass.RESTART_REQUIRED,
-    "notify_cooldown_hours": ReloadClass.RESTART_REQUIRED,
+    # Thermal input is protection policy.  Switching sensor (especially to
+    # "none") underneath a live operation could make it blind, so the old
+    # value stays effective until restart.
+    "temp_sensor": ReloadClass.RESTART_REQUIRED,
     # Per-operation policy and naming are captured when a job/operation starts.
     "append_tmdbid": ReloadClass.FUTURE_JOBS,
     "stall_minutes": ReloadClass.FUTURE_JOBS,
-    "temp_sensor": ReloadClass.FUTURE_JOBS,
+    # These consumers rebind at a boundary on reload (Daemon tick cadence and
+    # Notifier._config); no cached state prevents a live change.
+    "poll_seconds": ReloadClass.LIVE,
+    "review_reminder_days": ReloadClass.LIVE,
+    "notify_cooldown_hours": ReloadClass.LIVE,
     # The rest are read at each gate/check and are safe between operations.
     "ffprobe": ReloadClass.LIVE,
     "dry_run": ReloadClass.LIVE,
