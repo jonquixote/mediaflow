@@ -1,4 +1,4 @@
-"""Targeted deployment-safety regressions for the reviewed f058bb3 baseline."""
+"""[DEPLOY-4] Targeted deployment-safety regressions for reviewed baseline f058bb3."""
 
 from __future__ import annotations
 

@@ -224,6 +224,7 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-13** untrusted input: protocol whitelist, format allowlist, regular files only.
 - **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
 - **DEPLOY-1** every unverified claim has one registry item; only recorded on-box evidence can verify it.
+- **DEPLOY-4** host-only install and runtime startup do not touch library metadata; observational commands do not create state; no software/x265 probing in the initial workflow or automatic retests.
 - **DEPLOY-2** doctor is a read-only preflight with pass/fail/unknown outcomes and class-aware exit codes.
 - **DEPLOY-3** installer/upgrade rehearsal and redacted evidence bundles are tested; no on-box item is marked verified by the agent.
 - **STATE-1** one shared job-state vocabulary; RESTORED is terminal history and does not block a re-drop.
@@ -298,9 +299,12 @@ controls are supplied only when the callable accepts them.
 
 Pass D does not deploy. It provides a hardware-check registry, a read-only
 doctor preflight, an installer rehearsal, an ordered first-run kit and a
-redacted evidence-bundle workflow. All on-box items remain unverified until
-John supplies recorded evidence. See `docs/hardware_checks.toml`,
-`docs/DEPLOYMENT.md`, `docs/FIRST_RUN.md` and `docs/VERIFIED.md`.
+redacted evidence-bundle workflow. Host-only installation must not initialize
+media roots or change service state, and default doctor/diagnostics must not
+run encoding probes. All on-box items remain unverified until John supplies
+recorded evidence. See `docs/hardware_checks.toml`,
+`docs/DEPLOYMENT_SAFETY_HANDOFF.md`, `docs/DEPLOYMENT.md`, `docs/FIRST_RUN.md`
+and `docs/VERIFIED.md`.
 
 ## 11-12. Deployment and tests
 

@@ -34,9 +34,26 @@ required failure, `3` an enabled-feature failure, `4` a required unknown. Do
 not continue past a required failure. Record the exact output under the
 registry item you are addressing.
 
-## 1. Device and capability checks — HW-001 to HW-005, HW-020, HW-021
+## 1. Non-encoding diagnostics and separately approved capability checks — HW-001 to HW-005, HW-020, HW-021
 
-Run doctor as the service user, then capture one item at a time:
+Default `doctor` is non-encoding and read-only. It never probes a backend and
+never invokes software/x265:
+
+```sh
+sudo -u mediaflow -g media "$MF" --config "$CFG" doctor --json
+```
+
+Only after separate approval, request hardware-only capability probes. This
+step acquires the processing slot, creates temporary probe output, and may
+encode with qsv/vaapi. It never probes `software`:
+
+```sh
+sudo -u mediaflow -g media "$MF" --config "$CFG" doctor --capabilities --backends qsv,vaapi --json
+```
+
+`--backends software` is rejected. A skipped, deferred or incomplete probe is
+recorded as unknown; it is never a pass, an unsupported result, or complete
+acceptance evidence. Capture one item at a time:
 
 ```sh
 scripts/capture_evidence.sh "$EVIDENCE" HW-001 -- \
@@ -67,7 +84,7 @@ true`. Use the VFR and 10-bit clips for HW-030 and HW-003 if available.
 Use a scratch root, one disposable clip and `dry_run=false` only for that job.
 Inspect the published output with `ffprobe`, confirm `hvc1`, planned audio and
 subtitle streams, naming, sidecars and no overwrite. Verify the staged publish
-and marker order (HW-034); interrupt before the rename on a second disposable
+and marker order (HW-042); interrupt before the rename on a second disposable
 clip and confirm no partial folder appears in `movies/`.
 
 ## 4. Jellyfin direct-play — HW-009, HW-012, HW-013
@@ -92,7 +109,7 @@ Do not pull power unless John explicitly accepts the machine risk (HW-014).
 Back up and restore a copy of `state.db` while stopped. Rehearse a config
 reload with a live key and a restart-required key, then restart and confirm the
 hold clears. Run a schema migration on a **copy** of the database, never the
-live file. Confirm restore/re-drop creates a fresh job (HW-044).
+live file. Confirm restore/re-drop creates a fresh job (HW-041).
 
 ## 7. Calibration and thresholds — HW-016 to HW-019, HW-039
 

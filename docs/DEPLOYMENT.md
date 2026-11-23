@@ -12,7 +12,26 @@ John runs every command below. The agent never runs `install.sh`, `sudo`,
 `systemctl`, or any command against the real media or state roots. All rehearsal
 tests use `MEDIAFLOW_INSTALL_TEST=1` and fake roots under `/tmp`.
 
-## Fresh install
+## Host-only install (supported initial phase)
+
+The supported initial install changes only host files. It does **not** create
+or change anything beneath `/srv/media`, enable or start services, or change
+pre-existing service states:
+
+```sh
+sudo MEDIAFLOW_INSTALL_HOST_ONLY=1 ./install.sh
+```
+
+Preconditions: reviewed code and John's approval for host-file changes.
+Expected exit status: `0`. Verify that the daemon remains stopped/disabled,
+timers remain untouched, `/srv/media/movies` ownership is still
+`john:agentwork`, and `/srv/media/music` is unchanged. Rollback is reinstalling
+the previous release or removing only files this command created in
+`/opt/mediaflow`, `/etc/mediaflow`, `/var/lib/mediaflow` and
+`/usr/share/doc/mediaflow`; never remove existing config, secrets, state or
+media. Media initialization is a separate, explicitly approved phase.
+
+## Fresh install (only after media-initialization approval)
 
 1. Record the revision: `git -C /srv/agent-work/mediaflow rev-parse HEAD`.
 2. Review `install.sh`, `systemd/*.service`, `config/config.toml.example` and

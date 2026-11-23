@@ -39,6 +39,14 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
+### Deployment safety corrections
+
+- Added host-only install mode that leaves media roots and service state untouched.
+- Runtime startup/scan no longer creates or normalizes library directories.
+- Observational CLI commands use immutable read-only state and never create a DB.
+- Default doctor is non-encoding; hardware capability probes are explicit, hardware-only and never use software/x265.
+- Corrected registry references and documented doctor exit semantics in a durable handoff.
+
 ### Pass D (deployment readiness)
 
 - Added the authoritative hardware-check registry with generated markdown and

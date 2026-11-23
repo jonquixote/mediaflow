@@ -5,6 +5,25 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Sandbox verification - deployment safety corrections
+
+Implementation revision tested: `4d8a12d`, based on reviewed baseline
+`f058bb34f9e73f1c292ab3104f56b414ad20eb99`. Commands run:
+
+```sh
+.venv/bin/python tools/gen_invariants.py
+.venv/bin/python tools/gen_hardware_checks.py
+.venv/bin/python -m pytest -q tests/test_deployment_safety.py
+scripts/check.sh
+```
+
+Results: `11 passed` focused; `6 passed in 0.22s` traceability;
+`863 passed in 46.44s` unit/integration; `863 passed in 46.54s` full suite.
+No skips. No hardware, production-media, service or system configuration
+action occurred. See `docs/DEPLOYMENT_SAFETY_HANDOFF.md` for dispositions,
+side-effect matrix and staged commands. No on-hardware registry item was
+marked verified.
+
 ## Review record and sandbox verification - 2026-11-22 (Pass D: deployment readiness)
 
 Verified starting state: `main`/`origin/main` at
