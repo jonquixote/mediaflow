@@ -3,9 +3,14 @@
 **Spec v1.0** for john-server (Ubuntu Server 26.04.1 LTS, MacBookPro14,1, Intel i5-7360U, Iris Plus 640).
 Default output container: **MP4**. Owner: john. Builder: the coding agent (`agent` user), reviewed by john.
 
-The machine-readable requirement registry is `docs/requirements.toml`. Every
-normative ID lives there. `docs/INVARIANTS.md` is generated from the
-safety-flagged entries and is never edited by hand.
+The machine-readable requirement registry is `docs/requirements.toml`; it is
+authoritative for requirement IDs, wording and safety flags. `docs/INVARIANTS.md`
+is generated from its safety-flagged entries and is never edited by hand.
+`docs/PLAN_SCHEMA.md` is authoritative for persisted plan fields and their
+meaning. `docs/RUNBOOK.md` is authoritative for operator procedure, and
+`docs/VERIFIED.md` records only commands that were actually run. This SPEC and
+its detailed tables are explanatory; if they disagree with the registry,
+schema or code, those authorities win.
 
 ## 0. Reading this document
 
@@ -91,10 +96,12 @@ video, and reviews multiple videos or multi-disc entries. PLANNED records the
 full stream plan, target dimensions, name, path and estimate. Dry-run leaves
 the job PLANNED and moves nothing; flipping dry-run off re-plans once. ENCODING
 obeys start gates and writes partial output. VERIFIED hashes and runs all
-safety checks. NAMED resolves identity. PUBLISHED builds a folder in work and
-renames it into the library with a hidden marker. RETIRED moves the original to
+safety checks. NAMED resolves identity. PUBLISHED builds the final folder in
+work on the library filesystem, writes its hidden marker last, and publishes
+with one atomic no-replace rename. The verified output is moved into that
+folder; no output hard link or byte copy is used. RETIRED moves the original to
 trash and writes a manifest. DONE archives logs, updates stats and the speed
-table and cleans work.
+table (once per job) and cleans work.
 
 Review reasons and resume states are defined in the review table. Clearing a
 review never skips planning, encoding or verification.
@@ -175,6 +182,15 @@ count toward a stall or overall-timeout limit.
 Existing encoder and verifier call shapes remain supported; the engine passes
 new supervision controls only when the callable accepts them.
 
+The in-flight disk reserve is a bounded heuristic: the gross budget is the
+planned source video bytes (falling back to total source bytes); with no real
+media progress the full gross budget is reserved; with progress it is the
+larger of `gross * (1 - progress)` and a linear projection from partial bytes,
+capped by the `1.2 * source_size` admission envelope. It is clamped to
+`[0, cap]` and is not a guaranteed upper bound on the final output; the
+additive emergency low-water reserve covers nonlinear growth. A missing gross
+budget returns no estimate and the guard keeps its full source-size fallback.
+
 MP4 rules: MP4-1, MP4-2, MP4-3, MP4-4, MP4-5, MP4-6, MP4-7, MP4-8, MP4-9,
 MP4-10, MP4-11, MP4-12. MKV-1. Size rules: SIZE-1, SIZE-2, SIZE-3, SIZE-4,
 SIZE-5. Backend tests run 8-bit and 10-bit HEVC with the exact preset options
@@ -192,12 +208,12 @@ entry. Reject unknown keys/ids and out-of-range values.
 
 - **SAF-1** originals only move to trash; no early automatic purge.
 - **SAF-2** verify before publish; failures leave the original untouched.
-- **SAF-3** atomic publish, one filesystem, every move one rename.
+- **SAF-3** atomic publish from a staged work folder with one no-replace rename; no output hard link or byte copy.
 - **SAF-4** never overwrite; duplicate goes to REVIEW; replace records an intent and moves the old copy to trash first.
 - **SAF-5** one guarded delete function and one retire_move; no shell.
 - **SAF-6** crash-safe, idempotent recovery in every window, including marker adoption and intents.
 - **SAF-7** one daemon and one writer via flock; one encode at a time.
-- **SAF-8** free-space guards before/during encode and before publish; trash counts; never early purge.
+- **SAF-8** source-size admission envelope before encode and publish; publish adds only staged sidecar bytes; mid-encode uses bounded net remaining work plus emergency reserve; trash counts; never early purge.
 - **SAF-9** layered machine protection: systemd limits, start gates, thermal stop, hwmon discovery, fail closed, never touch fans/PROCHOT.
 - **SAF-10** unprivileged service; secrets only in env files, bearer header, redacted everywhere.
 - **SAF-11** fresh install dry-run; explicit logged disable; nothing moves in dry-run.
@@ -250,9 +266,9 @@ below is its human-readable mirror; the code is authoritative if they differ.
 
 | Class | Keys | Effect |
 |---|---|---|
-| restart-required | `root`, `state_dir`, `runtime_dir`, `ffmpeg`, `poll_seconds`, `review_reminder_days`, `notify_cooldown_hours` | Old effective value stays until restart; status shows `restart-required:*`. |
-| future-jobs | `append_tmdbid`, `stall_minutes`, `temp_sensor` | Captured per operation/job; new operations use the new value. |
-| live | `ffprobe`, `dry_run`, `stable_seconds`, `trash_retention_days`, `failed_retention_days`, `min_free_gb`, `root_min_free_gb`, `max_trash_gb`, `space_watchdog_seconds`, `pause_when_jellyfin_transcoding`, `pause_on_battery`, `pause_method`, `start_if_temp_below_c`, `thermal_pause_c`, `thermal_resume_c`, `progress_seconds`, `max_restarts`, `min_output_kbps`, `min_bpp`, `jellyfin_user` | Applied between operations at the next gate/check. |
+| restart-required | `root`, `state_dir`, `runtime_dir`, `ffmpeg`, `temp_sensor` | Old effective value stays until restart; status shows `restart-required:*`. `temp_sensor` is protection policy: changing it under a live operation could make thermal protection blind. |
+| future-jobs | `append_tmdbid`, `stall_minutes` | Captured per operation/job; new operations use the new value. |
+| live | `ffprobe`, `dry_run`, `poll_seconds`, `review_reminder_days`, `notify_cooldown_hours`, `stable_seconds`, `trash_retention_days`, `failed_retention_days`, `min_free_gb`, `root_min_free_gb`, `max_trash_gb`, `space_watchdog_seconds`, `pause_when_jellyfin_transcoding`, `pause_on_battery`, `pause_method`, `start_if_temp_below_c`, `thermal_pause_c`, `thermal_resume_c`, `progress_seconds`, `max_restarts`, `min_output_kbps`, `min_bpp`, `jellyfin_user` | Applied between operations; `poll_seconds` updates the daemon loop and notifier keys rebind the notifier at the reload boundary. |
 | rejected | any secret-like or unknown key | `config.toml` never holds secrets; unknown keys are errors. |
 
 `dry_run = true` is a start gate: PLANNED jobs re-plan once in either

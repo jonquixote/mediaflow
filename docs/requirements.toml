@@ -26,7 +26,7 @@ id = "SAF-3"
 title = "Atomic publish and one filesystem"
 safety = true
 section = "7"
-text = "Publish is one rename() into movies/. inbox, convert, work, review, failed, trash and movies must share one st_dev or the daemon refuses to run. Every move is therefore a single rename."
+text = "The final folder is staged in work/ on the library filesystem and published with one atomic no-replace rename into movies/. The verified output is moved into the staged folder; no output hard link or byte copy is used. inbox, convert, work, review, failed, trash and movies must share one st_dev or the daemon refuses to run. Every move is therefore a single rename."
 test = "tests/test_safety.py"
 
 [[requirements]]
@@ -66,7 +66,7 @@ id = "SAF-8"
 title = "Free-space guard"
 safety = true
 section = "7"
-text = "Free space must be at least max(1.2 * source_size, min_free_gb) before encode and before publish. During encode, the watchdog pauses unless free space covers net remaining work plus an additive min_free_gb / 2 emergency reserve; bytes already written are not subtracted twice. Root and DB filesystems need root_min_free_gb. Trash counts and pauses above max_trash_gb. Trash is never purged early."
+text = "Free space must be at least max(1.2 * source_size, min_free_gb) before encode and before publish; at publish the only additive reservation is the size of text sidecars staged with the output, because the output itself is moved on one filesystem. During encode, the watchdog pauses unless free space covers the bounded net remaining-work estimate plus an additive min_free_gb / 2 emergency reserve; bytes already written are not subtracted twice. Root and DB filesystems need root_min_free_gb. Trash counts and pauses above max_trash_gb. Trash is never purged early."
 test = "tests/test_guards.py"
 
 [[requirements]]

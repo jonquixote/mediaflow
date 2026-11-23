@@ -27,6 +27,7 @@ stream indexes as reported by ffprobe. Paths in the plan are absolute.
   "video": {
     "index": 0,
     "codec": "h264",
+    "source_codec": "h264",
     "width": 1920,
     "height": 1080,
     "target_width": 1280,
@@ -105,6 +106,11 @@ Rules:
   old plan.
 - `action=remux` means video stream copy. It can be selected by SIZE-1
   (already efficient) or be the preset's action.
+- A SIZE-2 fallback remux is rebuilt from `video.source_codec` and the source
+  geometry: `video.codec` is the copied source codec, `target_width/height`
+  equal `width/height`, `scaled=false`, and encode-only fields (`quality`,
+  `encoder`, `backend`, `look_ahead`) are absent. Audio and subtitle
+  selections are reused unchanged.
 - `container=mkv` implies MKV remux rules; audio/subtitle streams are
   selected but copied.
 - For MP4 HEVC, `video.tag` is `hvc1`.
