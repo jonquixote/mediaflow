@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -91,12 +91,18 @@ class DoctorReport:
                 if c.status == "fail" and c.check_class == "feature-conditional"]
 
     @property
+    def required_unknowns(self) -> list[Check]:
+        return [c for c in self.checks
+                if c.status == "warn" and c.check_class == "required"]
+
+    @property
     def unknowns(self) -> list[Check]:
         return [c for c in self.checks if c.status == "warn"]
 
     @property
     def ok(self) -> bool:
-        return not self.required_failures and not self.feature_failures
+        return not self.required_failures and not self.feature_failures \
+            and not self.required_unknowns
 
     @property
     def warnings(self) -> int:
@@ -110,8 +116,7 @@ class DoctorReport:
             return 2
         if self.feature_failures:
             return 3
-        if any(c.status == "warn" and c.check_class == "required"
-               for c in self.checks):
+        if self.required_unknowns:
             return 4
         return 0
 
@@ -125,6 +130,7 @@ class DoctorReport:
                 "unknown": sum(c.outcome == "unknown" for c in self.checks),
                 "required_failures": len(self.required_failures),
                 "feature_failures": len(self.feature_failures),
+                "required_unknowns": len(self.required_unknowns),
                 "informational": sum(c.check_class == "informational" for c in self.checks),
             },
             "warnings": self.warnings,
@@ -734,25 +740,68 @@ _INFORMATIONAL_CHECKS = {
 }
 
 
-def _classify_checks(report: DoctorReport, config: Any) -> DoctorReport:
+def apply_backend_acceptance(report: DoctorReport, policy: str, *,
+                             enabled_backends: frozenset[str] | None = None) -> DoctorReport:
+    """Apply an explicit backend acceptance policy to feature checks.
+
+    This is separate from requesting probes. Probing two backends never means
+    both are required. ``none`` makes backend results informational.
+    """
+
+    if policy not in {"none", "qsv-required", "vaapi-required", "either"}:
+        raise ValueError(f"unknown backend acceptance policy: {policy!r}")
+    enabled = enabled_backends or frozenset({"qsv", "vaapi"})
+    checks = [replace(check, meta=dict(check.meta)) for check in report.checks]
+    backend_checks = {c.name: c for c in checks
+                      if c.name in {"encode-qsv", "encode-vaapi"}}
+    passing = {name.removeprefix("encode-") for name, check in backend_checks.items()
+               if check.status == "ok"}
+    for name, check in backend_checks.items():
+        backend = name.removeprefix("encode-")
+        if backend not in enabled:
+            check.check_class = "informational"
+            continue
+        if policy == "none":
+            check.check_class = "informational"
+        elif policy == "qsv-required":
+            check.check_class = "feature-conditional" if backend == "qsv" else "informational"
+        elif policy == "vaapi-required":
+            check.check_class = "feature-conditional" if backend == "vaapi" else "informational"
+        elif policy == "either":
+            # One working backend is sufficient; a failing optional backend is
+            # informational. If none work, both failures are feature failures.
+            check.check_class = (
+                "informational" if passing else "feature-conditional"
+            )
+    return DoctorReport(checks)
+
+
+def _classify_checks(report: DoctorReport, config: Any, acceptance: str = "none") -> DoctorReport:
     """Attach outcome classes so exit codes reflect feature and info results."""
 
-    enabled = {str(getattr(value, "backend", "")).lower()
+    enabled = {str(getattr(value, "video", getattr(value, "backend", ""))).lower()
                for value in (getattr(config, "presets", {}) or {}).values()
-               if getattr(value, "action", "") == "encode"} if hasattr(config, "presets") else set()
+               if getattr(getattr(value, "video", None), "action", "") == "encode"
+               or getattr(value, "action", "") == "encode"} if hasattr(config, "presets") else set()
+    enabled = {name for name in enabled if name in {"qsv", "vaapi", "software"}}
     for check in report.checks:
-        if check.name in _INFORMATIONAL_CHECKS:
+        if check.name == "temp-sensor" and str(
+            getattr(config, "temp_sensor", "auto")
+        ).lower() == "none":
+            check.check_class = "informational"
+        elif check.name in _INFORMATIONAL_CHECKS:
             check.check_class = "informational"
         elif check.name in _FEATURE_CHECKS:
             check.check_class = "feature-conditional"
         elif check.name.startswith("encode-"):
             check.check_class = "feature-conditional"
-    return report
+    return apply_backend_acceptance(report, acceptance, enabled_backends=frozenset(enabled))
 
 
 def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Path | None = None,
                secrets: Any = None, run_capabilities: bool = False,
                capability_backends: tuple[str, ...] | None = None,
+                backend_acceptance: str = "none",
                 ffmpeg_runner: Callable[..., Any] | None = None) -> DoctorReport:
     checks: list[Check] = []
     ffmpeg = str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
@@ -1122,7 +1171,12 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
         check_class="informational" if not unit_text else "required",
     ))
 
-    return _classify_checks(DoctorReport(checks), config)
+    checks.append(Check(
+        "subprocess-audit", "ok",
+        "default doctor runs supervised ffmpeg -version only; capability mode adds supervised ffmpeg probes",
+        check_class="informational",
+    ))
+    return _classify_checks(DoctorReport(checks), config, backend_acceptance)
 
 
 def format_doctor(report: DoctorReport, *, short: bool = False) -> str:

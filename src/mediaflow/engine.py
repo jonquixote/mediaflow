@@ -256,6 +256,15 @@ class Engine:
     # ------------------------------------------------------------------
     def start(self) -> None:
         self._ensure_dirs()
+        if not self._manage_media_dirs:
+            required = (self.movies, self.inbox, self.convert_movies, self.work,
+                        self.review, self.failed, self.trash)
+            missing = [str(path) for path in required if not path.is_dir()]
+            if missing:
+                raise EngineError(
+                    "missing required media path(s); run the explicitly approved "
+                    "media initialization step first: " + ", ".join(missing)
+                )
         self._check_paths()
         self.recover()
         self._started = True

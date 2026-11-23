@@ -142,8 +142,11 @@ class Store:
             # Observational commands must never create or migrate a database.
             if not self.path.is_file():
                 raise DatabaseError(f"state.db not found: {self.path}")
+            # mode=ro is WAL/locking aware: it sees uncheckpointed commits and
+            # honours SQLite locking. It may create a -shm auxiliary file; this
+            # is documented rather than hidden behind immutable=1.
             self._conn = sqlite3.connect(
-                f"file:{self.path}?mode=ro&immutable=1", uri=True,
+                f"file:{self.path}?mode=ro", uri=True,
                 timeout=5.0, check_same_thread=False,
             )
         self._conn.row_factory = sqlite3.Row
@@ -308,9 +311,39 @@ class Store:
 
     # -- health ---------------------------------------------------------
     def integrity_check(self) -> None:
-        rows = [r[0] for r in self._conn.execute("PRAGMA integrity_check").fetchall()]
+        try:
+            rows = [r[0] for r in self._conn.execute("PRAGMA integrity_check").fetchall()]
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"state.db is not a readable SQLite database: {exc}") from exc
         if rows != ["ok"]:
             raise DatabaseError("state.db integrity_check failed: " + "; ".join(rows))
+
+    def check_schema(self) -> int:
+        """Validate compatibility without migrating. Returns the stored version."""
+
+        self.integrity_check()
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"cannot read schema_version: {exc}") from exc
+        if row is None:
+            raise DatabaseError("state.db has no schema_version; initialization required")
+        try:
+            version = int(row[0])
+        except (TypeError, ValueError) as exc:
+            raise DatabaseError(f"invalid schema_version: {row[0]!r}") from exc
+        if version > SCHEMA_VERSION:
+            raise DatabaseError(
+                f"state.db schema {version} is newer than supported {SCHEMA_VERSION}"
+            )
+        if version < SCHEMA_VERSION:
+            raise DatabaseError(
+                f"state.db schema {version} is older than supported {SCHEMA_VERSION}; "
+                "run approved maintenance to migrate"
+            )
+        return version
 
     def backup(self, destination: Path, keep: int = 3) -> Path:
         destination = Path(destination)

@@ -3,7 +3,8 @@
 # It never touches Jellyfin configuration, SSH, ufw, Tailscale, or the vault.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${MEDIAFLOW_INSTALL_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+REPO_DIR="$(cd "$REPO_DIR" && pwd -P)"
 # Production paths are fixed by the systemd units and config example. The
 # MEDIAFLOW_INSTALL_* overrides exist only for sandbox rehearsals and never
 # change production behaviour when unset.
@@ -59,7 +60,64 @@ install_file() {
   fi
 }
 
+# --- fail-closed preflight --------------------------------------------------
+# Every refusal happens before any file or service state is changed.
+REVISION="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ ${#REVISION} -ne 40 ]]; then
+  echo "preflight: cannot determine a full 40-character checkout revision" >&2
+  exit 3
+fi
+DIRTY="$(git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+if [[ -n "$DIRTY" && "${MEDIAFLOW_INSTALL_ALLOW_DIRTY:-0}" != "1" ]]; then
+  echo "preflight: tracked checkout is dirty; refuse before any writes" >&2
+  printf '%s\n' "$DIRTY" >&2
+  exit 3
+fi
+SERVICE_STATE="${MEDIAFLOW_INSTALL_SERVICE_STATE:-}"
+if [[ -z "$SERVICE_STATE" && "$TEST_MODE" != "1" ]]; then
+  ACTIVE="$(systemctl is-active mediaflow.service 2>/dev/null || true)"
+  ENABLED="$(systemctl is-enabled mediaflow.service 2>/dev/null || true)"
+  SERVICE_STATE="$ACTIVE $ENABLED"
+fi
+if [[ "$SERVICE_STATE" =~ active || "$SERVICE_STATE" =~ enabled ]]; then
+  echo "preflight: mediaflow.service is active/enabled ($SERVICE_STATE); refuse before writes" >&2
+  echo "a separately approved stop/disable transition is required first" >&2
+  exit 3
+fi
+for path in "$CONFIG_DIR/config.toml" "$CONFIG_DIR/tmdb.env" "$CONFIG_DIR/notify.env" \
+            "$SYSTEMD_DIR/mediaflow.service" "$PREFIX" "$STATE_DIR"; do
+  if [[ -L "$path" ]]; then
+    echo "preflight: refusing to follow or replace symlink destination: $path" >&2
+    exit 3
+  fi
+done
+if [[ "$HOST_ONLY" != "1" && "$TEST_MODE" != "1" && -e "$ROOT/movies" ]]; then
+  case "$(stat -c '%U:%G' "$ROOT/movies" 2>/dev/null || true)" in
+    john:agentwork|mediaflow:media) ;;
+    *)
+      echo "preflight: unexpected ownership on $ROOT/movies; refusing metadata change" >&2
+      exit 3
+      ;;
+  esac
+fi
+
+MANIFEST_PATH="$STATE_DIR/install-manifest.json"
+EXISTING_PATHS=()
+for path in "$PREFIX" "$CONFIG_DIR" "$STATE_DIR" "$SYSTEMD_DIR" "$DOC_DIR" \
+            "$CONFIG_DIR/config.toml" "$CONFIG_DIR/tmdb.env" "$CONFIG_DIR/notify.env"; do
+  if [[ -e "$path" ]]; then EXISTING_PATHS+=("$path"); fi
+done
+ALL_PATHS=("$PREFIX" "$PREFIX/venv" "$CONFIG_DIR" "$CONFIG_DIR/presets.d" \
+           "$CONFIG_DIR/experimental" "$CONFIG_DIR/config.toml" "$CONFIG_DIR/tmdb.env" \
+           "$CONFIG_DIR/notify.env" "$STATE_DIR" "$STATE_DIR/backup" "$STATE_DIR/logs" \
+           "$SYSTEMD_DIR" "$DOC_DIR" "$ROOT")
+CREATED_PATHS=()
+REPLACED_PATHS=()
+PRESERVED_PATHS=("${EXISTING_PATHS[@]}")
+
 echo "mediaflow installer"
+echo "  repo:   $REPO_DIR"
+echo "  rev:    $REVISION"
 echo "  repo:   $REPO_DIR"
 echo "  prefix: $PREFIX"
 echo "  config: $CONFIG_DIR"
@@ -171,6 +229,41 @@ else
   run_priv systemctl daemon-reload
   run_priv systemctl enable mediaflow.service
 fi
+
+# --- artifact manifest ------------------------------------------------------
+mkdir -p "$STATE_DIR"
+PATH_LIST="$(mktemp)"
+PRESERVED_LIST="$(mktemp)"
+printf '%s\n' "${ALL_PATHS[@]}" > "$PATH_LIST" || true
+printf '%s\n' "${PRESERVED_PATHS[@]}" > "$PRESERVED_LIST" || true
+MF_MANIFEST_PATH="$MANIFEST_PATH" MF_PATHS_FILE="$PATH_LIST" \
+MF_PRESERVED_FILE="$PRESERVED_LIST" \
+MF_REVISION="$REVISION" MF_HOST_ONLY="$HOST_ONLY" MF_TEST_MODE="$TEST_MODE" \
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+manifest = Path(os.environ["MF_MANIFEST_PATH"])
+paths_file = Path(os.environ["MF_PATHS_FILE"])
+all_paths = [line for line in paths_file.read_text().splitlines() if line]
+preserved = [line for line in Path(os.environ["MF_PRESERVED_FILE"]).read_text().splitlines() if line]
+created = [p for p in all_paths if p not in preserved and Path(p).exists()]
+data = {
+    "schema": 1,
+    "revision": os.environ["MF_REVISION"],
+    "host_only": os.environ["MF_HOST_ONLY"] == "1",
+    "test_mode": os.environ["MF_TEST_MODE"] == "1",
+    "created": created,
+    "replaced": [p for p in preserved if Path(p).is_file()],
+    "preserved": preserved,
+    "principals": {
+        "mediaflow_group": os.environ.get("MF_GROUP_MEDIAFLOW", "checked"),
+        "media_group": os.environ.get("MF_GROUP_MEDIA", "checked"),
+        "mediaflow_user": os.environ.get("MF_USER_MEDIAFLOW", "checked"),
+    },
+}
+manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+rm -f "$PATH_LIST" "$PRESERVED_LIST"
 
 if [[ "$HOST_ONLY" == "1" ]]; then
   cat <<EOF

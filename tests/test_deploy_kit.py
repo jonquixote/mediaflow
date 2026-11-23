@@ -25,6 +25,7 @@ def _install_env(tmp_path: Path) -> dict:
     env = dict(os.environ)
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
+        "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
         "MEDIAFLOW_INSTALL_PREFIX": str(tmp_path / "opt" / "mediaflow"),
         "MEDIAFLOW_INSTALL_CONFIG_DIR": str(tmp_path / "etc" / "mediaflow"),
         "MEDIAFLOW_INSTALL_ROOT": str(tmp_path / "media"),
@@ -83,8 +84,8 @@ def _bundle(tmp_path: Path, *, item="HW-001", exit_code=0, outputs=True, valid=T
     directory = tmp_path / "bundle" / item
     directory.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "schema": 1, "item_id": item, "timestamp": "2026-11-22T00:00:00+00:00",
-        "revision": "abc1234def", "command": ["mediaflow", "doctor", "--json"],
+        "schema": 2, "item_id": item, "timestamp": "2026-11-22T00:00:00+00:00",
+        "revision": "a" * 40, "command": ["mediaflow", "doctor", "--json"],
         "exit_code": exit_code,
         "outputs": [str(directory / "stdout.txt")] if outputs else [],
     }
@@ -99,11 +100,15 @@ def test_evidence_bundle_validates_and_updates_registry(tmp_path):
     assert evidence.validate(bundle)["item_id"] == "HW-001"
     registry = tmp_path / "hardware_checks.toml"
     registry.write_text((ROOT / "docs" / "hardware_checks.toml").read_text())
-    assert evidence.update_registry(bundle, registry) == "HW-001"
+    evidence.accept(bundle, accepted_by="John", notes="reviewed",
+                     expected_revision="a" * 40)
+    assert evidence.update_registry(
+        bundle, registry, expected_revision="a" * 40,
+    ) == "HW-001"
     data = tomllib.loads(registry.read_text())
     item = next(c for c in data["checks"] if c["id"] == "HW-001")
     assert item["status"] == "verified-on-hardware"
-    assert item["verified_revision"] == "abc1234def"
+    assert item["verified_revision"] == "a" * 40
 
 
 def test_evidence_validator_rejects_incomplete_and_tampered_bundles(tmp_path):

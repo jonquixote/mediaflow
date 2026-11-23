@@ -225,6 +225,7 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
 - **DEPLOY-1** every unverified claim has one registry item; only recorded on-box evidence can verify it.
 - **DEPLOY-4** host-only install and runtime startup do not touch library metadata; observational commands do not create state; no software/x265 probing in the initial workflow or automatic retests.
+- **DEPLOY-5** fail-closed installer preflight, explicit doctor acceptance, truthful state errors and separated evidence acceptance before registry mutation.
 - **DEPLOY-2** doctor is a read-only preflight with pass/fail/unknown outcomes and class-aware exit codes.
 - **DEPLOY-3** installer/upgrade rehearsal and redacted evidence bundles are tested; no on-box item is marked verified by the agent.
 - **STATE-1** one shared job-state vocabulary; RESTORED is terminal history and does not block a re-drop.

@@ -76,10 +76,11 @@ def _open_store(cfg: Config, *, observation: bool = False) -> Store | None:
     """
 
     if observation:
-        try:
-            return Store(cfg.db_path, read_only=True)
-        except DatabaseError:
+        if not cfg.db_path.is_file():
             return None
+        store = Store(cfg.db_path, read_only=True)
+        store.check_schema()
+        return store
     store = Store(cfg.db_path)
     store.initialize()
     return store
@@ -98,9 +99,11 @@ def _make_engine(cfg: Config, secrets: Any, presets: dict, store: Store) -> Engi
 
 def _status_payload(cfg: Config, store: Store | None = None) -> dict:
     status_file = cfg.status_path
+    liveness = "status-file" if status_file.exists() else "unknown"
     if status_file.exists():
         try:
             data = json.loads(status_file.read_text(encoding="utf-8"))
+            data.setdefault("liveness", "status-file")
             return data
         except Exception:
             pass
@@ -128,7 +131,15 @@ def _status_payload(cfg: Config, store: Store | None = None) -> dict:
             "trash_bytes": 0, "last_success": None, "dry_run": cfg.dry_run,
             "config_generation": int(getattr(cfg, "generation", 1) or 1),
             "pending_config_generation": None, "restart_required": [],
-            "updated_at": time.time()}
+            "liveness": liveness, "updated_at": time.time()}
+
+
+def _liveness_label(data: Mapping) -> str:
+    if data.get("paused_reasons"):
+        return "PAUSED"
+    if data.get("liveness") == "status-file":
+        return "reported-running"
+    return "unknown"
 
 
 def cmd_status(args) -> int:
@@ -143,7 +154,7 @@ def cmd_status(args) -> int:
         print(_json(data))
         return 0
     lines = [
-        f"state {'PAUSED' if data.get('paused_reasons') else 'running'}  dry-run {'on' if data.get('dry_run') else 'off'}",
+        f"state {_liveness_label(data)}  dry-run {'on' if data.get('dry_run') else 'off'}",
         f"queue {data.get('queue', 0)}  reviews {data.get('reviews', 0)}",
         f"config gen {data.get('config_generation', '?')}",
     ]
@@ -232,7 +243,7 @@ def cmd_plan(args) -> int:
     store = _open_store(cfg, observation=True)
     if store is None:
         print("no state database; start mediaflow once before plan", file=sys.stderr)
-        return 0
+        return 3
     try:
         engine = _make_engine(cfg, secrets, presets, store)
         path = Path(args.path)
@@ -435,6 +446,7 @@ def cmd_doctor(args) -> int:
         presets_dir=_presets_dir(_config_path(args)), secrets=secrets,
         run_capabilities=run_capabilities,
         capability_backends=backends if run_capabilities else None,
+        backend_acceptance=getattr(args, "accept_backends", "none"),
     )
     if args.json:
         print(_json(report.as_dict()))
@@ -479,7 +491,7 @@ def cmd_estimate(args) -> int:
     store = _open_store(cfg, observation=True)
     if store is None:
         print("no state database; start mediaflow once before estimate", file=sys.stderr)
-        return 0
+        return 3
     try:
         engine = _make_engine(cfg, secrets, presets, store)
         info = engine.estimate_path(Path(args.path), preset_id=args.preset)
@@ -502,8 +514,8 @@ def cmd_library(args) -> int:
     from .library import format_report, library_report
     store = _open_store(cfg, observation=True)
     if store is None:
-        print("no state database; nothing to report", file=sys.stderr)
-        return 0
+        print("no state database; initialize mediaflow before library report", file=sys.stderr)
+        return 3
     try:
         report = library_report(cfg.movies, store, ffprobe=cfg.ffprobe)
         if args.json:
@@ -575,6 +587,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run explicitly approved hardware-only capability probes")
     s.add_argument("--backends", default="qsv,vaapi",
                    help="comma-separated hardware backends for --capabilities")
+    s.add_argument("--accept-backends", choices=["none", "qsv-required", "vaapi-required", "either"],
+                   default="none", help="backend acceptance policy; separate from probing")
     s.set_defaults(func=cmd_doctor)
     s = sub.add_parser("maintenance", parents=[common]); s.set_defaults(func=cmd_maintenance)
 
@@ -611,7 +625,10 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return exc.code
-    except (ConfigError, DatabaseError) as exc:
+    except DatabaseError as exc:
+        print(f"mediaflow: {exc}", file=sys.stderr)
+        return 3
+    except ConfigError as exc:
         print(f"mediaflow: {exc}", file=sys.stderr)
         return 4
     except KeyboardInterrupt:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Redacted on-box evidence bundles and registry status updates.
+"""Redacted evidence bundles, integrity validation and explicit acceptance.
 
-The sandbox agent never runs on-box checks and never marks an item
-verified-on-hardware. This tool is for John: it records command output with
-secrets and titles removed, validates a completed bundle, and only then writes
-the verified status into docs/hardware_checks.toml.
+Bundle integrity, a claim review and registry mutation are separate steps.
+A successful command or a syntactically valid bundle is not proof that a
+hardware claim was tested, and the agent never marks on-box items verified.
 """
 
 from __future__ import annotations
@@ -14,33 +13,33 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "docs" / "hardware_checks.toml"
-
 MANIFEST = "manifest.json"
+ACCEPTANCE = "acceptance.json"
 
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(token|secret|password|authorization|api[_-]?key|notify[_-]?url|tmdb[_-]?read[_-]?token)"
-    r"\s*[=:]\s*\S+"
+    r"\s*[=:]\s*(?!\*\*\*)\S+"
 )
-_BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]+")
+_BEARER = re.compile(r"(?i)bearer\s+(?!\*\*\*)[A-Za-z0-9._\-]+")
 _URL_CREDENTIALS = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^/@\s]+@(?P<host>[^/\s]+)")
 _TITLE = re.compile(r"(?<![\w])[A-Z][\w .'\-]{1,80}\(\d{4}\)(?:\[[^\]]+\])?")
 _MEDIA_PATH = re.compile(r"/srv/media\b")
+_REVISION = re.compile(r"[0-9a-f]{40}")
+_ITEM_ID = re.compile(r"HW-\d{3}")
 
 
 def redact_text(text: str) -> str:
-    """Remove secrets, credentials and likely media titles from captured text."""
-
     text = _BEARER.sub("Bearer ***", text)
     text = _SECRET_ASSIGNMENT.sub(lambda m: f"{m.group(1)}=***", text)
     text = _URL_CREDENTIALS.sub(lambda m: f"{m.group('scheme')}***@{m.group('host')}/…", text)
     text = _TITLE.sub("[TITLE]", text)
-    text = _MEDIA_PATH.sub("/srv/media/[REDACTED]", text)
-    return text
+    return _MEDIA_PATH.sub("/srv/media/[REDACTED]", text)
 
 
 def _revision() -> str:
@@ -49,40 +48,52 @@ def _revision() -> str:
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=5,
         )
-        return proc.stdout.strip() if proc.returncode == 0 else "unknown"
+        return proc.stdout.strip() if proc.returncode == 0 else ""
     except Exception:
-        return "unknown"
+        return ""
 
 
 def capture(bundle: Path, command: list[str], *, item_id: str, cwd: Path | None = None,
             extra: dict | None = None) -> dict:
-    """Run a command and store its redacted output in a timestamped bundle."""
-
     bundle = Path(bundle)
-    directory = bundle / item_id / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    directory.mkdir(parents=True, exist_ok=False)
+    bundle.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     proc = subprocess.run(command, capture_output=True, text=True, cwd=cwd)
     outputs = {}
     for name, text in (("stdout.txt", proc.stdout), ("stderr.txt", proc.stderr)):
-        (directory / name).write_text(redact_text(text), encoding="utf-8")
-        outputs[name] = str(directory / name)
+        filename = f"{item_id}-{stamp}-{name}"
+        target = bundle / filename
+        target.write_text(redact_text(text), encoding="utf-8")
+        outputs[filename] = str(target)
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "item_id": item_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "revision": _revision(),
         "command": [redact_text(part) for part in command],
         "exit_code": proc.returncode,
         "outputs": outputs,
+        "claim_demonstrated": False,
         "extra": redact_text(json.dumps(extra or {}, sort_keys=True)),
     }
-    (directory / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (bundle / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
 
 
-def validate(bundle: Path) -> dict:
-    """Return the manifest if the bundle is complete, consistent and safe."""
+def _resolve_output(directory: Path, raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_absolute():
+        path = directory / path
+    resolved = path.resolve()
+    root = directory.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"output escapes bundle: {raw}")
+    if path.is_symlink():
+        raise ValueError(f"output is a symlink: {raw}")
+    return resolved
 
+
+def validate(bundle: Path, *, expected_revision: str | None = None) -> dict:
     bundle = Path(bundle)
     path = bundle / MANIFEST
     if not path.is_file():
@@ -91,42 +102,74 @@ def validate(bundle: Path) -> dict:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"unreadable manifest: {exc}") from exc
-    required = {"schema", "item_id", "timestamp", "revision", "command", "exit_code", "outputs"}
+    required = {"schema", "item_id", "timestamp", "revision", "command",
+                "exit_code", "outputs"}
     if not required <= set(manifest):
         raise ValueError(f"incomplete manifest: {sorted(required - set(manifest))}")
-    if manifest["schema"] != 1:
+    if manifest["schema"] != 2:
         raise ValueError("unsupported bundle schema")
-    if not manifest["item_id"] or not re.fullmatch(r"HW-\d{3}", str(manifest["item_id"])):
+    if not _ITEM_ID.fullmatch(str(manifest["item_id"])):
         raise ValueError("invalid item_id")
+    if not _REVISION.fullmatch(str(manifest["revision"])):
+        raise ValueError("revision must be a full 40-character SHA")
+    if expected_revision and str(manifest["revision"]) != str(expected_revision):
+        raise ValueError("bundle revision does not match expected revision")
     if not manifest["command"]:
         raise ValueError("empty command")
     if manifest["exit_code"] != 0:
         raise ValueError(f"command failed with {manifest['exit_code']}")
-    if not manifest["revision"] or len(str(manifest["revision"])) < 7:
-        raise ValueError("missing revision")
     if not manifest["outputs"]:
         raise ValueError("no output evidence")
-    for name in manifest["outputs"]:
-        output = Path(name)
-        if not output.is_file() or output.stat().st_size == 0:
-            raise ValueError(f"missing or empty evidence file: {name}")
+    for raw in manifest["outputs"]:
+        output = _resolve_output(path.parent, str(raw))
+        if not output.is_file():
+            raise ValueError(f"missing evidence file: {raw}")
         text = output.read_text(encoding="utf-8", errors="replace")
-        if _BEARER.search(text) or _SECRET_ASSIGNMENT.search(text) or _TITLE.search(text):
+        if redact_text(text) != text:
             raise ValueError(f"unredacted content in {output}")
     return manifest
 
 
-def update_registry(bundle: Path, registry: Path = REGISTRY) -> str:
-    """Mark one item verified only after its evidence bundle validates."""
+def accept(bundle: Path, *, accepted_by: str, notes: str, expected_revision: str) -> dict:
+    manifest = validate(bundle, expected_revision=expected_revision)
+    path = Path(bundle) / MANIFEST
+    attestation = {
+        "schema": 1,
+        "item_id": manifest["item_id"],
+        "accepted_by": accepted_by,
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+        "expected_revision": expected_revision,
+        "claim_verified": True,
+        "notes": redact_text(notes),
+    }
+    (path.parent / ACCEPTANCE).write_text(
+        json.dumps(attestation, indent=2), encoding="utf-8"
+    )
+    return attestation
 
-    manifest = validate(bundle)
-    item_id = str(manifest["item_id"])
+
+def update_registry(bundle: Path, registry: Path = REGISTRY,
+                    expected_revision: str | None = None) -> str:
+    if not expected_revision:
+        raise ValueError("--expected-revision is required for registry mutation")
+    manifest = validate(bundle, expected_revision=expected_revision)
+    acceptance_path = Path(bundle) / ACCEPTANCE
+    if not acceptance_path.is_file():
+        raise ValueError("explicit acceptance is required before registry mutation")
+    acceptance = json.loads(acceptance_path.read_text(encoding="utf-8"))
+    if acceptance.get("item_id") != manifest["item_id"]:
+        raise ValueError("acceptance item mismatch")
+    if expected_revision and acceptance.get("expected_revision") != expected_revision:
+        raise ValueError("acceptance revision mismatch")
+    if not acceptance.get("claim_verified"):
+        raise ValueError("claim was not explicitly verified")
+
     registry = Path(registry)
     text = registry.read_text(encoding="utf-8")
     blocks = text.split("[[checks]]")
     changed = False
     for index, block in enumerate(blocks):
-        if f'id = "{item_id}"' not in block:
+        if f'id = "{manifest["item_id"]}"' not in block:
             continue
         block = re.sub(r'status = "[^"]*"', 'status = "verified-on-hardware"', block)
         block = re.sub(r'verified_at = "[^"]*"',
@@ -137,37 +180,56 @@ def update_registry(bundle: Path, registry: Path = REGISTRY) -> str:
         changed = True
         break
     if not changed:
-        raise ValueError(f"registry item not found: {item_id}")
+        raise ValueError(f"registry item not found: {manifest['item_id']}")
     registry.write_text("[[checks]]".join(blocks), encoding="utf-8")
-    return item_id
+    return str(manifest["item_id"])
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser()
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="action", required=True)
     capture_p = sub.add_parser("capture")
     capture_p.add_argument("--bundle", required=True, type=Path)
     capture_p.add_argument("--item", required=True)
     capture_p.add_argument("--cwd", type=Path)
-    capture_p.add_argument("command", nargs=argparse.REMAINDER)
+    capture_p.add_argument("cmd", nargs=argparse.REMAINDER)
     validate_p = sub.add_parser("validate")
     validate_p.add_argument("bundle", type=Path)
+    validate_p.add_argument("--expected-revision")
+    accept_p = sub.add_parser("accept")
+    accept_p.add_argument("bundle", type=Path)
+    accept_p.add_argument("--accepted-by", required=True)
+    accept_p.add_argument("--notes", required=True)
+    accept_p.add_argument("--expected-revision", required=True)
     update_p = sub.add_parser("update-registry")
     update_p.add_argument("bundle", type=Path)
+    update_p.add_argument("--expected-revision")
+    update_p.add_argument("--registry", type=Path, default=REGISTRY)
     args = parser.parse_args(argv)
 
-    if args.command == "capture":
-        manifest = capture(args.bundle, args.command, item_id=args.item, cwd=args.cwd)
+    if args.action == "capture":
+        if not args.cmd or args.cmd[0] == "--":
+            args.cmd = args.cmd[1:]
+        if not args.cmd:
+            raise SystemExit("no command supplied to capture")
+        manifest = capture(args.bundle, args.cmd, item_id=args.item, cwd=args.cwd)
         print(json.dumps(manifest, indent=2))
         return 0
-    if args.command == "validate":
-        validate(args.bundle)
-        print("bundle valid")
+    if args.action == "validate":
+        validate(args.bundle, expected_revision=args.expected_revision)
+        print("bundle integrity valid")
         return 0
-    update_registry(args.bundle)
+    if args.action == "accept":
+        attestation = accept(args.bundle, accepted_by=args.accepted_by,
+                             notes=args.notes, expected_revision=args.expected_revision)
+        print(json.dumps(attestation, indent=2))
+        return 0
+    update_registry(args.bundle, registry=args.registry,
+                    expected_revision=args.expected_revision)
     print("registry updated")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    raise SystemExit(main())

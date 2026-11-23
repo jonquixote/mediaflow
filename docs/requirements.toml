@@ -198,6 +198,14 @@ text = "Host-only installation must not create or change media roots, enable ser
 test = "tests/test_deployment_safety.py"
 
 [[requirements]]
+id = "DEPLOY-5"
+title = "Fail-closed deployment tooling"
+safety = true
+section = "17"
+text = "Installation must refuse a dirty checkout, active/enabled service state and symlink destinations before any writes, and must produce an artifact manifest. Doctor backend acceptance policy is explicit and separate from probing; probing two backends does not require both. Observational commands must validate schema compatibility without migration, report missing/corrupt/older/newer state distinctly, and never turn an unperformed operation into success. Evidence bundle integrity, claim attestation, acceptance and registry mutation are separate; registry updates require explicit accepted evidence and a full expected revision."
+test = "tests/test_deployment_safety_round2.py"
+
+[[requirements]]
 id = "SCHED-1"
 title = "Schedule window is a start gate"
 safety = true

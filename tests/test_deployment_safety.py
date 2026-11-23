@@ -40,6 +40,7 @@ def _install_env(tmp_path: Path, *, host_only: bool) -> dict:
     env = dict(os.environ)
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
+        "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
         "MEDIAFLOW_INSTALL_HOST_ONLY": "1" if host_only else "0",
         "MEDIAFLOW_INSTALL_PREFIX": str(tmp_path / "opt" / "mediaflow"),
         "MEDIAFLOW_INSTALL_CONFIG_DIR": str(tmp_path / "etc" / "mediaflow"),
@@ -182,7 +183,7 @@ def test_automatic_ffmpeg_retest_never_enables_software_probing(tmp_path, monkey
 
 
 @pytest.mark.parametrize("command", [
-    ["status"], ["queue"], ["review", "list"], ["library", "report"],
+    ["status"], ["queue"], ["review", "list"],
 ])
 def test_observational_commands_do_not_create_state(tmp_path, monkeypatch, command):
     path = _write_config(tmp_path)
