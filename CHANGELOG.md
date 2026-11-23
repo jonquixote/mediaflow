@@ -39,6 +39,13 @@ completes the on-hardware checklist in `docs/RUNBOOK.md`.
 - Remuxes use an explicit copy estimate instead of borrowing an encode
   backend's speed-table row.
 
+### Deployment advisor round 3
+
+- Host installation is now create-only: exact SHA/provenance enforcement, exact passive service/timer parsing, conflict refusal, evidence preservation and hash-bound rollback manifest.
+- Doctor backend acceptance is aggregate with explicit unknown/missing semantics; observational DB and cache paths are truthful and WAL-aware.
+- Rehearsal provenance, doctor crash handling, sentinel comparison and identity-bound cleanup were tightened.
+- Scratch DB initialization, media-init modes/ancestors, and content-bound evidence acceptance were completed.
+
 ### Deployment advisor round 2
 
 - Installer preflight refuses dirty checkouts, active/enabled services, symlink destinations and unexpected media ownership before writes; artifact manifest and scoped rollback added.

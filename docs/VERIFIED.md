@@ -5,6 +5,24 @@ It is evidence, not a promise about john-server. On-hardware items still open
 are tracked as unchecked lines in `docs/QUESTIONS.md`; `doctor` warns while any
 remain.
 
+## Sandbox verification - deployment advisor round 3
+
+Reviewed baseline: `a31cd16640731e417462e8b55875f18bf396b670`; implementation
+revision `0bbd74f`; branch `pass-d-safety-round3`. Commands run:
+
+```sh
+.venv/bin/python tools/gen_invariants.py
+.venv/bin/python tools/gen_hardware_checks.py
+.venv/bin/python -m pytest -q tests/test_deployment_safety_round3.py
+scripts/check.sh
+```
+
+Results: focused `19 passed in 2.60s`; traceability `6 passed in 0.22s`;
+unit/integration `901 passed in 50.55s`; full suite `901 passed in 50.21s`.
+No skips. Accounting: `881 + 19 round-3 regressions + 1 registry-reference test
+= 901`. `/dev/dri/renderD128` remained inaccessible; no hardware, production,
+service or registry-status action occurred.
+
 ## Sandbox verification - deployment advisor round 2
 
 Reviewed baseline: `947c8f9f19fc090371d9fcf9a508cc342113aa41`; implementation

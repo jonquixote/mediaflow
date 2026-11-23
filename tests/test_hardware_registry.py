@@ -51,6 +51,16 @@ def test_every_open_question_has_a_registry_id():
         assert len(found) == 1, line
 
 
+def test_first_run_references_only_known_registry_ids():
+    import re
+
+    ids = {c["id"] for c in _registry()["checks"]}
+    text = (ROOT / "docs" / "FIRST_RUN.md").read_text()
+    found = set(re.findall(r"HW-\d{3}", text))
+    assert found
+    assert not found - ids
+
+
 def test_hardware_verification_requires_evidence(monkeypatch):
     data = _registry()
     check = dict(data["checks"][0])
