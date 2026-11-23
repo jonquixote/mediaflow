@@ -124,6 +124,6 @@ def test_doctor_skipped_without_running_hardware(tmp_path, capsys, monkeypatch):
     path = _write_config(tmp_path, ffmpeg="/nonexistent/ffmpeg", ffprobe="/nonexistent/ffprobe")
     monkeypatch.setenv("MEDIAFLOW_CONFIG", str(path))
     rc = main(["doctor", "--short"])
-    assert rc == 1
+    assert rc == 2  # required preflight failures
     out = capsys.readouterr().out
     assert "doctor" in out.lower()

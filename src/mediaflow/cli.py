@@ -401,7 +401,7 @@ def cmd_doctor(args) -> int:
         print(_json(report.as_dict()))
     else:
         print(format_doctor(report, short=args.short))
-    return 0 if report.ok else 1
+    return report.exit_code
 
 
 def cmd_calibrate(args) -> int:

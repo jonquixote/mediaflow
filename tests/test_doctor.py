@@ -82,7 +82,8 @@ def test_doctor_reports_capabilities_and_rate_control(tmp_path, monkeypatch):
     assert "ICQ" in names["encode-qsv"].detail
     assert names["encode-vaapi"].status == "ok"
     assert report.ok, [c for c in report.checks if c.status == "fail"]
-    assert json.loads(cfg.capabilities_path.read_text())["backends"]["vaapi"]["hevc10"] is True
+    # Preflight is read-only: capability facts are never written by doctor.
+    assert not cfg.capabilities_path.exists()
     short = format_doctor(report, short=True)
     assert len(short.splitlines()) <= 12
     assert all(len(line) <= 60 for line in short.splitlines())
@@ -446,3 +447,59 @@ def test_incomplete_capability_report_does_not_overwrite_valid_evidence(
     state = next(c for c in report.checks if c.name == "capability-state")
     assert state.status == "warn"
     assert state.meta["state"] == OperationState.TIMED_OUT.value
+
+
+# ---------------------------------------------------------------------------
+# [DEPLOY-2] Truthful preflight outcomes
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_json_reports_outcomes_and_classes(tmp_path, monkeypatch):
+    path, cfg = _setup(tmp_path)
+    monkeypatch.setattr("mediaflow.doctor.run_capability_tests",
+                        lambda *a, **k: {"ffmpeg_version": "x", "backends": {}})
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "QUESTIONS.md").write_text("")
+    monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    data = report.as_dict()
+
+    assert {"pass", "fail", "unknown"} <= set(data["summary"])
+    assert data["exit_code"] in {0, 2, 3, 4}
+    assert all({"name", "status", "outcome", "class", "detail"} <= set(check)
+               for check in data["checks"])
+    check = data["checks"][0]
+    assert check["outcome"] == {"ok": "pass", "warn": "unknown", "fail": "fail"}[check["status"]]
+
+
+def test_doctor_exit_codes_distinguish_required_feature_and_unknown():
+    required_fail = Check("x", "fail", "x")
+    feature_fail = Check("y", "fail", "y", check_class="feature-conditional")
+    unknown = Check("z", "warn", "z")
+    info = Check("i", "warn", "i", check_class="informational")
+
+    assert DoctorReport([Check("ok", "ok", "ok")]).exit_code == 0
+    assert DoctorReport([required_fail]).exit_code == 2
+    assert DoctorReport([feature_fail]).exit_code == 3
+    assert DoctorReport([unknown]).exit_code == 4
+    assert DoctorReport([info]).exit_code == 0
+
+
+def test_doctor_is_read_only_for_state_and_capabilities(tmp_path, monkeypatch):
+    path, cfg = _setup(tmp_path)
+    monkeypatch.setattr("mediaflow.doctor.run_capability_tests",
+                        lambda *a, **k: {"ffmpeg_version": "x", "backends": {}})
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "QUESTIONS.md").write_text("")
+    monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
+    before_db = cfg.db_path.read_bytes()
+    before_caps = cfg.capabilities_path.exists()
+    before_state = sorted(str(p) for p in cfg.state_dir.rglob("*"))
+
+    run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+
+    assert cfg.db_path.read_bytes() == before_db
+    assert cfg.capabilities_path.exists() == before_caps
+    assert sorted(str(p) for p in cfg.state_dir.rglob("*")) == before_state
