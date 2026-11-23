@@ -330,6 +330,24 @@ class Notifier:
         self._last_sent: dict[tuple[str, str | None], float] = {}
 
     # -- configuration --------------------------------------------------
+    def rebind(self, config: Any, secrets: Any) -> None:
+        """Adopt a new live configuration generation at a safe boundary.
+
+        The notification URL is deliberately not re-read: secret rotation is
+        restart-required, and ``secrets`` is the same object until then.
+        In-memory cooldown history is preserved.
+        """
+
+        _reject_config_url(config)
+        self._config = config
+        self._secrets = secrets
+        self._cooldown_hours = self._config_number(
+            "notify_cooldown_hours", DEFAULT_COOLDOWN_HOURS, minimum=0.0
+        )
+        self._timeout = self._config_number(
+            "notify_timeout_seconds", DEFAULT_TIMEOUT_SECONDS, minimum=0.1
+        )
+
     def _config_number(self, name: str, default: float, *, minimum: float) -> float:
         value = _config_value(self._config, name, default)
         if isinstance(value, bool) or value is None:
