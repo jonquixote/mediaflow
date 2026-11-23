@@ -90,6 +90,46 @@ def test_sigkill_recovery(tmp_path, state, mode):
     _assert_safe_final(root, 1)
 
 
+@pytest.mark.parametrize("phase", [
+    "publish-before-rename",
+    "publish-after-rename",
+    "speed-before-update",
+    "speed-after-update",
+])
+def test_sigkill_publish_and_speed_kill_points(tmp_path, phase):
+    """[SAF-6] Publish and speed-update kill points recover idempotently."""
+
+    root = tmp_path / phase
+    killed = _run(root, "--kill-phase", phase)
+    assert killed.returncode == -signal.SIGKILL, (
+        f"worker was not killed at {phase}: rc={killed.returncode}\n"
+        f"stdout={killed.stdout}\nstderr={killed.stderr}"
+    )
+    assert not list((root / "movies").rglob("*.partial"))
+
+    resumed = _run(root, "--loop")
+    assert resumed.returncode == 0, f"{resumed.stdout}\n{resumed.stderr}"
+    before = _recovery_event_count(root)
+    _assert_safe_final(root, 1)
+
+    again = _run(root, "--loop")
+    assert again.returncode == 0, f"{again.stdout}\n{again.stderr}"
+    assert _recovery_event_count(root) == before
+
+
+def _recovery_event_count(root: Path) -> int:
+    store = Store(root / "_state" / "state.db")
+    store.initialize()
+    try:
+        return sum(
+            1 for job in store.list_jobs(include_done=True)
+            for event in store.events(job["id"])
+            if event["kind"] == "recovery"
+        )
+    finally:
+        store.close()
+
+
 def test_chaos_loop(tmp_path):
     """[SAF-6] Random SIGKILLs across a batch never leave duplicates or partials."""
     root = tmp_path / "chaos"

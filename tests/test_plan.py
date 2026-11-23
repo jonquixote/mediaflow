@@ -42,6 +42,7 @@ SCHEMA_KEYS = {
 VIDEO_KEYS = {
     "index",
     "codec",
+    "source_codec",
     "width",
     "height",
     "target_width",
@@ -828,6 +829,18 @@ def test_estimate_and_speed_source(tmp_path):
     plan = build(probe, speed_factor=2.0, estimated_seconds=7.5)
     assert plan["estimated_seconds"] == pytest.approx(7.5)
     assert plan["speed_source"] == "table"
+
+
+def test_build_plan_ignores_an_encode_speed_factor_for_a_remux(tmp_path):
+    """A directly built remux must not borrow an encode backend row."""
+
+    probe = make_probe(tmp_path, video={"codec_name": "h264"})
+    preset = make_preset(action="remux")
+    plan = build(probe, preset=preset, speed_factor=2.0)
+    assert plan["action"] == "remux"
+    assert plan["speed_source"] == "copy-estimate"
+    assert plan["estimated_seconds"] == pytest.approx(100.0)
+    assert "speed_factor" not in plan
 
 
 def test_plan_version_and_fallback_from(tmp_path):

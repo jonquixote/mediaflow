@@ -589,29 +589,58 @@ class Store:
                 (preset, backend, self.bucket(height), float(factor), time.time(),
                  SPEED_KEY_VERSION))
 
+    @classmethod
+    def _speed_update_conn(cls, c: Any, preset: str, backend: str, height: int,
+                           real_factor: float, alpha: float = 0.3) -> float:
+        """Apply the EMA using an already-open transaction cursor."""
+
+        row = c.execute(
+            "SELECT factor,samples FROM speed_table WHERE preset=? AND backend=? "
+            "AND bucket=? AND key_version=?",
+            (preset, backend, cls.bucket(height), SPEED_KEY_VERSION),
+        ).fetchone()
+        if row:
+            value = alpha * real_factor + (1 - alpha) * float(row["factor"])
+            samples = int(row["samples"]) + 1
+        else:
+            value = real_factor
+            samples = 1
+        c.execute(
+            "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at,key_version) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(preset,backend,bucket) DO UPDATE SET "
+            "factor=excluded.factor,samples=excluded.samples,updated_at=excluded.updated_at,"
+            "key_version=excluded.key_version",
+            (preset, backend, cls.bucket(height), value, samples, time.time(),
+             SPEED_KEY_VERSION))
+        return value
+
     def speed_update(self, preset: str, backend: str, height: int, real_factor: float, alpha: float = 0.3) -> float:
         if not (real_factor > 0):
             raise DatabaseError("speed factor must be positive")
         with self._tx() as c:
-            row = c.execute(
-                "SELECT factor,samples FROM speed_table WHERE preset=? AND backend=? "
-                "AND bucket=? AND key_version=?",
-                (preset, backend, self.bucket(height), SPEED_KEY_VERSION),
-            ).fetchone()
-            if row:
-                value = alpha * real_factor + (1 - alpha) * float(row["factor"])
-                samples = int(row["samples"]) + 1
-            else:
-                value = real_factor
-                samples = 1
+            return self._speed_update_conn(c, preset, backend, height, real_factor, alpha)
+
+    def speed_update_once(self, job_id: str, preset: str, backend: str, height: int,
+                          real_factor: float, alpha: float = 0.3) -> float | None:
+        """Apply a job's post-encode EMA at most once, atomically.
+
+        The applied marker and the table update share one transaction, so a
+        crash before the DONE commit cannot make recovery count the encode
+        twice.  Returns ``None`` when this job's update was already applied.
+        """
+
+        if not (real_factor > 0):
+            raise DatabaseError("speed factor must be positive")
+        key = f"speed-updated:{job_id}"
+        with self._tx() as c:
+            if c.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone():
+                return None
+            value = self._speed_update_conn(c, preset, backend, height, real_factor, alpha)
             c.execute(
-                "INSERT INTO speed_table(preset,backend,bucket,factor,samples,updated_at,key_version) "
-                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(preset,backend,bucket) DO UPDATE SET "
-                "factor=excluded.factor,samples=excluded.samples,updated_at=excluded.updated_at,"
-                "key_version=excluded.key_version",
-                (preset, backend, self.bucket(height), value, samples, time.time(),
-                 SPEED_KEY_VERSION))
-        return value
+                "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                (key, "1"),
+            )
+            return value
 
     # -- TMDb cache -----------------------------------------------------
     def get_tmdb(self, key: str) -> dict | None:

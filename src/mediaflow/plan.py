@@ -2324,7 +2324,10 @@ def build_plan(
     ext = effective_container
     destination_rel = f"{stem}/{stem}.{ext}"
 
-    if speed_factor is not None:
+    # A remux has no encode-backend speed row.  A caller-supplied encode
+    # factor must never be applied to a stream copy, even when the caller is
+    # the planner's own test helper.
+    if speed_factor is not None and action != "remux":
         factor = _float(speed_factor, 0.0)
     else:
         factor = 0.0
@@ -2371,6 +2374,7 @@ def build_plan(
         "video": {
             "index": _stream_index(main_video),
             "codec": output_codec,
+            "source_codec": str(main_video.get("codec_name") or output_codec),
             "width": source_width,
             "height": source_height,
             "target_width": target_width,

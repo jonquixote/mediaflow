@@ -1539,42 +1539,60 @@ class Engine:
         return reasons, should_pause
 
     def _remaining_encode_work(self, job: dict) -> int | None:
-        """Return the bytes still needed for the in-flight operation.
+        """Bounded estimate of output bytes still to be written.
 
-        The source video size is a conservative upper bound for the planned
-        output.  A monotonic media-progress fraction reduces that budget;
-        output growth alone never does so.  When progress is available, the
-        current partial size also gives a second, independent projection of
-        the remaining output.  The larger of the two projections is retained
-        so the space guard fails closed rather than under-reserving.
+        Definition: ``gross`` is the source video-byte count, falling back to
+        total source bytes.  With no real media progress the estimate is the
+        full gross budget.  Once progress exists, the estimate is the larger
+        of ``gross * (1 - progress)`` and a linear projection from bytes
+        written, capped by the 1.2x source-size admission envelope.  The value
+        is clamped to ``[0, cap]``; a missing gross budget returns ``None`` so
+        the guard keeps its full source-size admission fallback.
+
+        Error bounds: this is a heuristic, not a guaranteed upper bound on the
+        final output.  Nonlinear VBR tails or mux overhead can understate the
+        true remainder; the additive emergency low-water reserve and the
+        admission envelope exist for that reason.  The cap prevents a tiny
+        progress fraction and a large partial from demanding an unbounded
+        reserve.
         """
         plan = job.get("plan") or {}
         source = plan.get("source") if isinstance(plan.get("source"), Mapping) else {}
-        try:
-            gross = int(
-                source.get("video_bytes")
-                or job.get("source_video_bytes")
-                or source.get("size_bytes")
-                or job.get("source_size")
-                or 0
-            )
-        except (TypeError, ValueError):
-            gross = 0
+
+        def _positive_int(*values: Any) -> int:
+            for value in values:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return number
+            return 0
+
+        gross = _positive_int(
+            source.get("video_bytes"), job.get("source_video_bytes"),
+            source.get("size_bytes"), job.get("source_size"),
+        )
         if gross <= 0:
             return None
-        fraction = min(1.0, max(0.0, float(self._encode_progress_fraction)))
+        source_size = _positive_int(source.get("size_bytes"), job.get("source_size"), gross)
+        cap = max(gross, int(math.ceil(1.2 * source_size)))
+        try:
+            fraction = float(self._encode_progress_fraction)
+        except (TypeError, ValueError):
+            fraction = 0.0
+        if not math.isfinite(fraction):
+            fraction = 0.0
+        fraction = min(1.0, max(0.0, fraction))
         if fraction <= 0.0:
-            # Before a real progress observation, retain the full conservative
-            # work budget.  A growing file is not proof that the encode is
-            # advancing and must not manufacture free space.
-            return gross
-        source_remaining = int(math.ceil(gross * (1.0 - fraction)))
-        consumed = self._encode_output_consumed(job)
+            return min(gross, cap)
+        source_remaining = min(cap, int(math.ceil(gross * (1.0 - fraction))))
+        consumed = max(0, self._encode_output_consumed(job))
         projected_remaining = 0
-        if consumed > 0 and fraction > 0.0:
-            projected_total = int(math.ceil(consumed / fraction))
+        if consumed > 0:
+            projected_total = min(cap, int(math.ceil(consumed / fraction)))
             projected_remaining = max(0, projected_total - consumed)
-        return max(source_remaining, projected_remaining)
+        return min(cap, max(source_remaining, projected_remaining))
 
     def _encode_output_consumed(self, job: dict) -> int:
         """Return bytes actually present in the current partial output."""
@@ -1888,24 +1906,77 @@ class Engine:
         return True
 
     def _prepare_remux_fallback(self, job: dict, plan: dict) -> bool:
+        """Build a genuine remux plan from the failed encode plan.
+
+        Stream copy cannot scale or transcode, so the fallback must describe
+        the source codec and source geometry.  Encode-only fields are removed
+        so verification, speed lookup and calibration cannot be misled.
+        """
+
         raw = self._preset_raw(self._preset(job["preset"]))
-        container = raw.get("container", "mp4")
-        codec = str(plan.get("video", {}).get("codec", ""))
+        container = str(raw.get("container", "mp4"))
+        video = dict(plan.get("video", {}))
+        source = plan.get("source") if isinstance(plan.get("source"), Mapping) else {}
+        probe = plan.get("source_probe") if isinstance(plan.get("source_probe"), Mapping) else {}
+        stream = next(
+            (
+                item for item in (probe.get("streams") or [])
+                if isinstance(item, Mapping)
+                and str(item.get("codec_type") or "") == "video"
+                and str(item.get("index")) == str(video.get("index", 0))
+            ),
+            {},
+        )
+        codec = str(
+            video.get("source_codec")
+            or stream.get("codec_name")
+            or ""
+        ).strip().lower()
+        if not codec:
+            codec = str(video.get("codec") or "").strip().lower()
         if container == "mp4" and codec not in {"h264", "hevc"}:
             self._review(job, "remux-incompatible-video", "PLANNED",
                          {"source_codec": codec, "fallback_from": "encode"})
             return False
+
+        def _dimension(*values: Any) -> int:
+            for value in values:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return number
+            return 0
+
+        width = _dimension(stream.get("width"), source.get("width"), video.get("width"))
+        height = _dimension(stream.get("height"), source.get("height"), video.get("height"))
+        new_video = {
+            key: value for key, value in video.items()
+            if key not in {"source_codec", "quality", "encoder", "backend",
+                           "look_ahead", "tag", "scaled", "target_width", "target_height"}
+        }
+        new_video.update({
+            "codec": codec,
+            "source_codec": codec,
+            "width": width,
+            "height": height,
+            "target_width": width,
+            "target_height": height,
+            "scaled": False,
+        })
+        if container == "mp4" and codec == "hevc":
+            new_video["tag"] = "hvc1"
+
         new = dict(plan)
         new["action"] = "remux"
         new["fallback_from"] = "encode"
         new["plan_version"] = int(plan.get("plan_version", 1)) + 1
-        new["video"] = dict(plan.get("video", {}))
-        new["video"].pop("quality", None)
-        new["video"].pop("encoder", None)
-        new["video"].pop("backend", None)
-        # A remux has no encode-speed row.  Never carry the failed encode's
-        # estimate into the fallback; use the explicit copy estimate instead.
-        duration = float((new.get("source") or {}).get("duration") or 0.0)
+        new["schema"] = 2
+        new["plan_schema"] = 2
+        new["video"] = new_video
+        # Audio and subtitle selections are reused unchanged (SIZE-2).
+        duration = float(source.get("duration") or 0.0)
         new["estimated_seconds"] = duration if duration > 0 else None
         new["speed_source"] = "copy-estimate" if duration > 0 else "missing"
         new.pop("speed_factor", None)
@@ -2055,28 +2126,73 @@ class Engine:
         return True
 
     def _publish(self, job: dict, plan: dict, dest: Path) -> None:
+        """Build the final folder in work/ and publish with one rename.
+
+        The staged folder already lives on the same filesystem as movies/, so
+        no output hard link or byte copy is needed.  The verified output is
+        moved into the staged folder with ``os.rename``; only text sidecars are
+        copied (or converted).  The marker is written last, so a staged folder
+        with a valid marker is complete and may be published directly after a
+        crash.  An unmarked folder is discarded or unwound before re-staging.
+        """
+
         work = self.work / job["id"]
         pub_root = work / "pub"
-        if pub_root.exists():
-            self.safety.remove(pub_root, "publish-cleanup", scratch=work)
         stem = plan["name"]["stem"]
         ext = plan["ext"]
         folder = pub_root / stem
-        folder.mkdir(parents=True, exist_ok=False)
         out_src = Path(plan["working_output"])
         out_dst = folder / f"{stem}.{ext}"
-        try:
-            os.link(out_src, out_dst)
-        except OSError:
-            shutil.copyfile(out_src, out_dst)
-        fsync_file(out_dst)
-        self._copy_sidecars(job, plan, folder, stem)
         marker = folder / f".mediaflow-{job['id']}"
-        atomic_write_json(marker, {"job_id": job["id"], "output_sha256": job["output_sha256"],
-                                   "published_at": self.clock()})
-        fsync_dir(folder)
+        complete = (
+            folder.is_dir()
+            and not folder.is_symlink()
+            and marker.is_file()
+            and out_dst.is_file()
+            and not out_dst.is_symlink()
+            and self._marker_matches(marker, job)
+        )
+        if folder.exists() and not complete:
+            # A partial stage has no valid marker.  If the output was already
+            # moved into it, move it back so re-staging cannot lose the only
+            # verified copy.  Both moves stay inside work/ on one filesystem.
+            if out_dst.is_file() and not out_dst.is_symlink() and not out_src.exists():
+                os.replace(out_dst, out_src)
+                fsync_dir(out_src.parent)
+            self.safety.remove(folder, "publish-partial", scratch=work)
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=False)
+        if not complete:
+            os.rename(out_src, out_dst)
+            fsync_file(out_dst)
+            self._copy_sidecars(job, plan, folder, stem)
+            atomic_write_json(marker, {
+                "job_id": job["id"], "output_sha256": job["output_sha256"],
+                "published_at": self.clock(),
+            })
+            fsync_dir(folder)
         self.safety.rename_noreplace(folder, dest, what="publish")
         fsync_dir(dest.parent)
+        # The staged tree is now empty; do not leave a reusable pub/ shell.
+        if pub_root.exists():
+            try:
+                self.safety.remove(pub_root, "publish-cleanup", scratch=work)
+            except Exception:
+                log.warning("could not remove empty publish stage job=%s", job["id"])
+
+    @staticmethod
+    def _publish_sidecar_reserve(plan: dict) -> int:
+        """Bytes a publish may still write for text sidecars."""
+
+        total = 0
+        for side in plan.get("sidecars", []) or []:
+            path = Path(side.get("path", ""))
+            try:
+                if path.is_file() and not path.is_symlink():
+                    total += int(path.stat().st_size)
+            except OSError:
+                continue
+        return max(0, total)
 
     def _copy_sidecars(self, job: dict, plan: dict, folder: Path, stem: str) -> None:
         for side in plan.get("sidecars", []):
@@ -2236,14 +2352,16 @@ class Engine:
                 job.get("encode_seconds"),
             )
         if plan.get("action") == "encode" and job.get("encode_seconds"):
-            backend = (plan.get("video") or {}).get("backend") or "software"
-            height = int((plan.get("video") or {}).get("target_height") or
-                         (plan.get("video") or {}).get("height") or 0)
+            backend, height = self._plan_speed_key(plan)
             duration = float(plan.get("source", {}).get("duration") or 0)
-            if duration > 0 and job["encode_seconds"] > 0:
+            if backend and height > 0 and duration > 0 and job["encode_seconds"] > 0:
                 try:
-                    self.store.speed_update(job["preset"], backend, height,
-                                            duration / float(job["encode_seconds"]))
+                    # The marker and EMA are committed together; replay after a
+                    # kill before DONE cannot double-count this encode.
+                    self.store.speed_update_once(
+                        job["id"], job["preset"], backend, height,
+                        duration / float(job["encode_seconds"]),
+                    )
                 except Exception:
                     log.warning("speed table update failed job=%s", job["id"])
         self._archive_log(job)
@@ -3223,27 +3341,15 @@ class Engine:
             return _SimpleDecision(False, reasons + [f"guard-error: {exc}"])
 
     def _space_gate(self, job: dict) -> Any:
-        """Apply the SAF-8 source reserve plus any publish copy fallback.
+        """Apply the SAF-8 source reserve plus staged sidecar bytes.
 
-        Publishing stages with a hard link where possible, so no extra space
-        is normally needed.  On filesystems without hard-link support it copies
-        the output, so those bytes are reserved additively on top of the
-        normative ``max(1.2 * source_size, min_free_gb)`` admission envelope.
+        The output is moved into a folder already staged on the same
+        filesystem, so publishing writes no output copy.  Only text sidecars
+        are copied during staging.
         """
 
-        copy_reserve = 0
-        try:
-            copy_reserve = int(job.get("output_size") or 0)
-        except (TypeError, ValueError):
-            copy_reserve = 0
-        if copy_reserve <= 0:
-            plan = job.get("plan") or {}
-            try:
-                output = Path(plan.get("working_output") or "")
-                if output.is_file() and not output.is_symlink():
-                    copy_reserve = output.stat().st_size
-            except OSError:
-                copy_reserve = 0
+        plan = job.get("plan") or {}
+        copy_reserve = self._publish_sidecar_reserve(plan)
         try:
             source_size = int(job.get("source_size") or 0)
         except (TypeError, ValueError):

@@ -1440,8 +1440,8 @@ def test_mid_encode_gate_receives_net_work_and_uses_a_monotonic_cadence(env):
     assert len(calls) == 1
 
 
-def test_publish_space_reserve_uses_the_output_copy_not_the_source(env):
-    """Publishing reserves the bytes that may be copied into movies/."""
+def test_publish_space_reserve_keeps_the_source_envelope_only(env):
+    """Publish writes no output copy, so no output-size reserve is added."""
 
     cfg, store, eng, _ = env
     calls = []
@@ -1456,14 +1456,36 @@ def test_publish_space_reserve_uses_the_output_copy_not_the_source(env):
         "id": "job",
         "source_size": 9_000_000,
         "output_size": 1234,
-        "plan": {"working_output": str(cfg.work / "job" / "out.mp4")},
+        "plan": {"working_output": str(cfg.work / "job" / "out.mp4"), "sidecars": []},
     }
 
     decision = eng._space_gate(job)
 
     assert decision.ok is True
     assert calls[0]["source_size"] == 9_000_000
-    assert calls[0]["additional_required_bytes"] == 1234
+    assert calls[0]["additional_required_bytes"] == 0
+
+
+def test_publish_space_reserve_adds_only_staged_sidecars(env, tmp_path):
+    """Sidecar bytes are the only additional publication write."""
+
+    cfg, store, eng, _ = env
+    side = tmp_path / "movie.en.srt"
+    side.write_bytes(b"subtitle" * 10)
+    calls = []
+
+    class Recorder:
+        def check_space(self, **kwargs):
+            calls.append(kwargs)
+            return None, SimpleNamespace(ok=True, reasons=(), messages=())
+
+    eng.guards = Recorder()
+    job = {
+        "id": "job", "source_size": 9_000_000,
+        "plan": {"sidecars": [{"path": str(side), "language": "en"}]},
+    }
+    eng._space_gate(job)
+    assert calls[0]["additional_required_bytes"] == side.stat().st_size
 
 
 def test_engine_uses_the_planned_backend_and_target_height_speed_key(env):
@@ -1844,4 +1866,233 @@ def test_recovery_does_not_recreate_terminal_work_directories(env):
 
     assert not work.exists()
     assert store.get_job(job["id"])["state"] == "RESTORED"
+
+
+# ---------------------------------------------------------------------------
+# Pass C follow-up: publish path and open findings
+# ---------------------------------------------------------------------------
+
+
+def _staged_publish_job(cfg, store, eng, *, sidecars=()):
+    """Build a NAMED job with a verified working output ready to publish."""
+
+    entry = _source(cfg)
+    out = cfg.work / "pub-job" / "out.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"verified output")
+    plan = {
+        "schema": 2, "plan_schema": 2, "preset": "test-preset", "action": "encode",
+        "video": {"index": 0, "backend": "qsv", "target_height": 1080},
+        "source": {"path": str(entry), "duration": 60.0, "size_bytes": 1000,
+                   "video_bytes": 900},
+        "name": {"stem": "Film (2001)", "title": "Film", "year": 2001},
+        "ext": "mp4",
+        "destination_rel": "Film (2001)/Film (2001).mp4",
+        "working_output": str(out),
+        "sidecars": list(sidecars),
+    }
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="NAMED",
+        plan_json=plan, output_sha256="sha", output_size=out.stat().st_size,
+        source_size=1000,
+    )
+    return job, plan, out
+
+
+def test_publish_uses_only_a_same_filesystem_rename(env, monkeypatch):
+    """No output hard link or byte copy is part of the publish design."""
+
+    import mediaflow.engine as engine_module
+    import shutil
+
+    cfg, store, eng, _ = env
+    job, plan, out = _staged_publish_job(cfg, store, eng)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("publish used a hard link or output byte copy")
+
+    monkeypatch.setattr(engine_module.os, "link", forbidden)
+    monkeypatch.setattr(engine_module.shutil, "copyfile", forbidden)
+    dest = cfg.movies / "Film (2001)"
+
+    eng._publish(store.get_job(job["id"]), plan, dest)
+
+    published = dest / "Film (2001).mp4"
+    assert published.read_bytes() == b"verified output"
+    assert not out.exists()  # moved into the staged folder
+    marker = json.loads((dest / f".mediaflow-{job['id']}").read_text())
+    assert marker["job_id"] == job["id"]
+
+
+def test_publish_recovers_a_partially_staged_folder(env, monkeypatch):
+    """A kill before the final rename leaves only work/-local state."""
+
+    cfg, store, eng, _ = env
+    job, plan, out = _staged_publish_job(cfg, store, eng)
+    dest = cfg.movies / "Film (2001)"
+    original = eng.safety.rename_noreplace
+
+    def fail_first(src, target, **kwargs):
+        raise RuntimeError("simulated kill after staging, before rename")
+
+    monkeypatch.setattr(eng.safety, "rename_noreplace", fail_first)
+    with pytest.raises(RuntimeError):
+        eng._publish(store.get_job(job["id"]), plan, dest)
+
+    assert not dest.exists()
+    staged = cfg.work / job["id"] / "pub" / "Film (2001)" / "Film (2001).mp4"
+    assert staged.exists()
+
+    monkeypatch.setattr(eng.safety, "rename_noreplace", original)
+    eng._publish(store.get_job(job["id"]), plan, dest)
+    assert (dest / "Film (2001).mp4").read_bytes() == b"verified output"
+    assert not cfg.work.joinpath(job["id"], "pub").exists()
+
+
+def test_publish_refuses_an_empty_existing_destination(env):
+    """SAF-4 covers empty directories as well as populated ones."""
+
+    cfg, store, eng, _ = env
+    job, plan, out = _staged_publish_job(cfg, store, eng)
+    dest = cfg.movies / "Film (2001)"
+    dest.mkdir(parents=True)
+
+    assert eng._step_named(store.get_job(job["id"])) is False
+    current = store.get_job(job["id"])
+    assert current["state"] == "REVIEW"
+    assert current["review_reason"] == "duplicate"
+    assert out.exists()
+
+
+def test_speed_update_is_idempotent_after_a_kill(env, monkeypatch):
+    """A replayed RETIRED step cannot double-apply the EMA."""
+
+    cfg, store, eng, _ = env
+    store.speed_seed("test-preset", "qsv", 1080, 1.0)
+    entry = _source(cfg)
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="RETIRED",
+    )
+    trash_dir = cfg.trash / time.strftime("%Y-%m-%d") / job["id"]
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    (trash_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    plan = {
+        "action": "encode", "source": {"duration": 100.0, "video_bytes": 900},
+        "video": {"backend": "qsv", "height": 2160, "target_height": 1080},
+    }
+    store.update_job(
+        job["id"], plan_json=plan, encode_seconds=50.0,
+        trash_path=str(trash_dir), manifest_path=str(trash_dir / "manifest.json"),
+    )
+    original = eng._transition
+
+    def fail_before_done(current, to_state, **kwargs):
+        if to_state == "DONE":
+            raise RuntimeError("simulated kill before DONE")
+        return original(current, to_state, **kwargs)
+
+    monkeypatch.setattr(eng, "_transition", fail_before_done)
+    with pytest.raises(RuntimeError):
+        eng._step_retired(store.get_job(job["id"]))
+    assert store.speed_get("test-preset", "qsv", 1080) == pytest.approx(1.3)
+
+    monkeypatch.setattr(eng, "_transition", original)
+    eng._step_retired(store.get_job(job["id"]))
+    assert store.speed_get("test-preset", "qsv", 1080) == pytest.approx(1.3)
+    assert store.get_job(job["id"])["state"] == "DONE"
+
+
+def test_remaining_encode_work_boundaries(env):
+    """The estimate is bounded, non-negative and conservative when unknown."""
+
+    cfg, store, eng, _ = env
+    job = {
+        "source_size": 1000,
+        "source_video_bytes": 1000,
+        "plan": {"source": {"size_bytes": 1000, "video_bytes": 1000},
+                 "working_output": str(cfg.work / "job" / "out.mp4")},
+    }
+    eng._encode_partial_bytes = 50
+    eng._encode_progress_fraction = 0.0
+    assert eng._remaining_encode_work(job) == 1000
+
+    eng._encode_progress_fraction = 0.99
+    assert eng._remaining_encode_work(job) in (10, 11)
+
+    eng._encode_progress_fraction = -4.0  # malformed/regressed value
+    assert eng._remaining_encode_work(job) == 1000
+
+    eng._encode_progress_fraction = 0.001  # tiny fraction, large partial
+    eng._encode_partial_bytes = 1000
+    estimate = eng._remaining_encode_work(job)
+    assert 0 <= estimate <= 1200  # capped by the admission envelope
+
+    eng._encode_progress_fraction = 0.5
+    empty = dict(job, source_video_bytes=0, source_size=0,
+                 plan={"source": {}, "working_output": ""})
+    assert eng._remaining_encode_work(empty) is None
+
+
+def test_size2_fallback_uses_source_codec_and_geometry(env):
+    """A remux fallback carries only fields meaningful to a remux."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    plan = {
+        "schema": 2, "plan_schema": 2, "preset": "test-preset", "action": "encode",
+        "plan_version": 1, "ext": "mp4",
+        "source": {"path": str(entry), "duration": 60.0, "size_bytes": 1000,
+                   "video_bytes": 900, "width": 3840, "height": 2160},
+        "source_probe": {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "h264",
+             "width": 3840, "height": 2160},
+        ]},
+        "video": {"index": 0, "codec": "hevc", "width": 3840, "height": 2160,
+                  "target_width": 1920, "target_height": 1080, "scaled": True,
+                  "quality": 24, "encoder": "hevc_qsv", "backend": "qsv",
+                  "look_ahead": True, "tag": "hvc1"},
+        "audio": [{"index": 1, "source_codec": "aac", "action": "copy"}],
+        "subtitles": [{"index": 2, "source_codec": "subrip", "action": "mov_text"}],
+    }
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="ENCODED", plan_json=plan,
+    )
+    assert eng._prepare_remux_fallback(store.get_job(job["id"]), plan) is True
+    fallback = store.get_job(job["id"])["plan"]
+    assert fallback["action"] == "remux"
+    assert fallback["video"]["codec"] == "h264"
+    assert fallback["video"]["width"] == 3840
+    assert fallback["video"]["target_width"] == 3840
+    assert fallback["video"]["scaled"] is False
+    assert "quality" not in fallback["video"]
+    assert "encoder" not in fallback["video"]
+    assert "backend" not in fallback["video"]
+    assert "look_ahead" not in fallback["video"]
+    assert fallback["audio"] == plan["audio"]
+    assert fallback["subtitles"] == plan["subtitles"]
+    assert fallback["speed_source"] == "copy-estimate"
+
+
+def test_size2_fallback_reviews_an_incompatible_source_codec(env):
+    """MP4 remux compatibility is judged on the source codec."""
+
+    cfg, store, eng, _ = env
+    entry = _source(cfg)
+    plan = {
+        "action": "encode", "preset": "test-preset", "ext": "mp4",
+        "source_probe": {"streams": [
+            {"index": 0, "codec_type": "video", "codec_name": "mpeg2video"},
+        ]},
+        "video": {"index": 0, "codec": "hevc", "target_width": 1920,
+                  "target_height": 1080},
+    }
+    job = store.create_job(
+        preset="test-preset", source_rel=entry.name, source_path=str(entry),
+        original_path=str(entry), entry_kind="dir", state="ENCODED", plan_json=plan,
+    )
+    assert eng._prepare_remux_fallback(store.get_job(job["id"]), plan) is False
+    assert store.get_job(job["id"])["review_reason"] == "remux-incompatible-video"
 

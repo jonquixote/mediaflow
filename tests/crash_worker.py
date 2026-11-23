@@ -62,6 +62,10 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--kill-state")
     ap.add_argument("--kill-mode", choices=["before-commit", "after-commit", "after-snapshot"])
+    ap.add_argument("--kill-phase", choices=[
+        "publish-before-rename", "publish-after-rename",
+        "speed-before-update", "speed-after-update",
+    ])
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--slow", action="store_true")
     args = ap.parse_args()
@@ -92,14 +96,15 @@ def main() -> int:
     eng._resolve_identity = identity
 
     killed = False
-    if args.kill_state:
-        def kill():
-            nonlocal killed
-            if killed:
-                return
-            killed = True
-            os.kill(os.getpid(), signal.SIGKILL)
 
+    def kill():
+        nonlocal killed
+        if killed:
+            return
+        killed = True
+        os.kill(os.getpid(), signal.SIGKILL)
+
+    if args.kill_state:
         if args.kill_mode in {"before-commit", "after-commit"}:
             original = store.transition
 
@@ -122,6 +127,32 @@ def main() -> int:
                     kill()
 
             eng._write_snapshot = snapshot
+
+    if args.kill_phase:
+        if args.kill_phase.startswith("publish-"):
+            original_rename = eng.safety.rename_noreplace
+
+            def rename_with_kill(src, dest, **kwargs):
+                if args.kill_phase == "publish-before-rename":
+                    kill()
+                result = original_rename(src, dest, **kwargs)
+                if args.kill_phase == "publish-after-rename":
+                    kill()
+                return result
+
+            eng.safety.rename_noreplace = rename_with_kill
+        else:
+            original_speed = store.speed_update_once
+
+            def speed_with_kill(*a, **kwargs):
+                if args.kill_phase == "speed-before-update":
+                    kill()
+                result = original_speed(*a, **kwargs)
+                if args.kill_phase == "speed-after-update":
+                    kill()
+                return result
+
+            store.speed_update_once = speed_with_kill
     try:
         eng.start()
         if args.loop:
