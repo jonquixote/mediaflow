@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -56,10 +57,23 @@ def read_capabilities(path: str | Path) -> dict:
 
 @dataclass
 class Check:
+    """One preflight check.
+
+    ``status`` is retained for older callers. ``outcome`` is the truthful
+    three-way result: pass, fail or unknown. ``check_class`` decides whether a
+    result affects the exit code.
+    """
+
     name: str
-    status: str  # ok | warn | fail
+    status: str  # ok | warn | fail (legacy view)
     detail: str
     meta: dict[str, Any] = field(default_factory=dict)
+    check_class: str = "required"  # required | feature-conditional | informational
+    registry_id: str | None = None
+
+    @property
+    def outcome(self) -> str:
+        return {"ok": "pass", "warn": "unknown", "fail": "fail"}[self.status]
 
 
 @dataclass
@@ -67,19 +81,58 @@ class DoctorReport:
     checks: list[Check]
 
     @property
+    def required_failures(self) -> list[Check]:
+        return [c for c in self.checks
+                if c.status == "fail" and c.check_class == "required"]
+
+    @property
+    def feature_failures(self) -> list[Check]:
+        return [c for c in self.checks
+                if c.status == "fail" and c.check_class == "feature-conditional"]
+
+    @property
+    def unknowns(self) -> list[Check]:
+        return [c for c in self.checks if c.status == "warn"]
+
+    @property
     def ok(self) -> bool:
-        return not any(c.status == "fail" for c in self.checks)
+        return not self.required_failures and not self.feature_failures
 
     @property
     def warnings(self) -> int:
         return sum(c.status == "warn" for c in self.checks)
 
+    @property
+    def exit_code(self) -> int:
+        """0 pass; 2 required failure; 3 enabled-feature failure; 4 required unknown."""
+
+        if self.required_failures:
+            return 2
+        if self.feature_failures:
+            return 3
+        if any(c.status == "warn" and c.check_class == "required"
+               for c in self.checks):
+            return 4
+        return 0
+
     def as_dict(self) -> dict:
         return {
             "ok": self.ok,
+            "exit_code": self.exit_code,
+            "summary": {
+                "pass": sum(c.outcome == "pass" for c in self.checks),
+                "fail": sum(c.outcome == "fail" for c in self.checks),
+                "unknown": sum(c.outcome == "unknown" for c in self.checks),
+                "required_failures": len(self.required_failures),
+                "feature_failures": len(self.feature_failures),
+                "informational": sum(c.check_class == "informational" for c in self.checks),
+            },
             "warnings": self.warnings,
-            "checks": [{"name": c.name, "status": c.status, "detail": c.detail, "meta": c.meta}
-                       for c in self.checks],
+            "checks": [{
+                "name": c.name, "status": c.status, "outcome": c.outcome,
+                "class": c.check_class, "registry_id": c.registry_id,
+                "detail": c.detail, "meta": c.meta,
+            } for c in self.checks],
         }
 
 
@@ -615,6 +668,25 @@ def _unchecked_questions() -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip().startswith("- [ ]")]
 
 
+def _read_state_settings(db_path: Path) -> dict[str, str]:
+    """Read persisted holds without opening or creating a writable DB."""
+
+    path = Path(db_path)
+    if not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = conn.execute("SELECT key,value FROM settings").fetchall()
+        return {str(key): str(value) for key, value in rows}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
 def _config_has_secrets(path: Path | None) -> bool:
     if not path or not Path(path).exists():
         return False
@@ -636,6 +708,31 @@ def _config_has_secrets(path: Path | None) -> bool:
         if any(k in {"tmdb_token", "tmdb_read_token", "notify_url", "token", "url"} for k in lowered):
             return True
     return False
+
+
+_FEATURE_CHECKS = {
+    "encode-qsv", "encode-vaapi", "hevc-10bit", "hardware-encode", "libvmaf",
+}
+_INFORMATIONAL_CHECKS = {
+    "verify-items", "db-backup", "last-migration", "trash-size", "ac-power",
+    "capability-file", "experimental-folder", "tmdb-config", "notification-config",
+}
+
+
+def _classify_checks(report: DoctorReport, config: Any) -> DoctorReport:
+    """Attach outcome classes so exit codes reflect feature and info results."""
+
+    enabled = {str(getattr(value, "backend", "")).lower()
+               for value in (getattr(config, "presets", {}) or {}).values()
+               if getattr(value, "action", "") == "encode"} if hasattr(config, "presets") else set()
+    for check in report.checks:
+        if check.name in _INFORMATIONAL_CHECKS:
+            check.check_class = "informational"
+        elif check.name in _FEATURE_CHECKS:
+            check.check_class = "feature-conditional"
+        elif check.name.startswith("encode-"):
+            check.check_class = "feature-conditional"
+    return report
 
 
 def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Path | None = None,
@@ -728,11 +825,26 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
                 else "no hardware HEVC 8-bit encoder; only MKV remuxes will work"
             )
             checks.append(Check("hardware-encode", "warn", detail))
-        if completed and caps.get("libvmaf") is not None:
-            try:
-                _write_capabilities(config, caps)
-            except OSError:
-                checks.append(Check("capabilities-write", "warn", "could not write capabilities.json"))
+        # Preflight is read-only.  Capability facts are written by the daemon
+        # after a deliberate retest, never by doctor.
+        try:
+            existing = read_capabilities(getattr(config, "capabilities_path", ""))
+            if not existing:
+                checks.append(Check(
+                    "capability-file", "warn",
+                    "no current tri-state capability file; doctor does not write one",
+                    check_class="informational",
+                ))
+            else:
+                age = time.time() - float(existing.get("tested_at") or 0)
+                checks.append(Check(
+                    "capability-file", "ok" if age < 30 * 86400 else "warn",
+                    f"capability file age {max(0, age) / 86400:.1f}d",
+                    check_class="informational",
+                ))
+        except Exception as exc:
+            checks.append(Check("capability-file", "warn", str(exc),
+                                check_class="informational"))
         if hardware_10bit:
             ten_detail = "hardware 10-bit HEVC available"
         elif any(r.get("hevc10") is None for r in hardware.values()):
@@ -805,39 +917,54 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
         except Exception as exc:
             checks.append(Check(f"perm-{name}", "fail", str(exc)))
 
-    # DB and backup
+    # DB and backup: strictly read-only.  Doctor must never migrate or create.
     try:
-        from .db import SCHEMA_VERSION, Store
-        store = Store(Path(getattr(config, "db_path")))
-        store.integrity_check()
-        with store._lock:
-            version_row = store._conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'"
-            ).fetchone()
-            migration_row = store._conn.execute(
-                "SELECT value FROM meta WHERE key='last_migration_backup'"
-            ).fetchone()
-        current_version = int(version_row[0]) if version_row else 0
-        checks.append(Check(
-            "db-schema",
-            "ok" if current_version == SCHEMA_VERSION else "fail",
-            f"schema {current_version} (supported {SCHEMA_VERSION})",
-        ))
-        checks.append(Check(
-            "last-migration",
-            "ok" if migration_row else "warn",
-            f"backup {migration_row[0]}" if migration_row else "no schema migration performed",
-        ))
-        backup = store.newest_backup(Path(getattr(config, "backup_dir")))
-        store.close()
-        if backup:
-            age = time.time() - backup.stat().st_mtime
-            status = "ok" if age < 48 * 3600 else "warn"
-            checks.append(Check("db-integrity", "ok", "integrity_check=ok"))
-            checks.append(Check("db-backup", status, f"newest backup {age / 3600:.1f}h old"))
+        from .db import SCHEMA_VERSION
+        db_path = Path(getattr(config, "db_path"))
+        if not db_path.is_file():
+            checks.append(Check(
+                "db-integrity", "warn", "state.db absent; no migration performed",
+                check_class="informational",
+            ))
+            checks.append(Check("db-schema", "warn", "schema unknown; database absent",
+                                check_class="informational"))
         else:
-            checks.append(Check("db-integrity", "ok", "integrity_check=ok"))
-            checks.append(Check("db-backup", "warn", "no backup yet"))
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=1.0)
+            try:
+                rows = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+                if rows != ["ok"]:
+                    raise RuntimeError("integrity_check=" + "; ".join(rows))
+                version_row = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'"
+                ).fetchone()
+                migration_row = conn.execute(
+                    "SELECT value FROM meta WHERE key='last_migration_backup'"
+                ).fetchone()
+            finally:
+                conn.close()
+            current_version = int(version_row[0]) if version_row else 0
+            checks.append(Check(
+                "db-schema",
+                "ok" if current_version == SCHEMA_VERSION else "warn",
+                f"schema {current_version} (supported {SCHEMA_VERSION}); doctor does not migrate",
+            ))
+            checks.append(Check(
+                "last-migration",
+                "ok" if migration_row else "warn",
+                f"backup {migration_row[0]}" if migration_row else "no schema migration performed",
+                check_class="informational",
+            ))
+            checks.append(Check("db-integrity", "ok", "integrity_check=ok (read-only)"))
+        backup_dir = Path(getattr(config, "backup_dir"))
+        backups = sorted(backup_dir.glob("state-*.db")) if backup_dir.is_dir() else []
+        if backups:
+            age = time.time() - backups[-1].stat().st_mtime
+            checks.append(Check("db-backup", "ok" if age < 48 * 3600 else "warn",
+                                f"newest backup {age / 3600:.1f}h old",
+                                check_class="informational"))
+        else:
+            checks.append(Check("db-backup", "warn", "no backup yet",
+                                check_class="informational"))
     except Exception as exc:
         checks.append(Check("db-integrity", "fail", f"refusing to trust state: {exc}"))
 
@@ -901,47 +1028,104 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
     else:
         checks.append(Check("verify-items", "ok", "no unchecked VERIFY items"))
 
-    # TMDb reachability (optional; token only in header)
+    # TMDb is optional and doctor never contacts the network.  A token only
+    # changes which optional feature is available; reachability is an on-box
+    # verification item, not a preflight result.
     token = getattr(secrets, "tmdb_token", None) if secrets is not None else None
-    if not token:
-        checks.append(Check("tmdb", "ok", "optional: no token configured; parse-only fallback"))
-    else:
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                "https://api.themoviedb.org/3/search/movie?query=test&year=2000",
-                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                ok = 200 <= resp.status < 300
-            checks.append(Check("tmdb", "ok" if ok else "warn", "TMDb reachable"))
-        except Exception:
-            checks.append(Check("tmdb", "warn", "TMDb unreachable; cached/parse-only fallback will be used"))
+    checks.append(Check(
+        "tmdb-config", "ok" if token else "warn",
+        "TMDb token configured" if token else "no TMDb token; parse-only fallback",
+        check_class="informational",
+    ))
+    checks.append(Check(
+        "notification-config", "ok" if getattr(secrets, "notify_url", None) else "warn",
+        "notification URL configured" if getattr(secrets, "notify_url", None)
+        else "no notification URL; notifications disabled",
+        check_class="informational",
+    ))
 
     # experimental folder not created by install
     exp_folder = Path(getattr(config, "convert")) / "1080p-best-x265-mp4"
     if exp_folder.exists():
         checks.append(Check("experimental-folder", "warn",
-                            "experimental preset folder exists; ensure it is intentional"))
+                            "experimental preset folder exists; ensure it is intentional",
+                            check_class="informational"))
 
-    return DoctorReport(checks)
+    import sys
+    checks.append(Check(
+        "python-version", "ok" if sys.version_info >= (3, 12) else "fail",
+        f"Python {sys.version_info.major}.{sys.version_info.minor} (need >= 3.12)",
+    ))
+
+    state_settings = _read_state_settings(Path(getattr(config, "db_path", "")))
+    holds = sorted(key for key, value in state_settings.items()
+                   if value and key.endswith("_hold"))
+    restart_pending = state_settings.get("restart_required", "")
+    checks.append(Check(
+        "restart-holds", "ok" if not restart_pending and not holds else "warn",
+        f"restart_required={restart_pending or 'none'}; holds={','.join(holds) or 'none'}",
+        {"restart_required": restart_pending, "holds": holds},
+        check_class="informational",
+    ))
+    checks.append(Check(
+        "ffmpeg-change", "ok" if not state_settings.get("ffmpeg_changed_hold", "") else "warn",
+        state_settings.get("ffmpeg_changed_hold", "") or "no ffmpeg-change hold",
+        check_class="informational",
+    ))
+
+    movies = Path(getattr(config, "movies", root / "movies"))
+    pipeline = Path(getattr(config, "pipeline", root / "_pipeline"))
+    checks.append(Check(
+        "library-roots",
+        "ok" if movies.exists() and movies.resolve() != pipeline.resolve() else "warn",
+        f"movies={movies}; pipeline={pipeline}",
+        check_class="informational" if not movies.exists() else "required",
+    ))
+
+    unit_paths = [Path("/etc/systemd/system/mediaflow.service"),
+                  Path(__file__).resolve().parents[2] / "systemd" / "mediaflow.service"]
+    unit_text = ""
+    for unit in unit_paths:
+        try:
+            unit_text = unit.read_text(encoding="utf-8")
+            if unit_text:
+                break
+        except OSError:
+            continue
+    needed = ("KillMode=", "TimeoutStopSec=", "DeviceAllow=/dev/dri/renderD128 rw",
+              "SupplementaryGroups=", "ReadWritePaths=")
+    missing = [token for token in needed if token not in unit_text]
+    checks.append(Check(
+        "systemd-hardening",
+        "ok" if unit_text and not missing else ("warn" if not unit_text else "fail"),
+        f"unit reviewed; missing={','.join(missing) or 'none'}",
+        {"missing": missing},
+        check_class="informational" if not unit_text else "required",
+    ))
+
+    return _classify_checks(DoctorReport(checks), config)
 
 
 def format_doctor(report: DoctorReport, *, short: bool = False) -> str:
     if short:
-        fails = [c for c in report.checks if c.status == "fail"]
-        warns = [c for c in report.checks if c.status == "warn"]
+        fails = report.required_failures
+        unknowns = report.unknowns
         lines = [f"mediaflow doctor: {'FAIL' if fails else 'OK'}",
-                 f"checks {len(report.checks)}, warnings {len(warns)}"]
+                 f"checks {len(report.checks)}, unknown {len(unknowns)}"]
         for c in fails[:6]:
             lines.append(f"FAIL {c.name}: {c.detail}"[:60])
-        for c in warns[:4]:
-            lines.append(f"WARN {c.name}: {c.detail}"[:60])
+        for c in unknowns[:4]:
+            lines.append(f"UNKN {c.name}: {c.detail}"[:60])
         return "\n".join(lines[:12])
-    out = []
-    for c in report.checks:
-        mark = {"ok": "OK  ", "warn": "WARN", "fail": "FAIL"}[c.status]
-        out.append(f"[{mark}] {c.name}: {c.detail}")
+    marks = {"ok": "PASS", "warn": "UNKN", "fail": "FAIL"}
+    out = [f"[{marks[c.status]}] {c.check_class[:4]} {c.name}: {c.detail}"
+           for c in report.checks]
     out.append("")
-    out.append("doctor: " + ("ok" if report.ok else "problems found") +
-               f" ({len(report.checks)} checks, {report.warnings} warnings)")
+    out.append(
+        "doctor: " + ("ok" if report.ok else "problems found")
+        + f" (exit {report.exit_code}, {len(report.checks)} checks, "
+        f"{len(report.required_failures)} required failures, "
+        f"{len(report.feature_failures)} feature failures, "
+        f"{len(report.unknowns)} unknown)"
+    )
     return "\n".join(out)

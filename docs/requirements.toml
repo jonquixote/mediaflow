@@ -166,6 +166,30 @@ text = "The database schema version is enforced. Older databases are backed up, 
 test = "tests/test_migrations.py"
 
 [[requirements]]
+id = "DEPLOY-1"
+title = "Hardware verification registry"
+safety = true
+section = "17"
+text = "Every unverified hardware or deployment claim has one registry item with a class, runner, exact procedure, expected result, failure interpretation, risk, evidence path and status. The generated markdown view is fresh, and only recorded on-box evidence may mark an item verified-on-hardware. The agent never marks an on-box item verified."
+test = "tests/test_hardware_registry.py"
+
+[[requirements]]
+id = "DEPLOY-2"
+title = "Truthful read-only doctor preflight"
+safety = true
+section = "17"
+text = "Doctor reports pass, fail and unknown outcomes separately for required, feature-conditional and informational checks. It exits non-zero only for required failures or enabled feature failures, never writes to media or state, never migrates the database, never performs network checks, and routes every subprocess through bounded supervision. Unknown is never reported as pass or as a failure of the tested capability."
+test = "tests/test_doctor.py"
+
+[[requirements]]
+id = "DEPLOY-3"
+title = "Installer rehearsal and evidence bundles"
+safety = true
+section = "17"
+text = "Installer and upgrade logic is rehearsed against a fake root: fresh install, repeat, over an older install, partial failure and refusal on a newer schema. Existing config, secrets and state are preserved. Evidence bundles record revision, timestamp and redacted command output without titles or secrets, and the registry updater accepts only complete, consistent bundles."
+test = "tests/test_deploy_kit.py"
+
+[[requirements]]
 id = "SCHED-1"
 title = "Schedule window is a start gate"
 safety = true

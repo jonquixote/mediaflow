@@ -1,0 +1,752 @@
+# Hardware and deployment verification registry.
+# Authoritative source for verification items. HARDWARE_CHECKS.md is generated.
+# The agent never sets verified-on-hardware; only recorded on-box evidence does.
+
+[[checks]]
+id = "HW-001"
+title = "real QSV HEVC 8-bit encode and the actual rate-control mode (ICQ vs CQP vs hybrid) on the Kaby Lake GPU; the s"
+claim = "[ ] Section 5.5, real QSV HEVC 8-bit encode and the actual rate-control mode (ICQ vs CQP vs hybrid) on the Kaby Lake GPU; the sandbox agent cannot open `/dev/dri/renderD128`, section 7. Run `sudo -u mediaflow -g media /opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor` after install and paste the QSV/rate-control result into `docs/VERIFIED.md`."
+supports = ["DEPLOY-1", "DEPLOY-2", "DEPLOY-3"]
+class = "required"
+runner = "doctor-automatable"
+procedure = "Run `sudo -u mediaflow -g media /opt/mediaflow/venv/bin/mediaflow --config /etc/mediaflow/config.toml doctor` after install and paste the QSV/rate-control result into `docs/VERIFIED.md`."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-001/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-002"
+title = "real VAAPI HEVC 8-bit fallback and its rate-control mode"
+claim = "[ ] Section 5.5, real VAAPI HEVC 8-bit fallback and its rate-control mode, section 7. Run the same `doctor`; if VAAPI works while QSV fails, verify the planner chooses VAAPI and logs it."
+supports = ["DEPLOY-1", "DEPLOY-2"]
+class = "required"
+runner = "doctor-automatable"
+procedure = "Run the same `doctor`; if VAAPI works while QSV fails, verify the planner chooses VAAPI and logs it."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-002/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-003"
+title = "Kaby Lake HEVC 10-bit hardware encode: disputed in public sources and deliberately never assumed"
+claim = "[ ] Section 5.5, Kaby Lake HEVC 10-bit hardware encode: disputed in public sources and deliberately never assumed, section 7. Run `doctor`; confirm the separate 10-bit result and exercise a 10-bit source through `keep-remux-mkv` and, if supported, `1080p-balanced-mp4`."
+supports = ["DEPLOY-1", "DEPLOY-2"]
+class = "feature-conditional"
+runner = "doctor-automatable"
+procedure = "Run `doctor`; confirm the separate 10-bit result and exercise a 10-bit source through `keep-remux-mkv` and, if supported, `1080p-balanced-mp4`."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-003/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-004"
+title = "whether ffmpeg debug output exposes the engaged rate-control mode as expected; if it does not"
+claim = "[ ] Section 5.5, whether ffmpeg debug output exposes the engaged rate-control mode as expected; if it does not, inspect `ffmpeg -v debug` for your installed `jellyfin-ffmpeg` and record the stable detector output in `docs/VERIFIED.md`."
+supports = ["DEPLOY-1", "DEPLOY-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.5, whether ffmpeg debug output exposes the engaged rate-control mode as expected; if it does not, inspect `ffmpeg -v debug` for your installed `jellyfin-ffmpeg` and record the stable detector output in `docs/VERIFIED.md`."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-004/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-005"
+title = "software-decode + hardware-upload fallback for source codecs without a hardware decoder. Run one real non-QSV-"
+claim = "[ ] Section 5.5, software-decode + hardware-upload fallback for source codecs without a hardware decoder. Run one real non-QSV-decodable source through an encode preset and confirm the log says software decode + upload rather than failing."
+supports = ["DEPLOY-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Run one real non-QSV-decodable source through an encode preset and confirm the log says software decode + upload rather than failing."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-005/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-006"
+title = "`IOSchedulingClass=idle` effect under the I/O scheduler in use (check `/sys/block/*/queue/scheduler`)"
+claim = "[ ] Section 7/SAF-9, `IOSchedulingClass=idle` effect under the I/O scheduler in use (check `/sys/block/*/queue/scheduler`), section 7. Run a real encode and inspect `ionice`/latency; record the scheduler and result."
+supports = ["DEPLOY-1", "DEPLOY-2", "SAF-9"]
+class = "informational"
+runner = "doctor-automatable"
+procedure = "Run a real encode and inspect `ionice`/latency; record the scheduler and result."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-006/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-007"
+title = "`MemoryHigh=2G`/`MemoryMax=3G` versus peak RSS for software decode plus HEVC encode and for a short x265 `slow"
+claim = "[ ] Section 7/SAF-9, `MemoryHigh=2G`/`MemoryMax=3G` versus peak RSS for software decode plus HEVC encode and for a short x265 `slow` sample, section 7. Use `/usr/bin/time -v` or systemd accounting; adjust the unit if needed."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "[ ] Section 7/SAF-9, `MemoryHigh=2G`/`MemoryMax=3G` versus peak RSS for software decode plus HEVC encode and for a short x265 `slow` sample, section 7. Use `/usr/bin/time -v` or systemd accounting; adjust the unit if needed."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-007/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-008"
+title = "`CPUQuota=300%` on this 2-core/4-thread CPU"
+claim = "[ ] Section 7/SAF-9, `CPUQuota=300%` on this 2-core/4-thread CPU, section 7. Start a real encode with the unit and confirm the effective quota and temperature behaviour."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "Start a real encode with the unit and confirm the effective quota and temperature behaviour."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-008/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-009"
+title = "`DeviceAllow=/dev/dri/renderD128 rw` and `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` do not break QSV/V"
+claim = "[ ] Section 7/SAF-9, `DeviceAllow=/dev/dri/renderD128 rw` and `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` do not break QSV/VAAPI or TMDb HTTPS, section 7. Run `doctor` and one real encode inside the installed unit; if broken, record the minimal change and update the unit."
+supports = ["DEPLOY-1", "DEPLOY-2", "DEPLOY-3", "SAF-9"]
+class = "required"
+runner = "doctor-automatable"
+procedure = "Run `doctor` and one real encode inside the installed unit; if broken, record the minimal change and update the unit."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-009/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-010"
+title = "SIGSTOP/SIGCONT of a real QSV/VAAPI encoder with an open GPU context finishes with a valid file"
+claim = "[ ] Section 5.5/SAF-9, SIGSTOP/SIGCONT of a real QSV/VAAPI encoder with an open GPU context finishes with a valid file, section 7. Start a real encode, `kill -STOP` then `kill -CONT` the ffmpeg pid, and verify the final file with `ffprobe` and the decode test. If it hangs or corrupts, set `pause_method = \"idle_after_job\"` and repeat thermal/AC tests."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Start a real encode, `kill -STOP` then `kill -CONT` the ffmpeg pid, and verify the final file with `ffprobe` and the decode test. If it hangs or corrupts, set `pause_method = \"idle_after_job\"` and repeat thermal/AC tests."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-010/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-011"
+title = "thermal pause/resume and the 60-second sustain threshold on the real hwmon sensor/fan profile"
+claim = "[ ] Section 7/SAF-9, thermal pause/resume and the 60-second sustain threshold on the real hwmon sensor/fan profile, section 7. Close the lid, run under load, and record package temperature plus every `encode-paused`/`encode-resumed` event. Re-run the 1-hour test after any fan change."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Close the lid, run under load, and record package temperature plus every `encode-paused`/`encode-resumed` event. Re-run the 1-hour test after any fan change."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-011/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-012"
+title = "AC-loss pause and resume during a real encode"
+claim = "[ ] Section 7/SAF-9, AC-loss pause and resume during a real encode, section 7. Unplug the charger mid-encode, confirm SIGSTOP/paused status, replug, and verify the output passes verification."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Unplug the charger mid-encode, confirm SIGSTOP/paused status, replug, and verify the output passes verification."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-012/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-013"
+title = "whether the fan/PROCHOT profile is adequate while the lid is closed; mediaflow never changes it. Record the ac"
+claim = "[ ] Section 5.5/SAF-9, whether the fan/PROCHOT profile is adequate while the lid is closed; mediaflow never changes it. Record the active fan settings with the thermal test."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.5/SAF-9, whether the fan/PROCHOT profile is adequate while the lid is closed; mediaflow never changes it. Record the active fan settings with the thermal test."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-013/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-014"
+title = "pulled-plug encode resumes with no corrupt or duplicate output on real hardware"
+claim = "[ ] Section 12, pulled-plug encode resumes with no corrupt or duplicate output on real hardware, section 7. With `dry_run=false`, pull power mid-encode, reboot, and verify final state, manifest, hashes, and no duplicate in `movies/`."
+supports = ["DEPLOY-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "With `dry_run=false`, pull power mid-encode, reboot, and verify final state, manifest, hashes, and no duplicate in `movies/`."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-014/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-015"
+title = "real phone Jellyfin direct-play of an encoded MP4 and an HEVC remux (including `hvc1`)"
+claim = "[ ] Section 12, real phone Jellyfin direct-play of an encoded MP4 and an HEVC remux (including `hvc1`), section 8. Play both on the Jellyfin phone app and an iPhone; confirm Direct Play with no transcode."
+supports = ["DEPLOY-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Play both on the Jellyfin phone app and an iPhone; confirm Direct Play with no transcode."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-015/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-016"
+title = "Jellyfin ignores the hidden `.mediaflow-<job-id>` marker"
+claim = "[ ] Section 12, Jellyfin ignores the hidden `.mediaflow-<job-id>` marker, section 7. Confirm the movie still appears once and no marker warning appears in Jellyfin logs."
+supports = ["DEPLOY-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Confirm the movie still appears once and no marker warning appears in Jellyfin logs."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-016/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-017"
+title = "optional `[tmdbid-N]` Jellyfin provider-ID folder syntax against current Jellyfin docs"
+claim = "[ ] Section 8, optional `[tmdbid-N]` Jellyfin provider-ID folder syntax against current Jellyfin docs, section 8. Leave `append_tmdbid=false` until tested; if enabling, verify provider matching for one title."
+supports = ["DEPLOY-1"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "[ ] Section 8, optional `[tmdbid-N]` Jellyfin provider-ID folder syntax against current Jellyfin docs, section 8. Leave `append_tmdbid=false` until tested; if enabling, verify provider matching for one title."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-017/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-018"
+title = "`calibrate` on one animation"
+claim = "[ ] Section 5.4, `calibrate` on one animation, one dark live-action and one high-grain film, section 5.4. Run with 90 seconds, record size/time/VMAF or SSIM, and write the chosen quality values into the preset files."
+supports = ["DEPLOY-1"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "Run with 90 seconds, record size/time/VMAF or SSIM, and write the chosen quality values into the preset files."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-018/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-019"
+title = "`calibrate` on the real machine reports the same backend the plan would select (`doctor` backend"
+claim = "[ ] Section 5.4/SAF-14, `calibrate` on the real machine reports the same backend the plan would select (`doctor` backend, not a silent software fallback), section 5.4. Run `mediaflow calibrate <clip> --preset 1080p-balanced-mp4 --json` and check that `backend`/`encoder` match the hardware the planner picks."
+supports = ["DEPLOY-1", "SAF-14"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "Run `mediaflow calibrate <clip> --preset 1080p-balanced-mp4 --json` and check that `backend`/`encoder` match the hardware the planner picks."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-019/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-020"
+title = "the calibration quality score is meaningful on the real machine: the sandbox ffmpeg build has no `libvmaf`"
+claim = "[ ] Section 5.4/SAF-14, the calibration quality score is meaningful on the real machine: the sandbox ffmpeg build has no `libvmaf`, so only SSIM was exercised, section 5.4. Run the same clip with an ffmpeg build that has `libvmaf` and record both numbers next to the chosen quality."
+supports = ["DEPLOY-1", "SAF-14"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "Run the same clip with an ffmpeg build that has `libvmaf` and record both numbers next to the chosen quality."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-020/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-021"
+title = "the speed-table seed is found again by `estimate` after a calibration"
+claim = "[ ] Section 5.4/SAF-14, the speed-table seed is found again by `estimate` after a calibration, section 12. Calibrate, then run `mediaflow estimate <path> --preset <id>` and confirm the factor matches the seeded one."
+supports = ["DEPLOY-1", "SAF-14"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.4/SAF-14, the speed-table seed is found again by `estimate` after a calibration, section 12. Calibrate, then run `mediaflow estimate <path> --preset <id>` and confirm the factor matches the seeded one."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-021/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-022"
+title = "speed-table estimates within 30% of real encode time on the sample clips"
+claim = "[ ] Section 5.4, speed-table estimates within 30% of real encode time on the sample clips, section 12. Compare `estimate` before and real encode wall time after; record both."
+supports = ["DEPLOY-1"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "Compare `estimate` before and real encode wall time after; record both."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-022/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-023"
+title = "the experimental x265 preset estimate versus the overnight window"
+claim = "[ ] Section 5.4, the experimental x265 preset estimate versus the overnight window, section 5.1. Leave it disabled; if testing, calibrate first, copy the preset into `presets.d`, set `enabled=true`, create its convert folder, and confirm the schedule gate refuses jobs longer than the window."
+supports = ["DEPLOY-1"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.4, the experimental x265 preset estimate versus the overnight window, section 5.1. Leave it disabled; if testing, calibrate first, copy the preset into `presets.d`, set `enabled=true`, create its convert folder, and confirm the schedule gate refuses jobs longer than the window."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-023/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-024"
+title = "the QSV and VAAPI encode paths carry the source's stated colour description (primaries"
+claim = "[ ] Section 7/SAF-2, the QSV and VAAPI encode paths carry the source's stated colour description (primaries, transfer, matrix, range) into the output; the sandbox could only verify the software path, section 7. Encode one tagged bt709 and one tagged bt2020/smpte2084 clip with `1080p-balanced-mp4` and check `ffprobe -show_streams` for `color_primaries`, `color_transfer`, `color_space` and `color_range`."
+supports = ["DEPLOY-1", "SAF-2"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Encode one tagged bt709 and one tagged bt2020/smpte2084 clip with `1080p-balanced-mp4` and check `ffprobe -show_streams` for `color_primaries`, `color_transfer`, `color_space` and `color_range`."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-024/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-025"
+title = "an MP4 output written by the hardware encoders contains a complete `colr` box: the MP4 `nclx` entry needs prim"
+claim = "[ ] Section 7/SAF-2, an MP4 output written by the hardware encoders contains a complete `colr` box: the MP4 `nclx` entry needs primaries, transfer and matrix, and a range-only description cannot be carried, section 7. Inspect the box of a hardware-encoded MP4 (`ffprobe -show_streams` plus a hex look for `colr`) and record which fields survive."
+supports = ["DEPLOY-1", "SAF-2"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Inspect the box of a hardware-encoded MP4 (`ffprobe -show_streams` plus a hex look for `colr`) and record which fields survive."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-025/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-026"
+title = "the planner-selected backend and the engine speed-table key now use the same backend and canonical target-heig"
+claim = "[ ] Section 5.5/SAF-2, the planner-selected backend and the engine speed-table key now use the same backend and canonical target-height bucket in the sandbox, section 5.5. On the real machine, compare the backend in `mediaflow plan --json` with the backend in `mediaflow estimate --json` for the same source, including a scaled source, and confirm they agree with the backend that actually ran."
+supports = ["DEPLOY-1", "SAF-2"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.5/SAF-2, the planner-selected backend and the engine speed-table key now use the same backend and canonical target-height bucket in the sandbox, section 5.5. On the real machine, compare the backend in `mediaflow plan --json` with the backend in `mediaflow estimate --json` for the same source, including a scaled source, and confirm they agree with the backend that actually ran."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-026/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-027"
+title = "the bits-per-pixel floor default (`min_bpp = 0.01` bits per pixel per frame"
+claim = "[ ] Section 7/SAF-2, the bits-per-pixel floor default (`min_bpp = 0.01` bits per pixel per frame, about 498 kbps at 1080p24) is a placeholder and is not empirically calibrated; the metric changed units in this pass, section 7. Run the calibration on the three sample clips, record the measured bits per pixel per frame, and set the default from that evidence."
+supports = ["DEPLOY-1", "DEPLOY-3", "SAF-2"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "Run the calibration on the three sample clips, record the measured bits per pixel per frame, and set the default from that evidence."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-027/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-028"
+title = "the presented-frame-count basis for variable-frame-rate sources (container count"
+claim = "[ ] Section 7/SAF-2, the presented-frame-count basis for variable-frame-rate sources (container count, then decoded count, then a labelled estimate), section 7. Take a VFR sample, compare `ffprobe -count_frames` with the container count, and record which basis the verifier used."
+supports = ["DEPLOY-1", "SAF-2"]
+class = "informational"
+runner = "manual-by-John"
+procedure = "[ ] Section 7/SAF-2, the presented-frame-count basis for variable-frame-rate sources (container count, then decoded count, then a labelled estimate), section 7. Take a VFR sample, compare `ffprobe -count_frames` with the container count, and record which basis the verifier used."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-028/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-029"
+title = "the MP4 muxer marks the first track of a type as default even when the plan says otherwise"
+claim = "[ ] Section 7/SAF-2, the MP4 muxer marks the first track of a type as default even when the plan says otherwise, while MKV keeps the disposition exactly; the plan always marks the first selected audio track as default, section 7. Confirm on the real machine that a multi-track source keeps its intended default track after an MP4 encode."
+supports = ["DEPLOY-1", "SAF-2"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Confirm on the real machine that a multi-track source keeps its intended default track after an MP4 encode."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-029/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-030"
+title = "if an external media drive is added later"
+claim = "[ ] Section 7/SAF-8, if an external media drive is added later, every pipeline path and `movies/` still share one filesystem and the systemd `ReadWritePaths`/mount paths are updated, section 7. Run `doctor`; it must fail if `st_dev` differs."
+supports = ["DEPLOY-1", "DEPLOY-2", "SAF-8"]
+class = "required"
+runner = "doctor-automatable"
+procedure = "Run `doctor`; it must fail if `st_dev` differs."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-030/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-031"
+title = "Jellyfin-transcoding detection with the real `jellyfin` user and a real transcode"
+claim = "[ ] Section 7/SAF-9, Jellyfin-transcoding detection with the real `jellyfin` user and a real transcode, section 7. Start a transcode and confirm mediaflow refuses to start/queues a job."
+supports = ["DEPLOY-1", "SAF-9"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Start a transcode and confirm mediaflow refuses to start/queues a job."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-031/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-032"
+title = "TMDb reachability and one real title lookup"
+claim = "[ ] Section 8, TMDb reachability and one real title lookup, section 8. Install a token, run one dry-run plan, confirm cached response reuse and that the token never appears in process output or logs."
+supports = ["DEPLOY-1", "DEPLOY-3"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "[ ] Section 8, TMDb reachability and one real title lookup, section 8. Install a token, run one dry-run plan, confirm cached response reuse and that the token never appears in process output or logs."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-032/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-033"
+title = "optional notification delivery and payload redaction with the real notify service"
+claim = "[ ] Section 9.1/SAF-10, optional notification delivery and payload redaction with the real notify service, section 9.1. Trigger a REVIEW and confirm the payload contains only counts/job ids; verify cooldown."
+supports = ["DEPLOY-1", "SAF-10"]
+class = "feature-conditional"
+runner = "manual-by-John"
+procedure = "[ ] Section 9.1/SAF-10, optional notification delivery and payload redaction with the real notify service, section 9.1. Trigger a REVIEW and confirm the payload contains only counts/job ids; verify cooldown."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-033/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-034"
+title = "controlled `SIGTERM` during a real encode and during verification"
+claim = "[ ] Section 5.5/SUP-3, controlled `SIGTERM` during a real encode and during verification, section 7. Run `sudo systemctl stop mediaflow.service` in each phase; confirm the ffmpeg child is gone, the original is intact, no partial file is published, the encode recovers at `PLANNED` without increasing `restarts`, and verification remains unverified until it completes."
+supports = ["DEPLOY-1", "SUP-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Run `sudo systemctl stop mediaflow.service` in each phase; confirm the ffmpeg child is gone, the original is intact, no partial file is published, the encode recovers at `PLANNED` without increasing `restarts`, and verification remains unverified until it completes."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-034/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-035"
+title = "reordered and variable-frame-rate packet presentation on real media"
+claim = "[ ] Section 5.5/SUP-1, reordered and variable-frame-rate packet presentation on real media, section 5.5. Compare `ffprobe -show_packets` with the container duration; confirm mediaflow uses the maximum `pts + duration`, not the final packet in file order, and that packet count and decoded-frame count remain distinct."
+supports = ["DEPLOY-1", "SUP-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Compare `ffprobe -show_packets` with the container duration; confirm mediaflow uses the maximum `pts + duration`, not the final packet in file order, and that packet count and decoded-frame count remain distinct."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-035/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-036"
+title = "bounded verification memory on a large packet-dense file"
+claim = "[ ] Section 5.5/SUP-1, bounded verification memory on a large packet-dense file, section 5.5. Verify a large VFR file while sampling peak RSS; confirm retained verifier memory does not grow in proportion to packet count and stays within the systemd `MemoryMax` limit."
+supports = ["DEPLOY-1", "SUP-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 5.5/SUP-1, bounded verification memory on a large packet-dense file, section 5.5. Verify a large VFR file while sampling peak RSS; confirm retained verifier memory does not grow in proportion to packet count and stays within the systemd `MemoryMax` limit."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-036/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-037"
+title = "an interrupted or deferred capability probe"
+claim = "[ ] Section 5.5/SUP-3, an interrupted or deferred capability probe, section 10. Interrupt `doctor` during a backend probe, for example by removing AC while it is running; confirm the result is `unknown` or `deferred`, not `no`, and that the last valid `/var/lib/mediaflow/capabilities.json` is unchanged."
+supports = ["DEPLOY-1", "SUP-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Interrupt `doctor` during a backend probe, for example by removing AC while it is running; confirm the result is `unknown` or `deferred`, not `no`, and that the last valid `/var/lib/mediaflow/capabilities.json` is unchanged."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-037/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-038"
+title = "migration of the real `state.db` before enabling live writes"
+claim = "[ ] Section 3.1/COMPAT-1, migration of the real `state.db` before enabling live writes, section 3.1. With the service stopped, copy `/var/lib/mediaflow/state.db` to a safe location, start the new version, confirm a pre-migration backup exists in `/var/lib/mediaflow/backup/`, run `doctor`, and verify that all job history and manifests remain visible."
+supports = ["COMPAT-1", "DEPLOY-1", "DEPLOY-2", "DEPLOY-3"]
+class = "required"
+runner = "doctor-automatable"
+procedure = "With the service stopped, copy `/var/lib/mediaflow/state.db` to a safe location, start the new version, confirm a pre-migration backup exists in `/var/lib/mediaflow/backup/`, run `doctor`, and verify that all job history and manifests remain visible."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-038/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-039"
+title = "live reload during a real encode"
+claim = "[ ] Section 10.1/CONFIG-1, live reload during a real encode, section 10.1. Start a long encode, edit a live key such as `min_free_gb`, then a restart-required key such as `poll_seconds`; confirm the encode keeps its original policy, `status --json` shows the new generation and restart hold, and the old `poll_seconds` remains effective until restart."
+supports = ["CONFIG-1", "DEPLOY-1", "DEPLOY-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Start a long encode, edit a live key such as `min_free_gb`, then a restart-required key such as `poll_seconds`; confirm the encode keeps its original policy, `status --json` shows the new generation and restart hold, and the old `poll_seconds` remains effective until restart."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-039/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-040"
+title = "TMDb/notify secret rotation on the installed service"
+claim = "[ ] Section 10.1/CONFIG-1, TMDb/notify secret rotation on the installed service, section 10.1. Replace `tmdb.env` and `notify.env`, reload the daemon, and confirm no secret value appears in status, journal or reload events and that a restart is reported until performed."
+supports = ["CONFIG-1", "DEPLOY-1", "DEPLOY-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 10.1/CONFIG-1, TMDb/notify secret rotation on the installed service, section 10.1. Replace `tmdb.env` and `notify.env`, reload the daemon, and confirm no secret value appears in status, journal or reload events and that a restart is reported until performed."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-040/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-041"
+title = "restore and re-drop a real title"
+claim = "[ ] Section 3.1/STATE-1, restore and re-drop a real title, section 3.1. Complete a job, run `mediaflow restore <id>`, drop the same folder under the same preset again, and confirm a new job id is created while the RESTORED history stays visible."
+supports = ["DEPLOY-1", "STATE-1"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 3.1/STATE-1, restore and re-drop a real title, section 3.1. Complete a job, run `mediaflow restore <id>`, drop the same folder under the same preset again, and confirm a new job id is created while the RESTORED history stays visible."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-041/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-042"
+title = "staged publish on the real shared filesystem"
+claim = "[ ] Section 7/SAF-3, staged publish on the real shared filesystem, section 7. Complete one encode and confirm the verified output is moved into the work-staged folder, the hidden marker is written last, and only one no-replace rename exposes it in `movies/`; interrupt before the rename and confirm no partial folder appears in the library."
+supports = ["DEPLOY-1", "SAF-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 7/SAF-3, staged publish on the real shared filesystem, section 7. Complete one encode and confirm the verified output is moved into the work-staged folder, the hidden marker is written last, and only one no-replace rename exposes it in `movies/`; interrupt before the rename and confirm no partial folder appears in the library."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-042/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-043"
+title = "thermal input reload on the installed service"
+claim = "[ ] Section 10.1/CONFIG-1, thermal input reload on the installed service, section 10.1. Start an encode, change `temp_sensor` to `none`, reload, and confirm a restart-required hold is shown and the running encode keeps its original thermal sensor until restart."
+supports = ["CONFIG-1", "DEPLOY-1", "DEPLOY-3"]
+class = "required"
+runner = "manual-by-John"
+procedure = "Start an encode, change `temp_sensor` to `none`, reload, and confirm a restart-required hold is shown and the running encode keeps its original thermal sensor until restart."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-043/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+
+[[checks]]
+id = "HW-044"
+title = "publish disk boundary with real sidecars"
+claim = "[ ] Section 7/SAF-8, publish disk boundary with real sidecars, section 7. Construct a source near the free-space threshold with large subtitle sidecars and confirm the publish gate reserves source envelope plus sidecar bytes, with no output-copy reservation."
+supports = ["DEPLOY-1", "SAF-8"]
+class = "required"
+runner = "manual-by-John"
+procedure = "[ ] Section 7/SAF-8, publish disk boundary with real sidecars, section 7. Construct a source near the free-space threshold with large subtitle sidecars and confirm the publish gate reserves source envelope plus sidecar bytes, with no output-copy reservation."
+expected = "Observed behaviour matches the claim; revision, timestamp and doctor JSON are captured in the evidence bundle."
+failure_interpretation = "Do not advance real-library enablement for the affected capability. Record the failure with evidence and follow the runbook guidance for this item."
+risk = "Low with a disposable clip in a sandbox root; no real media may be used. Power and thermal drills must be stopped by John if the machine becomes unstable."
+disposable_media = true
+evidence = "$EVIDENCE/HW-044/"
+status = "unverified"
+verified_at = ""
+verified_revision = ""
+

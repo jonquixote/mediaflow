@@ -7,10 +7,13 @@ The machine-readable requirement registry is `docs/requirements.toml`; it is
 authoritative for requirement IDs, wording and safety flags. `docs/INVARIANTS.md`
 is generated from its safety-flagged entries and is never edited by hand.
 `docs/PLAN_SCHEMA.md` is authoritative for persisted plan fields and their
-meaning. `docs/RUNBOOK.md` is authoritative for operator procedure, and
-`docs/VERIFIED.md` records only commands that were actually run. This SPEC and
-its detailed tables are explanatory; if they disagree with the registry,
-schema or code, those authorities win.
+meaning. `docs/hardware_checks.toml` is authoritative for unverified hardware
+and deployment items and their status; its markdown views are generated.
+`docs/DEPLOYMENT.md` is authoritative for install/upgrade/rollback procedure,
+`docs/FIRST_RUN.md` for the ordered on-box drills, `docs/RUNBOOK.md` for daily
+operation, and `docs/VERIFIED.md` records only commands that were actually run.
+This SPEC and its detailed tables are explanatory; if they disagree with the
+registry, schema or code, those authorities win.
 
 ## 0. Reading this document
 
@@ -220,6 +223,9 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **SAF-12** liveness: restart limit, stall detector, ffmpeg-version change pauses until capability tests pass.
 - **SAF-13** untrusted input: protocol whitelist, format allowlist, regular files only.
 - **SAF-14** calibration measures the production operation; no silent backend substitution; only valid trials seed the speed table.
+- **DEPLOY-1** every unverified claim has one registry item; only recorded on-box evidence can verify it.
+- **DEPLOY-2** doctor is a read-only preflight with pass/fail/unknown outcomes and class-aware exit codes.
+- **DEPLOY-3** installer/upgrade rehearsal and redacted evidence bundles are tested; no on-box item is marked verified by the agent.
 - **STATE-1** one shared job-state vocabulary; RESTORED is terminal history and does not block a re-drop.
 - **CONFIG-1** keyed reload classification, atomic generations and plan binding; restart-required changes stay visibly pending.
 - **COMPAT-1** enforced schema versions, backed-up ordered migrations and explicit semantic generations for plans/speed/capabilities.
@@ -287,6 +293,14 @@ marker follows the historical crash-recovery path, while a controlled encode
 or verification marker takes precedence and is recoverable. Older encoder,
 verifier, probe and guard call shapes continue to work; new supervision
 controls are supplied only when the callable accepts them.
+
+## 17. Deployment readiness
+
+Pass D does not deploy. It provides a hardware-check registry, a read-only
+doctor preflight, an installer rehearsal, an ordered first-run kit and a
+redacted evidence-bundle workflow. All on-box items remain unverified until
+John supplies recorded evidence. See `docs/hardware_checks.toml`,
+`docs/DEPLOYMENT.md`, `docs/FIRST_RUN.md` and `docs/VERIFIED.md`.
 
 ## 11-12. Deployment and tests
 
