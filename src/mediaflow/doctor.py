@@ -407,7 +407,8 @@ def run_capability_tests(
     config: Any,
     *,
     ffmpeg: str | None = None,
-    backends: Iterable[str] = ("qsv", "vaapi", "software"),
+    backends: Iterable[str] = ("qsv", "vaapi"),
+    allow_software: bool = False,
     timeout: float = 90.0,
     cancel_event: Any = None,
     pause_event: Any = None,
@@ -421,11 +422,25 @@ def run_capability_tests(
     first probe, while a completed 8-bit fact remains available if the
     10-bit probe later times out.  Incomplete reports are never persisted over
     a valid capability file.
+
+    Software/libx265 probing is disabled by default. The initial deployment
+    workflow and automatic retests must never encode with x265.
     """
+
+    backends = tuple(str(name) for name in backends)
+    if "software" in backends and not allow_software:
+        raise ValueError("software capability probes require explicit allow_software=True")
+    unknown = sorted(set(backends) - {"qsv", "vaapi", "software"})
+    if unknown:
+        raise ValueError(f"unknown capability backend(s): {', '.join(unknown)}")
+    if not backends:
+        raise ValueError("at least one capability backend is required")
 
     ffmpeg = ffmpeg or str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
     results: dict[str, Any] = {
         "capabilities_schema": CAPABILITIES_SCHEMA,
+        "backends_requested": list(backends),
+        "software_probing": "software" in backends,
         "status": "ok",
         "state": OperationState.SUCCEEDED.value,
         "deferred": False,
@@ -736,8 +751,9 @@ def _classify_checks(report: DoctorReport, config: Any) -> DoctorReport:
 
 
 def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Path | None = None,
-               secrets: Any = None, run_capabilities: bool = True,
-               ffmpeg_runner: Callable[..., Any] | None = None) -> DoctorReport:
+               secrets: Any = None, run_capabilities: bool = False,
+               capability_backends: tuple[str, ...] | None = None,
+                ffmpeg_runner: Callable[..., Any] | None = None) -> DoctorReport:
     checks: list[Check] = []
     ffmpeg = str(getattr(config, "ffmpeg", FFMPEG_DEFAULT))
     ffprobe = str(getattr(config, "ffprobe", FFPROBE_DEFAULT))
@@ -753,7 +769,10 @@ def run_doctor(config: Any, *, config_path: Path | None = None, presets_dir: Pat
     # Capability probes own their ffmpeg version subprocess.  This avoids a
     # second version probe outside the processing slot and keeps a busy slot
     # from starting any capability-related process.
-    caps = run_capability_tests(config, ffmpeg=ffmpeg) if run_capabilities else {}
+    backends = capability_backends or ("qsv", "vaapi")
+    caps = run_capability_tests(
+        config, ffmpeg=ffmpeg, backends=backends, allow_software=False,
+    ) if run_capabilities else {}
     if run_capabilities:
         version = caps.get("ffmpeg_version")
         verr = caps.get("version_error")

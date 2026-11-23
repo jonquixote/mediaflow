@@ -74,7 +74,8 @@ def test_doctor_reports_capabilities_and_rate_control(tmp_path, monkeypatch):
     docs.mkdir()
     (docs / "QUESTIONS.md").write_text("- [x] resolved\n")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
-    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
     assert isinstance(report, DoctorReport)
     names = {c.name: c for c in report.checks}
     assert names["encode-qsv"].status == "ok"
@@ -108,7 +109,8 @@ def test_doctor_does_not_call_software_10bit_hardware(tmp_path, monkeypatch):
     docs.mkdir()
     (docs / "QUESTIONS.md").write_text("")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
-    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
     names = {c.name: c for c in report.checks}
     assert names["hevc-10bit"].status == "warn"
     assert names["hardware-encode"].status == "warn"
@@ -125,7 +127,8 @@ def test_doctor_fails_closed_without_temp_sensor(tmp_path, monkeypatch):
     docs.mkdir()
     (docs / "QUESTIONS.md").write_text("")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
-    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
     sensor = next(c for c in report.checks if c.name == "temp-sensor")
     assert sensor.status == "fail"
     assert not report.ok
@@ -140,7 +143,8 @@ def test_doctor_flags_unknown_preset_folder(tmp_path, monkeypatch):
     docs.mkdir()
     (docs / "QUESTIONS.md").write_text("")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
-    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
     assert any(c.name == "unknown-preset-mystery-preset" and c.status == "fail"
                for c in report.checks)
 
@@ -216,7 +220,7 @@ def test_a_busy_processing_slot_prevents_every_capability_probe(
     )
 
     with processing_slot(slot_path(config), timeout=0):
-        result = run_capability_tests(config, backends=("software",))
+        result = run_capability_tests(config, backends=("software",), allow_software=True)
 
     assert result["status"] == "deferred"
     assert result["state"] == OperationState.DEFERRED.value
@@ -265,7 +269,7 @@ def test_capability_probes_and_filter_check_share_the_processing_slot(
     monkeypatch.setattr("mediaflow.doctor._encode_probe", fake_encode)
     monkeypatch.setattr("mediaflow.doctor._run_supervised", fake_filters)
 
-    result = run_capability_tests(config, backends=("software",))
+    result = run_capability_tests(config, backends=("software",), allow_software=True)
 
     assert result["completed"] is True
     assert result["libvmaf"] is True
@@ -302,7 +306,7 @@ def test_incomplete_first_probe_does_not_start_the_second_probe(
 
     monkeypatch.setattr("mediaflow.doctor._encode_probe", fake_encode)
 
-    result = run_capability_tests(config, backends=("software",))
+    result = run_capability_tests(config, backends=("software",), allow_software=True)
 
     assert calls == [False], "the 10-bit probe must not follow an incomplete 8-bit probe"
     assert result["status"] == "timed-out"
@@ -355,7 +359,7 @@ def test_completed_eight_bit_fact_survives_a_later_timeout(
 
     monkeypatch.setattr("mediaflow.doctor._encode_probe", fake_encode)
 
-    result = run_capability_tests(config, backends=("software",))
+    result = run_capability_tests(config, backends=("software",), allow_software=True)
 
     assert result["status"] == "timed-out"
     assert result["timeout_type"] == "overall"
@@ -392,7 +396,7 @@ def test_spawn_failure_leaves_capability_facts_unknown(
         },
     )
 
-    result = run_capability_tests(config, backends=("software",))
+    result = run_capability_tests(config, backends=("software",), allow_software=True)
 
     assert result["status"] == "failed"
     assert result["completed"] is False
@@ -440,7 +444,8 @@ def test_incomplete_capability_report_does_not_overwrite_valid_evidence(
     (docs / "QUESTIONS.md").write_text("")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
 
-    report = run_doctor(config, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(config, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
 
     assert config.capabilities_path.read_bytes() == before
     assert json.loads(config.capabilities_path.read_text()) == valid
@@ -462,7 +467,8 @@ def test_doctor_json_reports_outcomes_and_classes(tmp_path, monkeypatch):
     docs.mkdir()
     (docs / "QUESTIONS.md").write_text("")
     monkeypatch.setenv("MEDIAFLOW_DOCS", str(docs))
-    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d")
+    report = run_doctor(cfg, config_path=path, presets_dir=path.parent / "presets.d",
+                        run_capabilities=True)
     data = report.as_dict()
 
     assert {"pass", "fail", "unknown"} <= set(data["summary"])

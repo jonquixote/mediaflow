@@ -178,7 +178,8 @@ class Engine:
                  identity_resolver: Callable | None = None,
                  clock: Callable[[], float] = time.time,
                  dry_run_override: bool | None = None,
-                  secrets: Any = None):
+                  secrets: Any = None,
+                   manage_media_dirs: bool = False):
         self.cfg = config
         self.store = store
         self.presets = dict(presets or {})
@@ -212,6 +213,7 @@ class Engine:
         self.notifier = notifier
         self.identity_resolver = identity_resolver
         self.secrets = secrets if secrets is not None else _cfg(config, "secrets", None)
+        self._manage_media_dirs = bool(manage_media_dirs)
         self._started = False
         self._user_paused = store.get_setting("user_paused", "0") == "1"
         self._pause_reasons: list[str] = []
@@ -260,14 +262,25 @@ class Engine:
         self.write_status()
 
     def _ensure_dirs(self) -> None:
-        for p in (self.movies, self.inbox, self.convert_movies, self.work, self.review, self.failed,
-                  self.trash, self.log_dir, self.status_path.parent, self.progress_path.parent,
-                  self.capabilities_path.parent):
-            p.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(p, 0o2775)
-            except PermissionError:
-                pass
+        """Ensure only non-media runtime paths by default.
+
+        Production startup and scanning must never create, chmod or chown a
+        library root.  Media-path initialization is a separate, explicitly
+        approved step; it is enabled only for isolated scratch installations.
+        """
+
+        runtime_paths = (
+            self.log_dir, self.status_path.parent, self.progress_path.parent,
+            self.capabilities_path.parent,
+        )
+        for path in runtime_paths:
+            path.mkdir(parents=True, exist_ok=True)
+        if not self._manage_media_dirs:
+            return
+        for path in (self.movies, self.inbox, self.convert_movies, self.work,
+                     self.review, self.failed, self.trash):
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
 
     def _check_paths(self) -> None:
         try:

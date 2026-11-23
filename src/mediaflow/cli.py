@@ -68,7 +68,18 @@ def _load(args) -> tuple[Config, Any, dict]:
     return cfg, secrets, presets
 
 
-def _open_store(cfg: Config) -> Store:
+def _open_store(cfg: Config, *, observation: bool = False) -> Store | None:
+    """Open the state database. Observational commands use a read-only snapshot.
+
+    A missing database is not an error for an observational command: it has
+    nothing to show and must not create state.
+    """
+
+    if observation:
+        try:
+            return Store(cfg.db_path, read_only=True)
+        except DatabaseError:
+            return None
     store = Store(cfg.db_path)
     store.initialize()
     return store
@@ -122,11 +133,12 @@ def _status_payload(cfg: Config, store: Store | None = None) -> dict:
 
 def cmd_status(args) -> int:
     cfg, secrets, presets = _load(args)
-    store = _open_store(cfg)
+    store = _open_store(cfg, observation=True)
     try:
         data = _status_payload(cfg, store)
     finally:
-        store.close()
+        if store is not None:
+            store.close()
     if args.json:
         print(_json(data))
         return 0
@@ -165,7 +177,10 @@ def cmd_status(args) -> int:
 
 def cmd_queue(args) -> int:
     cfg, secrets, presets = _load(args)
-    store = _open_store(cfg)
+    store = _open_store(cfg, observation=True)
+    if store is None:
+        print("[]" if args.json else "queue empty (no state database)")
+        return 0
     try:
         jobs = store.list_jobs(include_done=True)
         if args.state:
@@ -214,7 +229,10 @@ def _plan_text(plan: Mapping) -> str:
 
 def cmd_plan(args) -> int:
     cfg, secrets, presets = _load(args)
-    store = _open_store(cfg)
+    store = _open_store(cfg, observation=True)
+    if store is None:
+        print("no state database; start mediaflow once before plan", file=sys.stderr)
+        return 0
     try:
         engine = _make_engine(cfg, secrets, presets, store)
         path = Path(args.path)
@@ -287,7 +305,15 @@ def _mutate(args, command: str, payload: Mapping) -> int:
 
 def cmd_review(args) -> int:
     cfg, secrets, presets = _load(args)
-    store = _open_store(cfg)
+    observation = args.review_command == "list"
+    store = _open_store(cfg, observation=observation)
+    if store is None:
+        if observation and getattr(args, "json", False):
+            print("[]")
+        else:
+            print("no reviews (no state database)" if observation
+                  else "no state database", file=sys.stderr)
+        return 0
     try:
         if args.review_command == "list":
             reviews = store.list_jobs(("REVIEW",))
@@ -395,8 +421,21 @@ def cmd_run(args) -> int:
 
 def cmd_doctor(args) -> int:
     cfg, secrets, presets = _load(args)
-    report = run_doctor(cfg, config_path=_config_path(args),
-                        presets_dir=_presets_dir(_config_path(args)), secrets=secrets)
+    run_capabilities = bool(getattr(args, "capabilities", False))
+    backends = tuple(
+        part.strip() for part in str(getattr(args, "backends", "qsv,vaapi")).split(",")
+        if part.strip()
+    )
+    if run_capabilities and any(backend == "software" for backend in backends):
+        print("error: software capability probing is not supported; use qsv,vaapi",
+              file=sys.stderr)
+        return 2
+    report = run_doctor(
+        cfg, config_path=_config_path(args),
+        presets_dir=_presets_dir(_config_path(args)), secrets=secrets,
+        run_capabilities=run_capabilities,
+        capability_backends=backends if run_capabilities else None,
+    )
     if args.json:
         print(_json(report.as_dict()))
     else:
@@ -437,7 +476,10 @@ def cmd_calibrate(args) -> int:
 
 def cmd_estimate(args) -> int:
     cfg, secrets, presets = _load(args)
-    store = _open_store(cfg)
+    store = _open_store(cfg, observation=True)
+    if store is None:
+        print("no state database; start mediaflow once before estimate", file=sys.stderr)
+        return 0
     try:
         engine = _make_engine(cfg, secrets, presets, store)
         info = engine.estimate_path(Path(args.path), preset_id=args.preset)
@@ -458,7 +500,10 @@ def cmd_estimate(args) -> int:
 def cmd_library(args) -> int:
     cfg, secrets, presets = _load(args)
     from .library import format_report, library_report
-    store = _open_store(cfg)
+    store = _open_store(cfg, observation=True)
+    if store is None:
+        print("no state database; nothing to report", file=sys.stderr)
+        return 0
     try:
         report = library_report(cfg.movies, store, ffprobe=cfg.ffprobe)
         if args.json:
@@ -525,7 +570,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("restore", parents=[common]); s.add_argument("id"); s.set_defaults(func=lambda a: cmd_mutate_simple(a, "restore"))
     s = sub.add_parser("calibrate", parents=[common]); s.add_argument("file"); s.add_argument("--seconds", type=int, default=90); s.add_argument("--preset"); s.set_defaults(func=cmd_calibrate)
     s = sub.add_parser("estimate", parents=[common]); s.add_argument("path"); s.add_argument("--preset"); s.set_defaults(func=cmd_estimate)
-    s = sub.add_parser("doctor", parents=[common]); s.set_defaults(func=cmd_doctor)
+    s = sub.add_parser("doctor", parents=[common])
+    s.add_argument("--capabilities", action="store_true",
+                   help="run explicitly approved hardware-only capability probes")
+    s.add_argument("--backends", default="qsv,vaapi",
+                   help="comma-separated hardware backends for --capabilities")
+    s.set_defaults(func=cmd_doctor)
     s = sub.add_parser("maintenance", parents=[common]); s.set_defaults(func=cmd_maintenance)
 
     review = sub.add_parser("review", parents=[common])

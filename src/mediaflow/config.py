@@ -310,7 +310,7 @@ class Config:
 
         return list(self.path_map().values())
 
-    def ensure_directories(self) -> list[Path]:
+    def ensure_directories(self, *, normalize_existing: bool = True) -> list[Path]:
         """Create the pipeline/state/runtime directories with mode 02775.
 
         The experimental preset folder is intentionally not part of this list:
@@ -352,10 +352,12 @@ class Config:
             if directory in seen:
                 continue
             seen.add(directory)
+            existed = directory.exists()
             directory.mkdir(parents=True, exist_ok=True)
             if directory.is_symlink():
                 raise ConfigError(f"managed directory must not be a symlink: {directory}")
-            os.chmod(directory, 0o2775)
+            if normalize_existing or not existed:
+                os.chmod(directory, 0o2775)
             touched.append(directory)
         return touched
 

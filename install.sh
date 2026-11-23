@@ -14,6 +14,7 @@ STATE_DIR="${MEDIAFLOW_INSTALL_STATE_DIR:-/var/lib/mediaflow}"
 SYSTEMD_DIR="${MEDIAFLOW_INSTALL_SYSTEMD_DIR:-/etc/systemd/system}"
 DOC_DIR="${MEDIAFLOW_INSTALL_DOC_DIR:-/usr/share/doc/mediaflow}"
 TEST_MODE="${MEDIAFLOW_INSTALL_TEST:-0}"
+HOST_ONLY="${MEDIAFLOW_INSTALL_HOST_ONLY:-0}"
 VENV="$PREFIX/venv"
 
 if [[ "$ROOT" == "/srv/media" || "$ROOT" == /srv/media/* ]] && [[ "$TEST_MODE" == "1" ]]; then
@@ -89,16 +90,20 @@ install_dir 0750 root mediaflow "$CONFIG_DIR/experimental"
 install_dir 2775 mediaflow media "$STATE_DIR"
 install_dir 2775 mediaflow media "$STATE_DIR/backup"
 install_dir 2775 mediaflow media "$STATE_DIR/logs"
-install_dir 2775 mediaflow media "$ROOT"
-install_dir 2775 mediaflow media "$ROOT/movies"
-install_dir 2775 mediaflow media "$ROOT/_pipeline"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/inbox"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/convert"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/convert/movies"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/work"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/review"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/failed"
-install_dir 2775 mediaflow media "$ROOT/_pipeline/trash"
+if [[ "$HOST_ONLY" != "1" ]]; then
+  install_dir 2775 mediaflow media "$ROOT"
+  install_dir 2775 mediaflow media "$ROOT/movies"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/inbox"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/convert"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/convert/movies"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/work"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/review"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/failed"
+  install_dir 2775 mediaflow media "$ROOT/_pipeline/trash"
+else
+  echo "host-only: no media roots or pipeline directories created"
+fi
 # Deliberately do NOT create the experimental preset folder.
 
 # --- code and venv ----------------------------------------------------------
@@ -145,10 +150,13 @@ if [[ -f "$REPO_DIR/presets/experimental/1080p-best-x265-mp4.toml" && \
     "$CONFIG_DIR/experimental/1080p-best-x265-mp4.toml"
 fi
 
-# Create one convert folder per enabled shipped preset.
-for preset_dir in keep-remux-mp4 keep-remux-mkv 1080p-balanced-mp4 1080p-small-mp4 720p-small-mp4; do
-  install_dir 2775 mediaflow media "$ROOT/_pipeline/convert/movies/$preset_dir"
-done
+# Create one convert folder per enabled shipped preset, only in the separately
+# approved media-initialization phase.
+if [[ "$HOST_ONLY" != "1" ]]; then
+  for preset_dir in keep-remux-mp4 keep-remux-mkv 1080p-balanced-mp4 1080p-small-mp4 720p-small-mp4; do
+    install_dir 2775 mediaflow media "$ROOT/_pipeline/convert/movies/$preset_dir"
+  done
+fi
 
 # --- systemd ----------------------------------------------------------------
 install_dir 0755 root root "$SYSTEMD_DIR"
@@ -157,16 +165,31 @@ install_file 0644 root root "$REPO_DIR/systemd/mediaflow-trash.service" "$SYSTEM
 install_file 0644 root root "$REPO_DIR/systemd/mediaflow-trash.timer" "$SYSTEMD_DIR/mediaflow-trash.timer"
 install_file 0644 root root "$REPO_DIR/systemd/mediaflow-doctor.service" "$SYSTEMD_DIR/mediaflow-doctor.service"
 install_file 0644 root root "$REPO_DIR/systemd/mediaflow-doctor.timer" "$SYSTEMD_DIR/mediaflow-doctor.timer"
-run_priv systemctl daemon-reload
-run_priv systemctl enable mediaflow.service
+if [[ "$HOST_ONLY" == "1" ]]; then
+  echo "host-only: service left stopped and disabled; timers untouched"
+else
+  run_priv systemctl daemon-reload
+  run_priv systemctl enable mediaflow.service
+fi
 
-cat <<EOF
+if [[ "$HOST_ONLY" == "1" ]]; then
+  cat <<EOF
 
-Installed. Next steps (see /usr/share/doc/mediaflow/RUNBOOK.md):
-  1. systemctl start mediaflow.service
+Host-only installation complete. No media paths were created and no service
+state was changed. Next approved steps (docs/DEPLOYMENT_SAFETY_HANDOFF.md):
+  1. Verify host files and leave the daemon stopped/disabled.
+  2. Run non-encoding diagnostics only.
+  3. Obtain separate approval before media initialization or access changes.
+EOF
+else
+  cat <<EOF
+
+Installed. Next steps (see /usr/share/doc/mediaflow/DEPLOYMENT.md):
+  1. sudo systemctl start mediaflow.service
   2. sudo -u mediaflow -g media $VENV/bin/mediaflow --config $CONFIG_DIR/config.toml doctor
   3. Put test folders in $ROOT/_pipeline/convert/movies/<preset>/ and inspect:
        $VENV/bin/mediaflow --config $CONFIG_DIR/config.toml plan <path>
-  4. Leave dry_run=true until doctor is green and docs/QUESTIONS.md is clear.
-  5. Enable mediaflow-trash.timer only after reviewing retention.
+  4. Leave dry_run=true until required registry items are verified.
+  5. Enable timers only after separate approval.
 EOF
+fi

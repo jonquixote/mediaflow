@@ -132,19 +132,30 @@ class Store:
     can read while the daemon writes.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), timeout=5.0, check_same_thread=False)
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(self.path), timeout=5.0, check_same_thread=False)
+        else:
+            # Observational commands must never create or migrate a database.
+            if not self.path.is_file():
+                raise DatabaseError(f"state.db not found: {self.path}")
+            self._conn = sqlite3.connect(
+                f"file:{self.path}?mode=ro&immutable=1", uri=True,
+                timeout=5.0, check_same_thread=False,
+            )
         self._conn.row_factory = sqlite3.Row
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=FULL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-        except sqlite3.DatabaseError as exc:
-            self._conn.close()
-            raise DatabaseError(f"cannot open state.db: {exc}") from exc
+        if not self.read_only:
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                self._conn.execute("PRAGMA synchronous=FULL")
+                self._conn.execute("PRAGMA busy_timeout=5000")
+                self._conn.execute("PRAGMA foreign_keys=ON")
+            except sqlite3.DatabaseError as exc:
+                self._conn.close()
+                raise DatabaseError(f"cannot open state.db: {exc}") from exc
         self._lock = __import__("threading").RLock()
         self._closed = False
 
@@ -155,9 +166,11 @@ class Store:
         A newer database is refused before any table is touched.  Older
         databases are backed up first, then migrated in one transaction; the
         version stamp is committed only after every step succeeds.  Re-running
-        initialize is idempotent.
+        initialize is idempotent.  A read-only store refuses initialization.
         """
 
+        if self.read_only:
+            raise DatabaseError("cannot initialize a read-only store")
         with self._lock:
             c = self._conn
             c.execute(

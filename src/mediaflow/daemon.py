@@ -312,7 +312,10 @@ class Daemon:
                 # the retest.  Capability probes still own their own timeouts,
                 # AC/thermal monitor and exclusive slot.
                 results = run_capability_tests(
-                    self.config, cancel_event=self._stop
+                    self.config,
+                    backends=("qsv", "vaapi"),
+                    allow_software=False,
+                    cancel_event=self._stop,
                 )
                 capability_status = str(results.get("status") or "ok")
                 if capability_status not in {"ok", "completed"}:
