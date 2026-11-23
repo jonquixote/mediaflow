@@ -690,22 +690,22 @@ def _unchecked_questions() -> list[str]:
 
 
 def _read_state_settings(db_path: Path) -> dict[str, str]:
-    """Read persisted holds without opening or creating a writable DB."""
+    """Read persisted holds through the same validated WAL-aware read path."""
+
+    from .db import DatabaseError, Store
 
     path = Path(db_path)
-    if not path.is_file():
+    if not path.exists():
         return {}
+    store = Store(path, read_only=True)
+    store.check_schema()
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return {}
-    try:
-        rows = conn.execute("SELECT key,value FROM settings").fetchall()
+        rows = store._conn.execute("SELECT key,value FROM settings").fetchall()
         return {str(key): str(value) for key, value in rows}
-    except sqlite3.Error:
-        return {}
+    except sqlite3.Error as exc:
+        raise DatabaseError(f"cannot read persisted holds: {exc}") from exc
     finally:
-        conn.close()
+        store.close()
 
 
 def _config_has_secrets(path: Path | None) -> bool:
@@ -750,29 +750,49 @@ def apply_backend_acceptance(report: DoctorReport, policy: str, *,
 
     if policy not in {"none", "qsv-required", "vaapi-required", "either"}:
         raise ValueError(f"unknown backend acceptance policy: {policy!r}")
-    enabled = enabled_backends or frozenset({"qsv", "vaapi"})
+    # An empty enabled set means no backend is enabled, not "both".
+    enabled = frozenset(enabled_backends or ())
     checks = [replace(check, meta=dict(check.meta)) for check in report.checks]
     backend_checks = {c.name: c for c in checks
                       if c.name in {"encode-qsv", "encode-vaapi"}}
-    passing = {name.removeprefix("encode-") for name, check in backend_checks.items()
-               if check.status == "ok"}
-    for name, check in backend_checks.items():
-        backend = name.removeprefix("encode-")
-        if backend not in enabled:
-            check.check_class = "informational"
-            continue
-        if policy == "none":
-            check.check_class = "informational"
-        elif policy == "qsv-required":
-            check.check_class = "feature-conditional" if backend == "qsv" else "informational"
-        elif policy == "vaapi-required":
-            check.check_class = "feature-conditional" if backend == "vaapi" else "informational"
-        elif policy == "either":
-            # One working backend is sufficient; a failing optional backend is
-            # informational. If none work, both failures are feature failures.
-            check.check_class = (
-                "informational" if passing else "feature-conditional"
-            )
+    for check in backend_checks.values():
+        check.check_class = "informational"
+
+    if policy == "none" or not enabled:
+        status, cls, detail = "ok", "informational", "no backend acceptance policy"
+    else:
+        required = {
+            "qsv-required": {"qsv"},
+            "vaapi-required": {"vaapi"},
+            "either": {"qsv", "vaapi"},
+        }[policy] & enabled
+        observed = {
+            name.removeprefix("encode-"): check.status
+            for name, check in backend_checks.items()
+            if name.removeprefix("encode-") in required
+        }
+        states = [observed.get(backend, "missing") for backend in sorted(required)]
+        if not required:
+            status, cls, detail = "ok", "informational", "no eligible backend"
+        elif all(state == "ok" for state in states):
+            status, cls, detail = "ok", "informational", "required backend passed"
+        elif any(state == "ok" for state in states) and policy == "either" \
+                and "missing" not in states:
+            status, cls, detail = "ok", "informational", "one eligible backend passed"
+        elif any(state != "ok" for state in states) and all(
+            state in {"ok", "fail"} for state in states
+        ) and policy == "either":
+            status, cls, detail = "fail", "feature-conditional", "no eligible backend passed"
+        elif all(state == "fail" for state in states):
+            status, cls, detail = "fail", "feature-conditional", "required backend failed"
+        else:
+            # Unknown, missing or a mix of failure and unknown is not proof of
+            # unsupported hardware; it is an unmet acceptance requirement.
+            status, cls, detail = "warn", "required", "backend acceptance unknown"
+    checks.append(Check(
+        "backend-acceptance", status, detail,
+        {"policy": policy, "enabled": sorted(enabled)}, check_class=cls,
+    ))
     return DoctorReport(checks)
 
 

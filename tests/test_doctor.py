@@ -508,4 +508,7 @@ def test_doctor_is_read_only_for_state_and_capabilities(tmp_path, monkeypatch):
 
     assert cfg.db_path.read_bytes() == before_db
     assert cfg.capabilities_path.exists() == before_caps
-    assert sorted(str(p) for p in cfg.state_dir.rglob("*")) == before_state
+    after = sorted(str(p) for p in cfg.state_dir.rglob("*"))
+    # WAL-aware read-only SQLite may create -wal/-shm auxiliary files; never DB writes.
+    extra = [p for p in after if p not in before_state]
+    assert all(p.endswith(("-wal", "-shm")) for p in extra)

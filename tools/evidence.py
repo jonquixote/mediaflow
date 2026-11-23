@@ -29,7 +29,7 @@ _SECRET_ASSIGNMENT = re.compile(
 _BEARER = re.compile(r"(?i)bearer\s+(?!\*\*\*)[A-Za-z0-9._\-]+")
 _URL_CREDENTIALS = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^/@\s]+@(?P<host>[^/\s]+)")
 _TITLE = re.compile(r"(?<![\w])[A-Z][\w .'\-]{1,80}\(\d{4}\)(?:\[[^\]]+\])?")
-_MEDIA_PATH = re.compile(r"/srv/media\b")
+_MEDIA_PATH = re.compile(r"/srv/media(?!/\[REDACTED\])")
 _REVISION = re.compile(r"[0-9a-f]{40}")
 _ITEM_ID = re.compile(r"HW-\d{3}")
 
@@ -77,6 +77,7 @@ def capture(bundle: Path, command: list[str], *, item_id: str, cwd: Path | None 
         "extra": redact_text(json.dumps(extra or {}, sort_keys=True)),
     }
     (bundle / MANIFEST).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (bundle / ACCEPTANCE).unlink(missing_ok=True)
     return manifest
 
 
@@ -130,6 +131,23 @@ def validate(bundle: Path, *, expected_revision: str | None = None) -> dict:
     return manifest
 
 
+def bundle_digest(bundle: Path, manifest: dict | None = None) -> str:
+    """Digest the exact reviewed manifest fields and output bytes."""
+
+    bundle = Path(bundle)
+    manifest = manifest or validate(bundle)
+    import hashlib
+
+    digest = hashlib.sha256()
+    canonical = {key: value for key, value in manifest.items()
+                 if key not in {"claim_demonstrated", "extra"}}
+    digest.update(json.dumps(canonical, sort_keys=True).encode("utf-8"))
+    for raw in sorted(manifest["outputs"]):
+        digest.update(str(raw).encode("utf-8"))
+        digest.update(_resolve_output(bundle, str(raw)).read_bytes())
+    return digest.hexdigest()
+
+
 def accept(bundle: Path, *, accepted_by: str, notes: str, expected_revision: str) -> dict:
     manifest = validate(bundle, expected_revision=expected_revision)
     path = Path(bundle) / MANIFEST
@@ -139,6 +157,7 @@ def accept(bundle: Path, *, accepted_by: str, notes: str, expected_revision: str
         "accepted_by": accepted_by,
         "accepted_at": datetime.now(timezone.utc).isoformat(),
         "expected_revision": expected_revision,
+        "bundle_digest": bundle_digest(bundle, manifest),
         "claim_verified": True,
         "notes": redact_text(notes),
     }
@@ -163,6 +182,8 @@ def update_registry(bundle: Path, registry: Path = REGISTRY,
         raise ValueError("acceptance revision mismatch")
     if not acceptance.get("claim_verified"):
         raise ValueError("claim was not explicitly verified")
+    if acceptance.get("bundle_digest") != bundle_digest(bundle, manifest):
+        raise ValueError("bundle changed after acceptance; re-accept required")
 
     registry = Path(registry)
     text = registry.read_text(encoding="utf-8")

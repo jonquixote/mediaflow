@@ -41,6 +41,11 @@ def _install_env(tmp_path: Path, *, host_only: bool) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
+        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
+        "MEDIAFLOW_INSTALL_EXPECTED_SHA": subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip(),
         "MEDIAFLOW_INSTALL_HOST_ONLY": "1" if host_only else "0",
         "MEDIAFLOW_INSTALL_PREFIX": str(tmp_path / "opt" / "mediaflow"),
         "MEDIAFLOW_INSTALL_CONFIG_DIR": str(tmp_path / "etc" / "mediaflow"),
@@ -64,7 +69,7 @@ def test_host_only_install_does_not_touch_media_or_service_state(tmp_path):
     proc = _install(tmp_path, host_only=True)
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert not (tmp_path / "media").exists()
-    assert "no media roots" in proc.stdout
+    assert "host-only" in proc.stdout.lower()
     assert "service left stopped and disabled" in proc.stdout
     assert "systemctl enable" not in proc.stdout
     assert (tmp_path / "etc" / "mediaflow" / "config.toml").is_file()

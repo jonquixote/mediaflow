@@ -26,6 +26,11 @@ def _install_env(tmp_path: Path) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
+        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
+        "MEDIAFLOW_INSTALL_EXPECTED_SHA": subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip(),
         "MEDIAFLOW_INSTALL_PREFIX": str(tmp_path / "opt" / "mediaflow"),
         "MEDIAFLOW_INSTALL_CONFIG_DIR": str(tmp_path / "etc" / "mediaflow"),
         "MEDIAFLOW_INSTALL_ROOT": str(tmp_path / "media"),
@@ -55,18 +60,22 @@ def test_installer_rehearsal_fresh_and_repeat(tmp_path):
 
     config.write_text("dry_run = false  # locally edited\n", encoding="utf-8")
     second = _install(tmp_path)
-    assert second.returncode == 0, second.stderr + second.stdout
+    assert second.returncode == 3
+    assert "conflict" in (second.stderr + second.stdout).lower()
     assert config.read_text() == "dry_run = false  # locally edited\n"
 
 
 def test_installer_rehearsal_preserves_state_and_secrets(tmp_path):
-    _install(tmp_path)
     state = tmp_path / "var" / "lib" / "mediaflow"
+    state.mkdir(parents=True)
     (state / "state.db").write_bytes(b"existing state")
-    secrets = tmp_path / "etc" / "mediaflow" / "tmdb.env"
+    config = tmp_path / "etc" / "mediaflow"
+    config.mkdir(parents=True)
+    secrets = config / "tmdb.env"
     secrets.write_text("TMDB_READ_TOKEN=keep-me\n", encoding="utf-8")
 
-    assert _install(tmp_path).returncode == 0
+    # Existing config/secrets are conflicts; the installer must refuse before writes.
+    assert _install(tmp_path).returncode == 3
     assert (state / "state.db").read_bytes() == b"existing state"
     assert secrets.read_text() == "TMDB_READ_TOKEN=keep-me\n"
 

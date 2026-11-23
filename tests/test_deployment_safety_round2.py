@@ -52,6 +52,11 @@ def _install_env(tmp_path: Path, repo: Path | None = None) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
+        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
+        "MEDIAFLOW_INSTALL_EXPECTED_SHA": subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip(),
         "MEDIAFLOW_INSTALL_HOST_ONLY": "1",
         "MEDIAFLOW_INSTALL_REPO_DIR": str(repo or ROOT),
         "MEDIAFLOW_INSTALL_PREFIX": str(tmp_path / "opt" / "mediaflow"),
@@ -92,6 +97,12 @@ def test_installer_refuses_dirty_checkout_before_writes(tmp_path):
 
     env = _install_env(tmp_path, repo)
     env["MEDIAFLOW_INSTALL_ALLOW_DIRTY"] = "0"
+    env["MEDIAFLOW_INSTALL_FORCE_DIRTY_CHECK"] = "1"
+    env["MEDIAFLOW_INSTALL_ALLOW_REPO_OVERRIDE"] = "1"
+    env["MEDIAFLOW_INSTALL_EXPECTED_SHA"] = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
     proc = subprocess.run(["bash", str(ROOT / "install.sh")], capture_output=True,
                           text=True, env=env, timeout=60)
     assert proc.returncode == 3
@@ -130,14 +141,13 @@ def test_installer_writes_artifact_manifest_and_rollback_is_scoped(tmp_path):
     manifest = tmp_path / "var" / "lib" / "mediaflow" / "install-manifest.json"
     assert manifest.is_file()
     data = json.loads(manifest.read_text())
-    assert {"created", "replaced", "preserved", "principals"}.issubset(data)
+    assert {"created_files", "replaced", "preserved", "principals"}.issubset(data)
 
     preexisting = tmp_path / "etc" / "mediaflow" / "config.toml"
     preexisting.write_text("keep\n")
-    # A second install records a replacement and preserves the original bytes
-    # in the manifest, without deleting shared directories.
+    # Create-only model: a second install refuses the conflict and preserves bytes.
     proc = _install(tmp_path)
-    assert proc.returncode == 0
+    assert proc.returncode == 3
     assert preexisting.read_text() == "keep\n"
 
 
@@ -157,13 +167,18 @@ def test_acceptance_policies_and_disabled_backend(tmp_path):
         Check("encode-qsv", "fail", "qsv failed", check_class="feature-conditional"),
         Check("encode-vaapi", "ok", "vaapi ok", check_class="feature-conditional"),
     ])
-    qsv = apply_backend_acceptance(DoctorReport(list(report.checks)), "qsv-required")
+    enabled = frozenset({"qsv", "vaapi"})
+    qsv = apply_backend_acceptance(DoctorReport(list(report.checks)), "qsv-required",
+                                   enabled_backends=enabled)
     assert qsv.exit_code == 3
-    either = apply_backend_acceptance(DoctorReport(list(report.checks)), "either")
+    either = apply_backend_acceptance(DoctorReport(list(report.checks)), "either",
+                                      enabled_backends=enabled)
     assert either.exit_code == 0
-    vaapi = apply_backend_acceptance(DoctorReport(list(report.checks)), "vaapi-required")
+    vaapi = apply_backend_acceptance(DoctorReport(list(report.checks)), "vaapi-required",
+                                     enabled_backends=enabled)
     assert vaapi.exit_code == 0
-    none = apply_backend_acceptance(DoctorReport(list(report.checks)), "none")
+    none = apply_backend_acceptance(DoctorReport(list(report.checks)), "none",
+                                    enabled_backends=enabled)
     assert none.exit_code == 0
 
 

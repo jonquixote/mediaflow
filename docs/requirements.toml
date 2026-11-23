@@ -206,6 +206,14 @@ text = "Installation must refuse a dirty checkout, active/enabled service state 
 test = "tests/test_deployment_safety_round2.py"
 
 [[requirements]]
+id = "DEPLOY-6"
+title = "Fail-closed create-only installation"
+safety = true
+section = "17"
+text = "Host installation must enforce an approved full revision and script provenance, parse exact passive service/timer states, refuse conflicting destinations before writes, and preserve existing evidence and shared state. Rollback removes only artifacts the installer created and never restores or deletes existing originals. Doctor backend acceptance is aggregate, observational cache writes are disabled, and evidence acceptance is bound to exact reviewed bundle bytes."
+test = "tests/test_deployment_safety_round3.py"
+
+[[requirements]]
 id = "SCHED-1"
 title = "Schedule window is a start gate"
 safety = true

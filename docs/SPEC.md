@@ -226,6 +226,7 @@ entry. Reject unknown keys/ids and out-of-range values.
 - **DEPLOY-1** every unverified claim has one registry item; only recorded on-box evidence can verify it.
 - **DEPLOY-4** host-only install and runtime startup do not touch library metadata; observational commands do not create state; no software/x265 probing in the initial workflow or automatic retests.
 - **DEPLOY-5** fail-closed installer preflight, explicit doctor acceptance, truthful state errors and separated evidence acceptance before registry mutation.
+- **DEPLOY-6** create-only host installation with exact revision/service checks, conflict refusal, bounded rollback, aggregate doctor acceptance and content-bound evidence acceptance.
 - **DEPLOY-2** doctor is a read-only preflight with pass/fail/unknown outcomes and class-aware exit codes.
 - **DEPLOY-3** installer/upgrade rehearsal and redacted evidence bundles are tested; no on-box item is marked verified by the agent.
 - **STATE-1** one shared job-state vocabulary; RESTORED is terminal history and does not block a re-drop.

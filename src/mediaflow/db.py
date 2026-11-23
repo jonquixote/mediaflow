@@ -145,10 +145,18 @@ class Store:
             # mode=ro is WAL/locking aware: it sees uncheckpointed commits and
             # honours SQLite locking. It may create a -shm auxiliary file; this
             # is documented rather than hidden behind immutable=1.
-            self._conn = sqlite3.connect(
-                f"file:{self.path}?mode=ro", uri=True,
-                timeout=5.0, check_same_thread=False,
-            )
+            try:
+                self._conn = sqlite3.connect(
+                    f"file:{self.path}?mode=ro", uri=True,
+                    timeout=5.0, check_same_thread=False,
+                )
+            except sqlite3.DatabaseError as exc:
+                raise DatabaseError(f"cannot open state.db read-only: {exc}") from exc
+            try:
+                self.integrity_check()
+            except sqlite3.DatabaseError as exc:
+                self._conn.close()
+                raise DatabaseError(f"cannot open state.db read-only: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
         if not self.read_only:
             try:

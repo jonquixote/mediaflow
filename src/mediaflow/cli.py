@@ -517,7 +517,10 @@ def cmd_library(args) -> int:
         print("no state database; initialize mediaflow before library report", file=sys.stderr)
         return 3
     try:
-        report = library_report(cfg.movies, store, ffprobe=cfg.ffprobe)
+        report = library_report(
+            cfg.movies, store, ffprobe=cfg.ffprobe,
+            cache=not getattr(store, "read_only", False),
+        )
         if args.json:
             print(_json(report))
         else:
