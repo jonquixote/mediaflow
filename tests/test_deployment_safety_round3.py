@@ -319,6 +319,8 @@ def test_media_init_documented_command_and_symlink_ancestors(tmp_path):
     (root / "_pipeline").symlink_to(outside, target_is_directory=True)
     env = dict(os.environ)
     env["MEDIAFLOW_MEDIA_INIT_APPROVED"] = "1"
+    env["MEDIAFLOW_MEDIA_INIT_UID"] = "1001"
+    env["MEDIAFLOW_MEDIA_INIT_GID"] = "1001"
     proc = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "media_init.py"),
          "--root", str(root), "--apply"],
@@ -333,6 +335,8 @@ def test_media_init_sets_expected_mode_on_new_paths(tmp_path):
     root.mkdir()
     env = dict(os.environ)
     env["MEDIAFLOW_MEDIA_INIT_APPROVED"] = "1"
+    env["MEDIAFLOW_MEDIA_INIT_UID"] = "1001"
+    env["MEDIAFLOW_MEDIA_INIT_GID"] = "1001"
     proc = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "media_init.py"),
          "--root", str(root), "--apply"],

@@ -310,6 +310,8 @@ def test_media_init_creates_only_approved_paths_and_preserves_modes(tmp_path):
 
     env = dict(os.environ)
     env["MEDIAFLOW_MEDIA_INIT_APPROVED"] = "1"
+    env["MEDIAFLOW_MEDIA_INIT_UID"] = "1001"
+    env["MEDIAFLOW_MEDIA_INIT_GID"] = "1001"
     proc = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "media_init.py"),
          "--root", str(root), "--apply"],

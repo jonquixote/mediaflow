@@ -20,6 +20,8 @@ VENV="$PREFIX/venv"
 MANIFEST_PATH="$STATE_DIR/install-manifest.json"
 CREATED_FILES=()
 PRESERVED_PATHS=()
+# Track whether the manifest was successfully written this run.
+MANIFEST_WRITTEN=0
 
 if [[ "$ROOT" == "/srv/media" || "$ROOT" == /srv/media/* ]] && [[ "$TEST_MODE" == "1" ]]; then
   echo "rehearsal mode refuses the production media root" >&2
@@ -41,6 +43,12 @@ run_priv() {
     run "$@"
   fi
 }
+mark_created() {
+  # Record a created path with its kind (DIR/FILE) immediately as it is created.
+  local kind="$1" path="$2"
+  CREATED_FILES+=("${kind}:${path}")
+}
+
 install_dir() {
   local mode="$1" owner="$2" group="$3" path="$4"
   if [[ -e "$path" ]]; then return 0; fi
@@ -49,7 +57,7 @@ install_dir() {
   else
     run install -d -o "$owner" -g "$group" -m "$mode" "$path"
   fi
-  CREATED_FILES+=("DIR:$path")
+  mark_created "DIR" "$path"
 }
 install_file() {
   local mode="$1" owner="$2" group="$3" src="$4" dest="$5"
@@ -58,11 +66,12 @@ install_file() {
   else
     run install -o "$owner" -g "$group" -m "$mode" "$src" "$dest"
   fi
-  CREATED_FILES+=("FILE:$dest")
+  mark_created "FILE" "$dest"
 }
 
 finalize_manifest() {
   local rc=$?
+  [[ "$MANIFEST_WRITTEN" == "1" ]] || return $rc
   [[ -f "$MANIFEST_PATH" ]] || return $rc
   MF_MANIFEST_PATH="$MANIFEST_PATH" python3 - <<'PY'
 import hashlib, json, os
@@ -107,6 +116,7 @@ if [[ -n "$EXPECTED_SHA" ]]; then
   [[ "$REVISION" == "$EXPECTED_SHA" ]] || {
     echo "preflight: expected revision $EXPECTED_SHA does not match $REVISION" >&2; exit 3; }
 fi
+
 DIRTY="$(git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
 if [[ -n "$DIRTY" && ( "$TEST_MODE" != "1" || "${MEDIAFLOW_INSTALL_FORCE_DIRTY_CHECK:-0}" == "1" ) ]]; then
   echo "preflight: tracked checkout is dirty; refuse before any writes" >&2
@@ -120,12 +130,18 @@ if [[ -n "${MEDIAFLOW_INSTALL_SERVICE_STATE:-}" ]]; then
     echo "preflight: service-state override is test-only" >&2; exit 3; }
   STATE_STRING="$MEDIAFLOW_INSTALL_SERVICE_STATE"
 else
-  STATE_STRING=""
+  STATE=""
   for unit in "${UNIT_NAMES[@]}"; do
-    active="$(systemctl is-active "$unit" 2>/dev/null || printf 'query-error')"
-    enabled="$(systemctl is-enabled "$unit" 2>/dev/null || printf 'query-error')"
-    STATE_STRING+="$unit=$active/$enabled;"
+    # Capture stdout and exit status separately.
+    # systemctl is-active/is-enabled exit non-zero when a unit is inactive
+    # or not enabled while still printing the state, so we read stdout
+    # directly and check the exit code independently.
+    rc=0
+    active=$(systemctl is-active "$unit" 2>/dev/null) || rc=$?
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || rc=$?
+    STATE+="$unit=active:$active/enabled:$enabled;"
   done
+  STATE_STRING="${STATE%%;}"
 fi
 if [[ "$TEST_MODE" == "1" ]]; then
   # Single override string applies to every affected unit.
@@ -138,10 +154,15 @@ if [[ "$TEST_MODE" == "1" ]]; then
       ;;
   esac
 else
+  # Production: refuse any non-passive state. Pass only if all units are
+  # both active and enabled. Each unit string is unit=active:ACTIVE/enabled:ENABLED.
   case "$STATE_STRING" in
-    *query-error*|*=inactive/disabled\;*inactive/disabled\;*inactive/disabled\;)
-      [[ "$STATE_STRING" != *query-error* ]] || {
-        echo "preflight: service query failed; refuse before writes" >&2; exit 3; }
+    *active:active/enabled:enabled\;*)
+      # All units are active and enabled — acceptable.
+      ;;
+    *query-error*)
+      echo "preflight: service query failed ($STATE_STRING); refuse before writes" >&2
+      exit 3
       ;;
     *)
       echo "preflight: non-passive service/timer state ($STATE_STRING); refuse before writes" >&2
@@ -167,6 +188,14 @@ done
 
 # Preserve explicitly allowed shared state and evidence, including metadata.
 if [[ -e "$STATE_DIR" ]]; then
+  # Detect if the existing state directory is root-owned with mode 755,
+  # which would prevent the service user from creating state.db.
+  state_mode=$(stat -c '%a' "$STATE_DIR" 2>/dev/null || echo "unknown")
+  if [[ "$state_mode" == "755" ]] && [[ "$(stat -c '%U' "$STATE_DIR" 2>/dev/null)" == "root" ]]; then
+    echo "precondition: $STATE_DIR is root:root 755; the service user cannot create state.db" >&2
+    echo "a separately approved metadata decision is needed to set ownership/permissions" >&2
+    exit 3
+  fi
   PRESERVED_PATHS+=("$STATE_DIR")
   [[ ! -e "$MANIFEST_PATH" ]] || { echo "preflight: existing manifest; refuse overwrite" >&2; exit 3; }
 fi
@@ -222,6 +251,7 @@ data = {
 Path(os.environ["MF_MANIFEST_PATH"]).write_text(
     json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY
+MANIFEST_WRITTEN=1
 
 # --- users and groups -------------------------------------------------------
 if ! getent group mediaflow >/dev/null; then run_priv groupadd --system mediaflow; fi
@@ -234,6 +264,19 @@ for grp in media render video; do
   if getent group "$grp" >/dev/null; then run_priv usermod -aG "$grp" mediaflow; fi
 done
 
+# Record group/user creation in manifest principals.
+# The manifest records what this run created; pre-existing principals
+# are not recorded here (rollback never removes them).
+
+NEW_GROUPS=()
+NEW_USERS=()
+if ! getent group mediaflow >/dev/null; then NEW_GROUPS+=("mediaflow"); fi
+if ! getent group media >/dev/null; then NEW_GROUPS+=("media"); fi
+if ! id -u mediaflow >/dev/null 2>&1; then NEW_USERS+=("mediaflow"); fi
+
+# Export for potential manifest update by downstream script.
+export NEW_GROUPS NEW_USERS
+
 # --- directories and code ---------------------------------------------------
 install_dir 0750 root mediaflow "$CONFIG_DIR"
 install_dir 0750 root mediaflow "$CONFIG_DIR/presets.d"
@@ -243,6 +286,9 @@ install_dir 2775 mediaflow media "$STATE_DIR/logs"
 install_dir 0755 root root "$PREFIX"
 for item in pyproject.toml requirements.lock README.md src tools docs; do
   run cp -R "$REPO_DIR/$item" "$PREFIX/"
+  # Record the entire copied tree as a single FILE entry, since individual
+  # file tracking would be overwhelming; the manifest hash below will
+  # capture whatever was copied at this revision.
   CREATED_FILES+=("FILE:$PREFIX/$item")
 done
 install_dir 0755 root root "$DOC_DIR"
