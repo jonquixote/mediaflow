@@ -15,7 +15,7 @@ INVARIANTS = ROOT / "docs" / "INVARIANTS.md"
 TESTS = ROOT / "tests"
 
 ID_RE = re.compile(
-    r"\b(?:SAF|SCHED|ENC|REV|MP4|MKV|SIZE|SUP|STATE|CONFIG|COMPAT)-\d+\b"
+    r"\b(?:SAF|SCHED|ENC|REV|MP4|MKV|SIZE|SUP|STATE|CONFIG|COMPAT|DEPLOY)-\d+\b"
 )
 
 
