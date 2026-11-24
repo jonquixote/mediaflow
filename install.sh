@@ -154,21 +154,16 @@ if [[ "$TEST_MODE" == "1" ]]; then
       ;;
   esac
 else
-  # Production: refuse any non-passive state. Pass only if all units are
-  # both active and enabled. Each unit string is unit=active:ACTIVE/enabled:ENABLED.
-  case "$STATE_STRING" in
-    *active:active/enabled:enabled\;*)
-      # All units are active and enabled — acceptable.
-      ;;
-    *query-error*)
-      echo "preflight: service query failed ($STATE_STRING); refuse before writes" >&2
-      exit 3
-      ;;
-    *)
-      echo "preflight: non-passive service/timer state ($STATE_STRING); refuse before writes" >&2
-      exit 3
-      ;;
-  esac
+  # Service-state gate: each unit queried independently with systemctl show.
+  # Passes if all five units are absent; refuses if any unit is loaded.
+  RESULT=$(/opt/mediaflow/venv/bin/python3 tools/service_state.py \
+     mediaflow.service mediaflow-trash.service \
+     mediaflow-trash.timer mediaflow-doctor.service mediaflow-doctor.timer \
+     || exit $?)
+  if [[ $RESULT -ne 0 ]]; then
+    exit 3
+  fi
+  STATE_STRING=""
 fi
 
 for path in "$CONFIG_DIR/config.toml" "$CONFIG_DIR/tmdb.env" "$CONFIG_DIR/notify.env" \
