@@ -78,6 +78,8 @@ def test_queue_empty_and_review_list(tmp_path, capsys, monkeypatch):
 
 
 def test_pause_and_resume_without_daemon(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("MEDIAFLOW_ROOT", raising=False)
+    monkeypatch.delenv("MEDIAFLOW_INSTALL_ROOT", raising=False)
     path = _write_config(tmp_path)
     monkeypatch.setenv("MEDIAFLOW_CONFIG", str(path))
     assert main(["pause"]) == 0
