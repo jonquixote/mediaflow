@@ -124,46 +124,23 @@ if [[ -n "$DIRTY" && ( "$TEST_MODE" != "1" || "${MEDIAFLOW_INSTALL_FORCE_DIRTY_C
   exit 3
 fi
 
-UNIT_NAMES=(mediaflow.service mediaflow-trash.timer mediaflow-doctor.timer)
+UNIT_NAMES=(mediaflow.service mediaflow-trash.service mediaflow-trash.timer mediaflow-doctor.service mediaflow-doctor.timer)
 if [[ -n "${MEDIAFLOW_INSTALL_SERVICE_STATE:-}" ]]; then
+  # Test-only seam kept for existing rehearsal tests; production never takes this branch.
   [[ "$TEST_MODE" == "1" ]] || {
     echo "preflight: service-state override is test-only" >&2; exit 3; }
-  STATE_STRING="$MEDIAFLOW_INSTALL_SERVICE_STATE"
-else
-  STATE=""
-  for unit in "${UNIT_NAMES[@]}"; do
-    # Capture stdout and exit status separately.
-    # systemctl is-active/is-enabled exit non-zero when a unit is inactive
-    # or not enabled while still printing the state, so we read stdout
-    # directly and check the exit code independently.
-    rc=0
-    active=$(systemctl is-active "$unit" 2>/dev/null) || rc=$?
-    enabled=$(systemctl is-enabled "$unit" 2>/dev/null) || rc=$?
-    STATE+="$unit=active:$active/enabled:$enabled;"
-  done
-  STATE_STRING="${STATE%%;}"
-fi
-if [[ "$TEST_MODE" == "1" ]]; then
-  # Single override string applies to every affected unit.
-  case "$STATE_STRING" in
-    "inactive disabled"|"inactive masked") ;;
+  case "$MEDIAFLOW_INSTALL_SERVICE_STATE" in
+    "inactive disabled"|"inactive masked"|"absent") ;;
     *)
-      echo "preflight: non-passive service state ($STATE_STRING); refuse before writes" >&2
+      echo "preflight: non-passive service state ($MEDIAFLOW_INSTALL_SERVICE_STATE); refuse before writes" >&2
       echo "a separately approved stop/disable/unmask transition is required first" >&2
       exit 3
       ;;
   esac
-else
-  # Service-state gate: each unit queried independently with systemctl show.
-  # Passes if all five units are absent; refuses if any unit is loaded.
-  RESULT=$(/opt/mediaflow/venv/bin/python3 tools/service_state.py \
-     mediaflow.service mediaflow-trash.service \
-     mediaflow-trash.timer mediaflow-doctor.service mediaflow-doctor.timer \
-     || exit $?)
-  if [[ $RESULT -ne 0 ]]; then
-    exit 3
-  fi
-  STATE_STRING=""
+elif ! python3 "$REPO_DIR/tools/service_state.py" "${UNIT_NAMES[@]}"; then
+  echo "preflight: service or timer state conflicts with a create-only install; refuse before writes" >&2
+  echo "a separately approved stop/disable/unmask transition is required first" >&2
+  exit 3
 fi
 
 for path in "$CONFIG_DIR/config.toml" "$CONFIG_DIR/tmdb.env" "$CONFIG_DIR/notify.env" \
