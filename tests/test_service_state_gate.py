@@ -138,9 +138,12 @@ def test_install_script_is_valid_bash_and_uses_the_helper():
 def test_installer_refuses_before_any_write_when_a_unit_is_loaded(stub, tmp_path, state):
     dirs = {name: tmp_path / name for name in
             ("prefix", "config", "state", "systemd", "doc", "media")}
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": str(tmp_path),
+    env = dict(os.environ)
+    for key in ("MEDIAFLOW_ROOT", "MEDIAFLOW_CONFIG", "MEDIAFLOW_ENV_DIR",
+                "MEDIAFLOW_PRESETS", "MEDIAFLOW_DOCS", "PYTHONPATH",
+                "MEDIAFLOW_INSTALL_SERVICE_STATE"):
+        env.pop(key, None)
+    env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_SYSTEMCTL": str(stub),
         "STUB_SCENARIO": f"mediaflow.service={state}",
@@ -151,7 +154,7 @@ def test_installer_refuses_before_any_write_when_a_unit_is_loaded(stub, tmp_path
         "MEDIAFLOW_INSTALL_SYSTEMD_DIR": str(dirs["systemd"]),
         "MEDIAFLOW_INSTALL_DOC_DIR": str(dirs["doc"]),
         "MEDIAFLOW_INSTALL_ROOT": str(dirs["media"]),
-    }
+    })
     result = subprocess.run(
         ["bash", str(INSTALL)], capture_output=True, text=True, env=env, timeout=120,
     )
