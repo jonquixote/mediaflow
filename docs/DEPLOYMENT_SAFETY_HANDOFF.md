@@ -37,10 +37,10 @@ Consequences and limitations:
 |---|---|---|
 | Revision printed but not enforced | Fixed | `install.sh` requires `MEDIAFLOW_INSTALL_EXPECTED_SHA`, rejects mismatch, and requires source/script provenance. `test_installer_enforces_expected_sha`. |
 | Dirty override available in production | Fixed | Dirty check is production-only; test seams are explicit (`ALLOW_DIRTY`, `FORCE_DIRTY_CHECK`, `ALLOW_REPO_OVERRIDE`). `test_installer_refuses_dirty_checkout_before_writes`. |
-| `inactive` matched as active | Fixed | Exact passive state parser; `inactive disabled` passes, active/enabled/unknown/missing/transitioning states refuse. `test_installer_accepts_only_exact_passive_service_states`. |
+| `inactive` matched as active | Fixed | Exact passive state parser; `inactive disabled` passes, active/enabled/unknown/missing/transitioning states refuse. `test_installer_accepts_only_exact_passive_service_states`. **Update 2026-11-25 (`44a3b60`):** that override parser was removed together with the seam; refusal semantics now come from `tools/service_state.py` (`LoadState=not-found` only), covered by `tests/test_deployment_safety_round3.py::test_installer_refuses_loaded_units_and_query_problems_at_the_real_gate` and `tests/test_service_state_gate.py`. |
 | Query failures treated as absence | Fixed | Failed queries become `query-error` and refuse. Same test. |
 | Only main service inspected | Fixed | `mediaflow.service`, `mediaflow-trash.timer`, `mediaflow-doctor.timer` all inspected. |
-| Service override available in production | Fixed | `MEDIAFLOW_INSTALL_SERVICE_STATE` is test-only. |
+| Service override available in production | Fixed | `MEDIAFLOW_INSTALL_SERVICE_STATE` is test-only. **Update 2026-11-25 (`44a3b60`):** the override no longer exists at all. `install.sh` unconditionally consults `tools/service_state.py`; an inherited `MEDIAFLOW_INSTALL_SERVICE_STATE` is ignored and cannot influence the gate. Regressions: `test_inherited_override_cannot_convert_rejecting_stub_to_success`, `test_inherited_override_cannot_mask_query_failure` (`tests/test_service_state_gate.py`). |
 | Masked unit overwritten | Fixed | Symlink to `/dev/null` is preserved and skipped. `test_installer_preserves_masked_unit_symlink`. |
 | Conflicting destination overwritten | Fixed | Create-only conflict refusal before writes. `test_installer_create_only_refuses_conflicting_destination`. |
 | Evidence/parent metadata changed | Fixed | Existing state/evidence and metadata preserved. `test_installer_preserves_evidence_and_parent_metadata`. |
@@ -97,12 +97,21 @@ git -C /srv/agent-work/mediaflow rev-parse HEAD
 
 Host-only install (write; requires explicit approval and `EXPECTED_SHA`):
 
+**Update 2026-11-25 (`27130be`/`44a3b60`):** the command below is **historical
+and no longer valid**. `install.sh` is now sandbox-only: without
+`MEDIAFLOW_INSTALL_TEST=1` it exits 3 before any host action, and in test mode
+it writes only inside a validated disposable scratch root
+(`MEDIAFLOW_INSTALL_SCRATCH_ROOT`). There is no production override. A
+separately reviewed manual procedure is proposed (unapproved) in
+`docs/MANUAL_INSTALL_DRAFT.md`; this block is retained only as round-3
+historical context.
+
 ```sh
 sudo MEDIAFLOW_INSTALL_HOST_ONLY=1 MEDIAFLOW_INSTALL_EXPECTED_SHA=<approved-full-sha> /srv/agent-work/mediaflow/install.sh
 ```
 
-Expected exit: `0` on fresh create-only install, `3` on conflict/preflight
-refusal. The daemon and timers remain stopped/disabled.
+Expected exit (historical, round 3): `0` on fresh create-only install, `3` on
+conflict/preflight refusal. The daemon and timers remain stopped/disabled.
 
 Verify service state (read):
 
