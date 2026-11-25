@@ -157,3 +157,121 @@ def test_refusal_leaves_scratch_files_unchanged(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
     assert (root / MARKER).read_bytes() == marker_before
     assert sorted(p.name for p in root.iterdir()) == [MARKER, "sentinel"]
+
+
+# --------------------------------------------------------------------------
+# gaps identified while implementing the lock: privilege reach, later
+# preflight reach, and additional escape shapes.
+# --------------------------------------------------------------------------
+
+
+def _privileged_stubs(tmp_path: Path) -> tuple[Path, Path]:
+    """Stub binaries that log any execution instead of acting."""
+    stubs = tmp_path / "privileged-stubs"
+    stubs.mkdir()
+    log = tmp_path / "privileged-stub.log"
+    for name in ("useradd", "groupadd", "usermod", "systemctl"):
+        stub = stubs / name
+        stub.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$PRIV_STUB_LOG\"\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+    return stubs, log
+
+
+def test_lock_refusal_does_not_execute_service_or_account_commands(tmp_path):
+    root = _scratch(tmp_path)
+    stubs, log = _privileged_stubs(tmp_path)
+    env = _env(root, root, test_mode=False)
+    env["PATH"] = f"{stubs}:{env['PATH']}"
+    env["PRIV_STUB_LOG"] = str(log)
+    env["MEDIAFLOW_SYSTEMCTL"] = str(stubs / "systemctl")
+    result = _run(env)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert not log.exists(), "service or account command ran during lock refusal"
+
+
+def test_lock_is_euid_independent_by_construction():
+    """Root-equivalence check without running anything as root.
+
+    Running the refusal as root on this host is not safe, so the lock's
+    privilege independence is asserted structurally: between the shell safety
+    options and the first directory resolution there is the unconditional
+    refusal and nothing else — no EUID/id branch, no EXIT-trap setup, and no
+    variable resolution.
+    """
+    text = INSTALL.read_text()
+    lock_section = text.split("set -euo pipefail", 1)[1].split("SCRIPT_DIR=", 1)[0]
+    assert '[[ "${MEDIAFLOW_INSTALL_TEST:-}" != "1" ]]' in lock_section
+    assert "exit 3" in lock_section
+    command_lines = [ln.strip() for ln in lock_section.splitlines()
+                     if ln.strip() and not ln.strip().startswith("#")]
+    assert command_lines, "lock section disappeared from install.sh"
+    for line in command_lines:
+        assert not line.startswith(("EUID", "id -u", "trap", "SCRIPT_DIR=",
+                                    "REPO_DIR=", "PREFIX=", "CONFIG_DIR=",
+                                    "ROOT=", "STATE_DIR=", "SYSTEMD_DIR=",
+                                    "DOC_DIR=")), line
+
+
+def test_valid_scratch_reaches_later_preflight(tmp_path):
+    """Valid designation + contained destinations pass the lock and the
+    containment guard, then reach the expected-revision preflight."""
+    root = _scratch(tmp_path)
+    env = _env(root, root)
+    env["MEDIAFLOW_INSTALL_EXPECTED_SHA"] = "b" * 40
+    result = _run(env)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "expected revision" in (result.stdout + result.stderr).lower()
+    assert _created(root) == []
+
+
+def test_dotdot_destination_escape_refuses_before_writes(tmp_path):
+    root = _scratch(tmp_path)
+    outside = tmp_path / "escaped"
+    env = _env(root, root)
+    env["MEDIAFLOW_INSTALL_PREFIX"] = str(root / ".." / "escaped" / "opt" / "mediaflow")
+    result = _run(env)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "scratch root" in result.stderr.lower()
+    assert not outside.exists()
+    assert _created(root) == []
+
+
+def test_symlinked_intermediate_component_refuses_before_writes(tmp_path):
+    root = _scratch(tmp_path)
+    outside = tmp_path / "outside"
+    (outside / "var" / "lib").mkdir(parents=True)
+    (root / "etc").mkdir()
+    (root / "etc" / "lib").symlink_to(outside / "var" / "lib",
+                                      target_is_directory=True)
+    env = _env(root, root, state=root / "etc" / "lib")
+    result = _run(env)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "symlink" in (result.stdout + result.stderr).lower()
+    assert not (outside / "var" / "lib" / "mediaflow").exists()
+    assert _created(root) == ["etc"]
+
+
+def test_scratch_root_refused_as_destination(tmp_path):
+    root = _scratch(tmp_path)
+    env = _env(root, root)
+    env["MEDIAFLOW_INSTALL_PREFIX"] = str(root)
+    result = _run(env)
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "strictly inside the scratch root" in result.stderr
+    assert _created(root) == []
+
+
+def test_privileged_operations_are_suppressed_during_rehearsal(tmp_path):
+    root = _scratch(tmp_path)
+    stubs, log = _privileged_stubs(tmp_path)
+    env = _env(root, root)
+    env["PATH"] = f"{stubs}:{env['PATH']}"
+    env["PRIV_STUB_LOG"] = str(log)
+    result = _run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not log.exists(), "rehearsal executed a privileged command instead of echoing it"
+    assert "+ [rehearsal]" in result.stdout

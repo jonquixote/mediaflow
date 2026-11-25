@@ -1,8 +1,24 @@
 #!/usr/bin/env bash
-# mediaflow installer: create-only host installation.
-# Run as root after reviewing this file. It never touches Jellyfin config,
-# SSH, ufw, Tailscale, the vault, real media paths, or existing artifacts.
+# mediaflow installer: SANDBOX-ONLY create-only rehearsal tool.
+# This installer never performs a production installation. Production
+# installation is not approved; it would require a separately reviewed manual
+# procedure, which this repository does not provide. In rehearsal mode
+# (MEDIAFLOW_INSTALL_TEST=1) it performs a create-only installation into a
+# validated disposable scratch root. It never touches Jellyfin config, SSH,
+# ufw, Tailscale, the vault, real media paths, or existing artifacts.
 set -euo pipefail
+
+# --- unconditional production lock ------------------------------------------
+# Applies identically to root and non-root invocations. Refuses before any
+# directory resolution, external command, service query, account operation,
+# destination write, or EXIT-trap setup. There is no production override.
+if [[ "${MEDIAFLOW_INSTALL_TEST:-}" != "1" ]]; then
+  echo "refuse: mediaflow installer is sandbox-only; production installation is not approved." >&2
+  echo "Production installation would require a separately reviewed manual procedure, which this repository does not provide." >&2
+  echo "Rehearsal requires MEDIAFLOW_INSTALL_TEST=1 and a validated disposable scratch root (MEDIAFLOW_INSTALL_SCRATCH_ROOT)." >&2
+  echo "No override unlocks production installation." >&2
+  exit 3
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_DIR="${MEDIAFLOW_INSTALL_REPO_DIR:-$SCRIPT_DIR}"
@@ -27,9 +43,81 @@ if [[ "$ROOT" == "/srv/media" || "$ROOT" == /srv/media/* ]] && [[ "$TEST_MODE" =
   echo "rehearsal mode refuses the production media root" >&2
   exit 2
 fi
-if [[ ${EUID} -ne 0 && "$TEST_MODE" != "1" ]]; then
-  echo "install.sh must run as root (john). The coding agent must never run it." >&2
-  exit 1
+
+# --- disposable scratch designation (rehearsal-only) --------------------------
+# The validated scratch root is the only permitted write domain. Identity,
+# /tmp location, mediaflow-rehearsal.* name, and creation marker are checked
+# with tools/scratch.py, resolved from the executing script's directory (not
+# from the overridable MEDIAFLOW_INSTALL_REPO_DIR used by some tests).
+SCRATCH_ROOT="${MEDIAFLOW_INSTALL_SCRATCH_ROOT:-}"
+[[ -n "$SCRATCH_ROOT" ]] || {
+  echo "preflight: MEDIAFLOW_INSTALL_SCRATCH_ROOT is required; rehearsals need a disposable scratch root; refuse before writes" >&2
+  exit 3
+}
+if ! SCRATCH_RESOLVED="$(python3 -c '
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+from scratch import validate_scratch
+try:
+    print(validate_scratch(Path(sys.argv[1])))
+except ValueError as exc:
+    print("preflight: invalid scratch root designation: %s" % exc, file=sys.stderr)
+    sys.exit(1)
+' "$SCRATCH_ROOT" "$SCRIPT_DIR/tools")"; then
+  echo "preflight: MEDIAFLOW_INSTALL_SCRATCH_ROOT is not a validated disposable scratch root; refuse before writes" >&2
+  exit 3
+fi
+
+# --- destination containment ---------------------------------------------------
+# Every destination, including derived write targets (venv, manifest, state
+# subdirectories, preset subdirectories, media layout), must resolve strictly
+# inside the validated scratch root. The check is component-aware (resolved
+# parents, not a string-prefix test) and follows existing symlinks, so escapes
+# through intermediate symlink components fail closed before any write.
+if ! MF_SCRATCH_ROOT="$SCRATCH_RESOLVED" python3 - \
+  "$PREFIX" "$CONFIG_DIR" "$ROOT" "$STATE_DIR" "$SYSTEMD_DIR" "$DOC_DIR" \
+  "$VENV" "$MANIFEST_PATH" \
+  "$STATE_DIR/backup" "$STATE_DIR/logs" "$STATE_DIR/evidence" \
+  "$CONFIG_DIR/presets.d" "$CONFIG_DIR/experimental" \
+  "$ROOT/movies" "$ROOT/_pipeline/convert/movies" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+root = Path(os.environ["MF_SCRATCH_ROOT"]).resolve()
+for raw in sys.argv[1:]:
+    p = Path(raw)
+    if not p.is_absolute():
+        print("preflight: destination is not an absolute path: %s" % raw,
+              file=sys.stderr)
+        sys.exit(1)
+    try:
+        resolved = p.resolve()
+    except OSError as exc:
+        print("preflight: cannot resolve destination %s: %s" % (raw, exc),
+              file=sys.stderr)
+        sys.exit(1)
+    if resolved == root:
+        print("preflight: destination %s is the scratch root itself; "
+              "destinations must be strictly inside the scratch root" % raw,
+              file=sys.stderr)
+        sys.exit(1)
+    if root not in resolved.parents:
+        note = ""
+        cur = p
+        while cur != cur.parent:
+            if cur.is_symlink():
+                note = " (symlink escape)"
+                break
+            cur = cur.parent
+        print("preflight: destination %s resolves outside the validated "
+              "scratch root%s: %s" % (raw, note, resolved), file=sys.stderr)
+        sys.exit(1)
+PY
+then
+  echo "preflight: refusing installer destinations outside the disposable scratch root; refuse before writes" >&2
+  exit 3
 fi
 
 run() {
