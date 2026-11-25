@@ -161,3 +161,77 @@ def test_installer_refuses_before_any_write_when_a_unit_is_loaded(stub, tmp_path
     assert result.returncode == 3, result.stderr
     assert "refuse before writes" in result.stderr
     assert not any(path.exists() for path in dirs.values())
+
+
+# --------------------------------------------------------------------------
+# Seam removal regressions: the MEDIAFLOW_INSTALL_SERVICE_STATE override is
+# removed from install.sh. An inherited value must not bypass or weaken the
+# real tools/service_state.py gate: the stub's verdict always decides.
+# --------------------------------------------------------------------------
+
+
+def _installer_env(stub, tmp_path, *, scenario=None, stub_mode=None,
+                   inherited_override=None):
+    dirs = {name: tmp_path / name for name in
+            ("prefix", "config", "state", "systemd", "doc", "media")}
+    env = dict(os.environ)
+    for key in ("MEDIAFLOW_ROOT", "MEDIAFLOW_CONFIG", "MEDIAFLOW_ENV_DIR",
+                "MEDIAFLOW_PRESETS", "MEDIAFLOW_DOCS", "PYTHONPATH",
+                "MEDIAFLOW_INSTALL_SERVICE_STATE"):
+        env.pop(key, None)
+    env.update({
+        "MEDIAFLOW_INSTALL_TEST": "1",
+        "MEDIAFLOW_SYSTEMCTL": str(stub),
+        "MEDIAFLOW_INSTALL_HOST_ONLY": "1",
+        "MEDIAFLOW_INSTALL_PREFIX": str(dirs["prefix"]),
+        "MEDIAFLOW_INSTALL_CONFIG_DIR": str(dirs["config"]),
+        "MEDIAFLOW_INSTALL_STATE_DIR": str(dirs["state"]),
+        "MEDIAFLOW_INSTALL_SYSTEMD_DIR": str(dirs["systemd"]),
+        "MEDIAFLOW_INSTALL_DOC_DIR": str(dirs["doc"]),
+        "MEDIAFLOW_INSTALL_ROOT": str(dirs["media"]),
+    })
+    if scenario:
+        env["STUB_SCENARIO"] = scenario
+    if stub_mode:
+        env["STUB_MODE"] = stub_mode
+    if inherited_override is not None:
+        env["MEDIAFLOW_INSTALL_SERVICE_STATE"] = inherited_override
+    return env, dirs
+
+
+def test_inherited_override_cannot_convert_rejecting_stub_to_success(stub, tmp_path):
+    env, dirs = _installer_env(
+        stub, tmp_path,
+        scenario="mediaflow.service=active-enabled",
+        inherited_override="inactive disabled",
+    )
+    result = subprocess.run(
+        ["bash", str(INSTALL)], capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "refuse before writes" in result.stderr
+    assert "service or timer state conflicts" in result.stderr
+    assert not any(path.exists() for path in dirs.values())
+
+
+def test_inherited_override_cannot_mask_query_failure(stub, tmp_path):
+    env, dirs = _installer_env(
+        stub, tmp_path, stub_mode="exit1",
+        inherited_override="inactive disabled",
+    )
+    result = subprocess.run(
+        ["bash", str(INSTALL)], capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert "refuse before writes" in result.stderr
+    assert "query-error" in result.stdout
+    assert not any(path.exists() for path in dirs.values())
+
+
+def test_installer_proceeds_when_stub_reports_all_units_absent(stub, tmp_path):
+    env, dirs = _installer_env(stub, tmp_path)
+    result = subprocess.run(
+        ["bash", str(INSTALL)], capture_output=True, text=True, env=env, timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "create-only host installation complete" in result.stdout

@@ -41,7 +41,6 @@ def _install_env(tmp_path: Path, *, host_only: bool) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
-        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
         "MEDIAFLOW_INSTALL_EXPECTED_SHA": subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,

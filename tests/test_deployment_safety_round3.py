@@ -97,16 +97,38 @@ def test_installer_enforces_expected_sha(tmp_path):
     assert not (tmp_path / "etc").exists()
 
 
-def test_installer_accepts_only_exact_passive_service_states(tmp_path):
-    assert _install(tmp_path, MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled").returncode == 0
+def test_installer_proceeds_when_stub_reports_all_units_absent(tmp_path):
+    proc = _install(tmp_path)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "create-only host installation complete" in proc.stdout
 
-    for state in ("active disabled", "inactive enabled", "inactive",
-                  "unknown disabled", "inactive query-error", "failed disabled",
-                  "activating disabled", "inactive static"):
-        target = tmp_path / state.replace(" ", "_")
-        proc = _install(target, MEDIAFLOW_INSTALL_SERVICE_STATE=state)
-        assert proc.returncode == 3, (state, proc.stdout, proc.stderr)
-        assert not (target / "etc").exists(), state
+
+@pytest.mark.parametrize("overrides", [
+    {"STUB_SCENARIO": "mediaflow.service=inactive-disabled"},
+    {"STUB_SCENARIO": "mediaflow.service=active-enabled"},
+    {"STUB_SCENARIO": "mediaflow.service=masked"},
+    {"STUB_SCENARIO": "mediaflow.service=failed"},
+    {"STUB_SCENARIO": "mediaflow.service=activating"},
+    {"STUB_SCENARIO": "mediaflow.service=deactivating"},
+    {"STUB_SCENARIO": "mediaflow.service=static"},
+    {"STUB_SCENARIO": "mediaflow.service=indirect"},
+    {"STUB_SCENARIO": "mediaflow.service=linked"},
+    {"STUB_MODE": "exit1"},
+    {"STUB_MODE": "garbage"},
+], ids=["loaded-inactive", "loaded-active", "masked", "failed", "activating",
+        "deactivating", "static", "indirect", "linked", "query-error", "garbage"])
+def test_installer_refuses_loaded_units_and_query_problems_at_the_real_gate(
+        tmp_path, overrides):
+    target = tmp_path / "target"
+    proc = _install(target, **overrides)
+    output = proc.stderr + proc.stdout
+    assert proc.returncode == 3, (overrides, proc.stdout, proc.stderr)
+    # the refusal must come from the real service-state gate, not an earlier guard
+    assert "service or timer state conflicts" in output, overrides
+    assert "refuse before writes" in output
+    if "STUB_MODE" in overrides:
+        assert "query-error" in output, overrides
+    assert not (target / "etc").exists(), overrides
 
 
 def test_installer_preserves_masked_unit_symlink(tmp_path):
@@ -114,7 +136,7 @@ def test_installer_preserves_masked_unit_symlink(tmp_path):
     systemd.mkdir()
     unit = systemd / "mediaflow.service"
     unit.symlink_to("/dev/null")
-    proc = _install(tmp_path, MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled")
+    proc = _install(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert unit.is_symlink() and os.readlink(unit) == "/dev/null"
 
@@ -123,7 +145,7 @@ def test_installer_create_only_refuses_conflicting_destination(tmp_path):
     config = tmp_path / "etc" / "mediaflow"
     config.mkdir(parents=True)
     (config / "config.toml").write_text("keep\n")
-    proc = _install(tmp_path, MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled")
+    proc = _install(tmp_path)
     assert proc.returncode == 3
     assert "conflict" in (proc.stderr + proc.stdout).lower()
     assert (config / "config.toml").read_text() == "keep\n"
@@ -138,14 +160,14 @@ def test_installer_preserves_evidence_and_parent_metadata(tmp_path):
     marker.write_text("keep evidence\n")
     before = stat.S_IMODE(state.stat().st_mode)
 
-    proc = _install(tmp_path, MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled")
+    proc = _install(tmp_path)
     assert proc.returncode == 0, proc.stderr
     assert marker.read_text() == "keep evidence\n"
     assert stat.S_IMODE(state.stat().st_mode) == before
 
 
 def test_installer_manifest_and_rollback_cover_created_files(tmp_path):
-    proc = _install(tmp_path, MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled",
+    proc = _install(tmp_path,
                     MEDIAFLOW_INSTALL_FAIL_AFTER="config")
     assert proc.returncode == 9
     manifest = tmp_path / "var" / "lib" / "mediaflow" / "install-manifest.json"

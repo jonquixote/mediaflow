@@ -213,19 +213,11 @@ if [[ -n "$DIRTY" && ( "$TEST_MODE" != "1" || "${MEDIAFLOW_INSTALL_FORCE_DIRTY_C
 fi
 
 UNIT_NAMES=(mediaflow.service mediaflow-trash.service mediaflow-trash.timer mediaflow-doctor.service mediaflow-doctor.timer)
-if [[ -n "${MEDIAFLOW_INSTALL_SERVICE_STATE:-}" ]]; then
-  # Test-only seam kept for existing rehearsal tests; production never takes this branch.
-  [[ "$TEST_MODE" == "1" ]] || {
-    echo "preflight: service-state override is test-only" >&2; exit 3; }
-  case "$MEDIAFLOW_INSTALL_SERVICE_STATE" in
-    "inactive disabled"|"inactive masked"|"absent") ;;
-    *)
-      echo "preflight: non-passive service state ($MEDIAFLOW_INSTALL_SERVICE_STATE); refuse before writes" >&2
-      echo "a separately approved stop/disable/unmask transition is required first" >&2
-      exit 3
-      ;;
-  esac
-elif ! python3 "$REPO_DIR/tools/service_state.py" "${UNIT_NAMES[@]}"; then
+# The service-state gate has no override seam: the real tools/service_state.py
+# parser and decision logic always decide. Rehearsals inject a sandbox-local
+# systemctl via MEDIAFLOW_SYSTEMCTL (honored only in test mode by the helper);
+# an inherited MEDIAFLOW_INSTALL_SERVICE_STATE is ignored, never consulted.
+if ! python3 "$REPO_DIR/tools/service_state.py" "${UNIT_NAMES[@]}"; then
   echo "preflight: service or timer state conflicts with a create-only install; refuse before writes" >&2
   echo "a separately approved stop/disable/unmask transition is required first" >&2
   exit 3

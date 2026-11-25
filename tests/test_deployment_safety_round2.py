@@ -52,7 +52,6 @@ def _install_env(tmp_path: Path, repo: Path | None = None) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_TEST": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
-        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
         "MEDIAFLOW_INSTALL_EXPECTED_SHA": subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
             capture_output=True, text=True, check=True,
@@ -112,7 +111,7 @@ def test_installer_refuses_dirty_checkout_before_writes(tmp_path):
 
 def test_installer_refuses_existing_active_or_enabled_service(tmp_path):
     env = _install_env(tmp_path)
-    env["MEDIAFLOW_INSTALL_SERVICE_STATE"] = "active enabled"
+    env["STUB_SCENARIO"] = "mediaflow.service=active-enabled"
     proc = subprocess.run(["bash", str(ROOT / "install.sh")], capture_output=True,
                           text=True, env=env, timeout=60)
     assert proc.returncode == 3

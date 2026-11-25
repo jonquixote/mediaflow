@@ -26,12 +26,27 @@ min_free_gb = 1
 EOF
 
 SHA="$(git -C "$ROOT_REPO" rev-parse HEAD)"
+
+# Deterministic sandbox-local systemctl stub: every mediaflow unit reports
+# absent, so the real service-state gate passes without querying or modifying
+# the host's service manager.
+SYSTEMCTL_STUB="$SCRATCH/systemctl-stub"
+cat > "$SYSTEMCTL_STUB" <<'EOF'
+#!/usr/bin/env bash
+unit="${@: -1}"
+echo "Id=$unit"
+echo "LoadState=not-found"
+echo "ActiveState=inactive"
+echo "UnitFileState="
+EOF
+chmod +x "$SYSTEMCTL_STUB"
+
 env -u MEDIAFLOW_ROOT -u MEDIAFLOW_CONFIG -u MEDIAFLOW_ENV_DIR \
     -u MEDIAFLOW_PRESETS -u MEDIAFLOW_DOCS -u PYTHONPATH \
     MEDIAFLOW_INSTALL_TEST=1 MEDIAFLOW_INSTALL_HOST_ONLY=1 MEDIAFLOW_INSTALL_ALLOW_DIRTY=1 \
     MEDIAFLOW_INSTALL_EXPECTED_SHA="$SHA" \
     MEDIAFLOW_INSTALL_REPO_DIR="$ROOT_REPO" \
-    MEDIAFLOW_INSTALL_SERVICE_STATE="inactive disabled" \
+    MEDIAFLOW_SYSTEMCTL="$SYSTEMCTL_STUB" \
     MEDIAFLOW_INSTALL_SCRATCH_ROOT="$SCRATCH" \
     MEDIAFLOW_INSTALL_PREFIX="$SCRATCH/opt/mediaflow" \
     MEDIAFLOW_INSTALL_CONFIG_DIR="$SCRATCH/etc/mediaflow" \

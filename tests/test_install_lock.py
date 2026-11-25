@@ -40,6 +40,25 @@ def _head() -> str:
     ).stdout.strip()
 
 
+# Deterministic sandbox systemctl stub: every mediaflow unit reports absent,
+# so the real tools/service_state.py gate passes in test mode without ever
+# querying the host's service manager.
+SYSTEMCTL_STUB = r"""#!/usr/bin/env bash
+unit="${@: -1}"
+echo "Id=$unit"
+echo "LoadState=not-found"
+echo "ActiveState=inactive"
+echo "UnitFileState="
+"""
+
+
+def _systemctl_stub(directory: Path) -> Path:
+    stub = directory / "systemctl-stub"
+    stub.write_text(SYSTEMCTL_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
+
 def _scratch(parent: Path, name: str = "mediaflow-rehearsal.lock",
              marker: bool = True) -> Path:
     root = parent / name
@@ -58,8 +77,8 @@ def _env(scratch, base, *, test_mode=True, **moved) -> dict:
     env.update({
         "MEDIAFLOW_INSTALL_HOST_ONLY": "1",
         "MEDIAFLOW_INSTALL_ALLOW_DIRTY": "1",
-        "MEDIAFLOW_INSTALL_SERVICE_STATE": "inactive disabled",
         "MEDIAFLOW_INSTALL_EXPECTED_SHA": _head(),
+        "MEDIAFLOW_SYSTEMCTL": str(_systemctl_stub(base.parent)),
     })
     if test_mode:
         env["MEDIAFLOW_INSTALL_TEST"] = "1"
